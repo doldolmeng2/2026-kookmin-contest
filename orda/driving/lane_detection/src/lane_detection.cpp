@@ -1205,7 +1205,7 @@ int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
 
     Config config = load_config(
-        "/home/xytron/xycar_ws/src/orda/modular/lane_detection/lane_detection_parameter.json"
+        "/home/xytron/xycar_ws/src/orda/driving/lane_detection/lane_detection_parameter.json"
     );
 
     // 로드된 설정값 확인용 로그 (config 수정이 실제로 반영됐는지 디버깅용)

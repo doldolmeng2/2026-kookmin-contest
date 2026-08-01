@@ -1,105 +1,383 @@
-# 2025 제8회 국민대학교 자율주행 경진대회
+# 2026 제9회 국민대학교 자율주행 경진대회
+
+본선: 2026년 8월 25일 (화) · 국민대 자율주행 스튜디오
+연습 주행: 2026년 7월 1일 ~ 8월 21일
 
 ## 디렉터리 생성 및 클론
 ```bash
-mkdir -p xycar_ws/src/orda
-cd xycar_ws/src/orda
-git clone https://github.com/doldolmeng2/2025-kookmin-contest.git .
+mkdir -p xycar_ws/src
+cd xycar_ws/src
+git clone https://github.com/doldolmeng2/2026-kookmin-contest.git .
 ```
+
+---
+
+## 주행 미션 시퀀스
+
+트랙을 **총 3바퀴** 주행하며, 1바퀴와 2·3바퀴의 시작 방식이 다르다.
+
+**1바퀴** — 정지 상태에서 신호등을 보고 출발
+```
+① 신호등 인식 출발 → ② 차선 주행 → ③ 라바콘 주행 → ④ 고정장애물 회피
+→ ⑤ 방해차량 추월 → ⑥ S커브 구간 → ⑦ 결승선 통과
+```
+
+**2·3바퀴 — 좌회전 신호가 아닐 때** (직진)
+```
+① 신호등 경로 선택 → ② 차선 주행 → ③ 라바콘 주행 → ④ 고정장애물 회피
+→ ⑤ 방해차량 추월 → ⑥ S커브 구간 → ⑦ 결승선 통과
+```
+
+**2·3바퀴 — 좌회전 신호일 때** (지름길, 경주 중 1회)
+```
+① 신호등 경로 선택 → ② 지름길 통과 → ③ S커브 구간 → ④ 결승선 통과
+```
+
+- **2·3바퀴에서도 신호등이 정지 신호(`1`)면 정지한다.** 신호 준수는 바퀴와 무관하다.
+  다만 `WAIT_GREEN` 모드는 **출발 시 한 번만 사용하고 재진입하지 않는다.**
+  2·3바퀴의 정지는 모드 전환 없이 **제어 계층의 정지 오버라이드**로 처리한다
+  (`/traffic_detection == 1` → `speed = 0`, 신호가 `2`/`3` 으로 바뀌면 즉시 해제).
+- **S커브 구간은 모든 바퀴가 통과한다.** 지름길을 타든 안 타든 결승선 직전에 반드시 지난다.
+  별도 모드를 두지 않고 `LANE_DRIVE` 로 처리하며, 감속은 `control.py` 의 조향각 기반
+  감속 로직에 맡긴다.
+- **2바퀴째 또는 3바퀴째**에 4구 신호등에서 좌회전 신호가 나온다(어느 바퀴인지 랜덤).
+  좌회전 신호는 **전체 경주에서 단 한 번만** 나오고, 지름길도 그때 한 번만 쓸 수 있다.
+- 따라서 **좌회전 신호를 인식하면 반드시 좌회전하여 지름길로 주행한다.**
+  직좌 동시신호라 직진도 규정상 허용되지만, 여기서 직진하면 지름길 기회가 사라져
+  주행 거리가 그대로 길어진다. 직진/좌회전을 저울질하는 분기를 두지 않는다.
+- **1차선/2차선 구분이 없다.** 양쪽 실선만 벗어나지 않으면 되고,
+  가운데 점선을 두 바퀴 사이에 두고 주행하는 것도 허용된다.
+
+### 지름길은 좌측 구간 전체를 건너뛴다
+
+트랙은 좌측 루프와 우측 루프를 중앙 세로 도로가 잇는 형태다. 신호등은 중앙 도로가
+상단에 닿는 교차로에 있고, **라바콘·고정장애물은 좌측 루프에 배치**되어 있다.
+
+```
+직진(정규 경로) : 신호등 ─▶ 라바콘 ─▶ 고정장애물 ─▶ 방해차량 ─▶ S커브 ─▶ 결승선
+좌회전(지름길)  : 신호등 ─▶ 중앙 도로 ───────────────────────▶ S커브 ─▶ 결승선
+```
+
+따라서 **지름길을 타는 바퀴에는 라바콘·고정장애물·방해차량 구간을 모두 건너뛴다.**
+라바콘은 3바퀴 중 2바퀴에서만 만난다. S커브와 결승선은 두 경로가 합류한 뒤라 항상 통과한다.
+
+| | 1바퀴 | 2바퀴 | 3바퀴 |
+|---|---|---|---|
+| 좌회전 신호가 2바퀴째인 경우 | 라바콘·고정장애물·방해차량 | **지름길** | 라바콘·고정장애물·방해차량 |
+| 좌회전 신호가 3바퀴째인 경우 | 라바콘·고정장애물·방해차량 | 라바콘·고정장애물·방해차량 | **지름길** |
+
+> 방해차량은 고정 배치물이 아니라 **주행 중인 이동체**이므로 조우 위치가 완전히 고정되지는
+> 않는다. `OVERTAKE` 전이 자체는 `LANE_DRIVE` 에서 항상 활성이므로 별도 조치는 필요 없다.
+
+### 코드가 지켜야 하는 규정 제약
+
+| 항목 | 제한 | 처리 |
+|---|---|---|
+| 총 주행시간 | 3바퀴 4분 초과 | 실격 |
+| 라바콘 구간 | 1분 내 미통과 | 실격 |
+| 주행 정지 | 정지 후 1분 내 미재개 | 실격 |
+| 라바콘 충돌 | 개당 | 벌초 3초 |
+| 차량 터치 | 1회당 (한 바퀴 15회 초과 시 실격) | 벌초 5초 |
+| 추돌 / 피추돌 | 1회당 | 벌초 10초 |
+| 빨간불 출발 | 1회당 | 벌초 10초 |
+
+> 정지 상태가 곧 실격으로 이어지므로, 안전 정지는 **복귀 가능한 감속**을 우선하고
+> 완전 정지는 최후 수단으로만 사용한다.
+
+---
 
 ## 소스코드 파일 구조
+
 ```
-src
-├── modular
-│    ├── image_resize      # 카메라 영상 리사이즈 (640×360)
-│    ├── lane_detection    # BEV 기반 차선 검출
-│    ├── object_detection  # LiDAR + YOLO 장애물 검출
-│    ├── rubbercone        # LiDAR 기반 라바콘 오프셋 계산
-│    ├── traffic_light     # 초록 신호등 검출
-│    └── main              # 상태 머신 + 모터 제어 (오케스트레이터)
+src/
+├── orda/
+│   ├── perception/                 # 원시 인지 (미션 중립)
+│   │    ├── image_resize           # 카메라 영상 리사이즈 (640×360)
+│   │    ├── traffic_light          # 4구 신호등 상태 판별
+│   │    └── object_detection       # LiDAR + YOLO 차량 검출 (정지/이동 분류)
+│   │
+│   ├── driving/                    # 조향 오프셋 생성
+│   │    ├── lane_detection         # BEV 기반 차선 검출
+│   │    └── rubbercone             # LiDAR 기반 라바콘 오프셋 계산
+│   │
+│   ├── main/                       # 미션 상태 머신 + 모터 제어
+│   │
+│   └── function/                   # 보조 도구
+│        ├── manual_drive           # Xbox 컨트롤러 수동 주행 / bag 수집
+│        └── sensors_viewer         # 센서 데이터 시각화
 │
-└── function
-     ├── manual_drive      # Xbox 컨트롤러 수동 주행
-     └── sensors_viewer    # 센서 데이터 시각화 툴
+├── track_drive/                    # (Xytron 제공) 예제 주행 패키지
+├── xycar_application/              # (Xytron 제공) 예제 애플리케이션
+├── xycar_device/                   # (Xytron 제공) 센서·모터 드라이버, xycar_msgs
+└── xycar_simulator/                # (Xytron 제공) 시뮬레이터
 ```
 
+`perception` / `driving` / `function` 은 **폴더 계층일 뿐 ROS 패키지가 아니다.**
+colcon 은 `package.xml` 을 재귀로 탐색하므로 폴더 깊이는 빌드에 영향을 주지 않는다.
+
+### main 패키지 내부
+
+```
+main/main/
+├── main.py                 # [노드] ROS 배선 전담 (구독/발행/타이머)
+├── control.py              # 모드별 조향각·속도 계산
+├── control_selector.py     # 제어 소스 중재 + 입력 신선도 검사
+├── race_fsm.py             # 미션 상태 머신
+├── race_context.py         # 랩 수·지름길 사용 여부 등 경주 전역 상태
+├── mission_observation.py  # 인지 입력 스냅샷
+├── safety_monitor.py       # 안전 판정 (입력 유실, 시간 제한)
+├── cone_entry.py           # 라바콘 진입 디바운스
+├── shortcut_turn.py        # 지름길 좌회전 궤적 (IMU yaw 기반)
+└── bag_replay.py           # 오프라인 bag 리플레이 검증
+```
+
+**노드 파일은 `main.py` 하나뿐이다.** 나머지는 `rclpy` 를 import 하지 않는 순수 로직
+모듈이며, 토픽을 직접 다루지 않고 `main.py` 가 import 해서 사용한다.
+이 규칙 덕분에 FSM·제어 로직을 실차 없이 단위 테스트와 bag 리플레이로 검증할 수 있다.
+
+---
+
 ## 노드 및 토픽 구조
+
+토픽 표기: **[유지]** 작년과 동일 · **[변경]** 이름 유지, 페이로드 재정의 · **[신규]** 신설
 
 ```
 [Xycar HW]
   xycar_cam       → /image_raw          (sensor_msgs/Image)
   xycar_lidar     → /scan               (sensor_msgs/LaserScan)
+  xycar_imu       → /imu                (sensor_msgs/Imu)
   xycar_ultrasonic→ /xycar_ultrasonic   (std_msgs/Int32MultiArray)
   joy_node        → /joy                (sensor_msgs/Joy)
 
 [전처리]
   resize_node
     sub: /image_raw
-    pub: /resized_image                 (sensor_msgs/Image, 640×360)
+    pub: /resized_image                 (sensor_msgs/Image, 640×360)      [유지]
 
 [인지]
   traffic_node
     sub: /resized_image
-    pub: /traffic_detection             (std_msgs/Bool)
+    pub: /traffic_detection             (std_msgs/Int32)                  [변경]
+         0 = 인식 못함
+         1 = 정지   (빨강, 주황)
+         2 = 직진   (녹색)
+         3 = 좌회전 (녹색 + 좌회전 화살표 동시 점등 → 지름길 진입)
 
   rubbercone_node
     sub: /scan
-    pub: /rubbercone_info               (std_msgs/Int32MultiArray,
-                                         [offset, end_flag, confidence])
-                                         confidence: 경로 추정 신뢰도(0~100)
+    pub: /rubbercone_info               (std_msgs/Int32MultiArray)        [유지]
+         [offset, end_flag, confidence]
+         confidence: 경로 추정 신뢰도 (0~100)
 
   lane_node
     sub: /resized_image, /mode_info
-    pub: /lane_offset                   (std_msgs/Int16, 픽셀 오프셋)
-         /lane_fit                      (std_msgs/Float32MultiArray, [m, b])
-         /lane_change_state             (std_msgs/Int32MultiArray)
+    pub: /lane_offset                   (std_msgs/Int16, 픽셀 오프셋)     [유지]
+         /lane_fit                      (std_msgs/Float32MultiArray, [m, b]) [유지]
+         /lane_change_state             (std_msgs/Int32MultiArray)        [유지]
+         [변경중, 성공여부]
 
   object_node
     sub: /scan, /resized_image, /lane_fit
-    pub: /object_info                   (std_msgs/Float32MultiArray, 10 필드)
+    pub: /object_info                   (std_msgs/Float32MultiArray, 11 필드) [변경]
          [exists, min_dist, angle, span, cluster_size,
-          box_size, box_cx, box_cy, dx, car_lane]
+          box_size, box_cx, box_cy, dx, car_lane, is_moving]
+         car_lane : 0=중앙, 1=왼쪽, 2=오른쪽
+         is_moving: 0=고정장애물, 1=방해차량      ← 11번째 필드 신설
 
 [제어]
   main_node
-    sub: /rubbercone_info, /lane_offset, /object_info,
-         /traffic_detection, /joy, /xycar_ultrasonic
-    pub: /xycar_motor                   (std_msgs/Float32MultiArray, [angle, speed])
-         /mode_info                     (std_msgs/Int32MultiArray, [mode, lane])
+    sub: /rubbercone_info, /lane_offset, /lane_change_state, /object_info,
+         /traffic_detection, /imu, /joy, /xycar_ultrasonic
+    pub: /xycar_motor                   (std_msgs/Float32MultiArray)      [유지]
+         [angle, speed]
+         /mode_info                     (std_msgs/Int32MultiArray)        [변경]
+         [mode, lap, shortcut_used, lane_target]
 ```
+
+### 인터페이스 변경 사유
+
+| 토픽 | 변경 내용 | 사유 |
+|---|---|---|
+| `/traffic_detection` | `Bool` → `Int32` (4상태) | 4구 신호등의 좌회전 화살표를 구분해야 지름길 판단이 가능 |
+| `/object_info` | `is_moving` 필드 추가 | 고정장애물 회피와 방해차량 추월은 **규칙이 다른 별개 미션** (추월 중에는 차선 이탈이 허용됨) |
+| `/mode_info` | `[mode, lane]` → `[mode, lap, shortcut_used, lane_target]` | 1·2차선 구분이 폐지되어 `lane` 은 무의미해졌고, 3바퀴·지름길 1회 판단에 랩 수와 사용 여부가 필요 |
+
+`car_lane` 과 `lane_target` 은 **같은 정수 규약(0=중앙, 1=왼쪽, 2=오른쪽)** 을 쓴다.
+방해차량이 있는 쪽의 반대편을 추월 방향으로 그대로 뒤집어 쓸 수 있게 하기 위함이다.
+
+> `Int32MultiArray` 의 인덱스 의미는 이 문서뿐 아니라 **코드 내 상수로도 정의한다.**
+> 문서에만 존재하는 인덱스 규약은 배선 실수의 주된 원인이 된다.
+
+#### 정지 신호(`1`) 오검출 주의
+
+`/traffic_detection == 1` 은 **주행 중에도 즉시 정지**를 유발하므로 오검출 비용이 가장 크다.
+트랙 중간에서 잘못 정지하면 재개 지연으로 실격까지 이어질 수 있다.
+
+- 정지 신호를 **빨강과 주황으로 함께 정의했는데, 라바콘이 주황색이다.** 라바콘 구간에서
+  신호등이 아닌 물체를 정지 신호로 읽지 않도록 해야 한다.
+- 색상 블롭만으로 판정하지 말고 **4구 신호등 하우징을 먼저 찾은 뒤 그 안에서 색을 판정**하거나,
+  ROI 를 신호등이 나타나는 화면 상단으로 제한한다.
+- 좌회전 신호(`3`)는 미검출을 줄이는 방향으로, 정지 신호(`1`)는 오검출을 줄이는 방향으로
+  임계값을 잡는다. **두 신호의 튜닝 방향이 반대**라는 점에 유의한다.
+
+---
+
+## 차선 주행 정책
+
+기본은 **중앙 주행**(가운데 점선을 두 바퀴 사이에 두고 주행)이다. 양쪽 실선에서
+가장 멀어 차선 이탈 위험이 최소이고, 곡선 구간 코너 안쪽에 설치되는 방해 장애물과의
+간격도 확보된다.
+
+**단, 장애물이 나올 수 있는 구간에서는 중앙 주행이 오히려 불리하다.** 중앙 주행은 두 차선을
+동시에 점유하므로 장애물이 어느 차선에 있든 충돌 대상이 된다. 따라서 장애물 구간에서는
+**미리 한쪽 차선을 확정해서 진입한다.** 장애물이 반대 차선이면 아무 조작 없이 통과하고,
+같은 차선이면 한 번의 완전한 차선 변경으로 회피한다.
+
+### 구간별 목표 차선
+
+| 구간 | 모드 | `lane_target` | 근거 |
+|---|---|---|---|
+| 신호등 → 라바콘 진입 | `LANE_DRIVE` | 0 (중앙) | 실선 이탈 위험 최소화 |
+| 라바콘 | `CONE_DRIVE` | — | 라이다 경로를 따름 |
+| 라바콘 종료 → 고정장애물 통과 | `FIXED_AVOID` | **2 (오른쪽 확정)** | 곡선 코너 안쪽에 방해 장애물이 설치되므로(규정 p.29) 바깥 차선이 유리 |
+| 고정장애물 통과 → 추월 완료 | `OVERTAKE` | **직전 차선 유지** | 불필요한 차선 변경을 줄임. 방해차량 차선은 어차피 랜덤 |
+| 추월 완료 → 결승선 (S커브 포함) | `LANE_DRIVE` | 0 (중앙) | S커브 코너링에 유리 |
+
+- 고정장애물이 2차선에 있으면 1차선으로 회피하고, **그대로 1차선에서 방해차량 구간을 시작한다.**
+  회피 후 2차선으로 되돌아오지 않는다.
+- 추월 방향은 시작 차선과 무관하게 **방해차량이 있는 차선의 반대편**으로 결정한다
+  (같은 쪽으로 추월하면 차선 이탈로 간주됨, 규정 p.33).
+
+`main_node` 가 `/mode_info` 의 `lane_target` 으로 목표를 지시하고,
+`lane_node` 가 `/lane_change_state` 로 이동 진행·완료를 보고한다.
+
+> ⚠️ 방해차량은 **1차선과 2차선을 오가며 주행한다**(규정 p.32). `car_lane` 은 한 번 읽고
+> 마는 값이 아니라 추월 직전까지 계속 갱신해야 하며, 접근 중에 방해차량이 차선을 바꾸면
+> 추월 방향도 다시 결정해야 한다.
+
+---
 
 ## 주행 상태 머신 (main_node)
 
-| 모드 | 값 | 설명 | 전환 조건 |
+`race_fsm.Mode` 로 정의된다. `/mode_info[0]` 에 아래 정수값으로 발행한다.
+
+| 모드 | 값 | 설명 | 전이 조건 |
 |---|---|---|---|
-| TRAFFIC_WAIT | 0 | 신호 대기 (정지) | 초록불 감지 |
-| RUBBERCONE_DRIVE | 1 | 라바콘 구간 주행 | end_flag = 1 |
-| RUBBERCONE_END | 2 | 라바콘 종료 후 차선 진입 | 1.4초 경과 |
-| BEFORE | 4 | 장애물 접근 대기 | 추월 조건 충족 |
-| LANE_DRIVE | 3 | 차선 주행 | 박스 크기 ≥ 1900 px² |
-| CHANGE_LANE | 5 | 차선 변경 중 | 변경 완료 |
+| `INIT` | 0 | 입력 대기 | 필수 입력 수신 |
+| `WAIT_GREEN` | 1 | 신호등 앞 정지, 출발 대기 | `/traffic_detection` = 2 (디바운스) |
+| `LANE_DRIVE` | 2 | 차선 주행 (기본 중앙 주행) | 아래 분기 참조 |
+| `CONE_DRIVE` | 3 | 라바콘 구간 주행 | `end_flag` = 1 |
+| `REJOIN` | 4 | 라바콘 종료 후 차선 복귀 | 차선 인식 유효 |
+| `FIXED_AVOID` | 5 | **고정장애물 구간** (2차선 확정 주행) | 고정장애물 통과 |
+| `OVERTAKE` | 6 | **방해차량 구간** (직전 차선 유지) | 추월 완료 |
+| `SHORTCUT` | 7 | 지름길 좌회전 주행 | 목표 yaw 도달 |
+| `FINISH` | 8 | 3바퀴 완료 (종료 상태) | — |
+| `STOP` | 9 | 안전 정지 (종료 상태) | — |
+
+```
+INIT ──(입력 준비)──▶ WAIT_GREEN ──(신호 2 = 직진)──▶ LANE_DRIVE   [시간 측정 시작]
+
+[정규 경로 — 구간이 순서대로 이어진다]
+LANE_DRIVE ─(라바콘 진입 확정)─▶ CONE_DRIVE ─(end_flag)─▶ REJOIN
+REJOIN      ─(차선 인식 유효)──▶ FIXED_AVOID              [lane_target = 2]
+FIXED_AVOID ─(고정장애물 통과)─▶ OVERTAKE                 [lane_target = 직전 차선 유지]
+OVERTAKE    ─(추월 완료)───────▶ LANE_DRIVE               [lane_target = 0, S커브 중앙 주행]
+
+[지름길 / 종료]
+LANE_DRIVE ─(신호 3 & lap∈{2,3} & !shortcut_used)─▶ SHORTCUT ─▶ LANE_DRIVE
+LANE_DRIVE ─(3바퀴 완료)─▶ FINISH
+
+(모든 상태) ─(안전 조건 위반)─▶ STOP
+```
+
+- `FIXED_AVOID` 와 `OVERTAKE` 는 **순간적인 회피 동작이 아니라 구간(zone)** 이다.
+  장애물을 검출해서 진입하는 게 아니라, **라바콘 종료 후 순서대로 통과한다.**
+  고정장애물이 항상 방해차량보다 먼저 배치되므로 이 순서는 보장된다.
+- 구간 안에서 실제 회피/추월 동작을 할지는 `/object_info` 로 판단하며,
+  `is_moving` 은 **회피 규칙을 고르는 데 쓴다** (추월 중에는 차선 이탈이 허용되지만
+  고정장애물 회피는 그렇지 않다). 구간 진입 조건이 아니다.
+- **구간이 끝나지 않을 때의 탈출 경로가 필요하다.** 고정장애물이 미검출되거나 방해차량을
+  그 바퀴에 만나지 못하면 이벤트가 오지 않아 다음 구간으로 넘어가지 못한다.
+  각 구간에 시간 상한을 두고, 초과하면 다음 구간으로 진행한다.
+  랩 경계(결승선 통과)에서는 조건 없이 `LANE_DRIVE` + `lane_target = 0` 으로 초기화한다.
+
+- 좌회전 신호(`3`)를 인식하면 **조건 없이 즉시 `SHORTCUT` 으로 전이한다.**
+  신호가 나오는 바퀴는 랜덤이고 기회는 한 번뿐이므로, 직진을 선택하는 분기는 두지 않는다.
+  `shortcut_used` 는 전이가 확정되는 시점에만 세워, 한 번의 신호가 두 번 소비되지 않게 한다.
+- 좌회전 신호 인식은 **놓치면 만회할 수 없는 유일한 이벤트**다. 미검출(false negative)을
+  최소화하는 방향으로 임계값을 잡는다.
+- 라바콘 구간은 지름길 통과할 때를 제외하고 전부 통과하므로, 진입 판정 latch 는 랩 경계마다 재무장되어야 한다.
+- 지름길 바퀴에는 `FIXED_AVOID` · `OVERTAKE` 구간에도 진입하지 않는다.
+  `CONE_DRIVE` 를 거치지 않으므로 구간 체인 자체가 시작되지 않고, 중앙 주행이 유지된다.
+
+### 지름길 바퀴의 가드
+
+> 인지 노드는 모드와 무관하게 **항상 동작한다**(작년 구조 유지). 따라서 특정 구간에서만
+> 유효한 신호는 인지단을 끄는 대신 **FSM 쪽 가드로 걸러낸다.**
+
+- **지름길을 사용한 바퀴에는 라바콘이 없다.** 그런데 rubbercone 노드는 그 바퀴에도 계속
+  동작하므로, 중앙 도로의 벽이나 구조물을 라바콘으로 오인해 유효한 confidence 를 낼 수 있다.
+  `shortcut_used` 가 선 뒤 같은 바퀴에서 올라오는 라바콘 진입 신호는 **오검출로 간주하고 무시한다.**
+- `CONE_DRIVE` 를 거치지 않은 바퀴가 생기는 것은 정상이다. 이를 이상 상태로 판단하거나
+  복구 동작을 넣지 않는다.
+- 라바콘 1분 제한은 `CONE_DRIVE` 에 진입한 바퀴에만 적용한다. 지름길 바퀴에는 타이머를 걸지 않는다.
+
+### 랩 카운트
+
+결승선의 Gate(통과감지장치)는 주최측 장비라 차량이 신호를 받을 수 없다.
+따라서 **신호등 조우를 랩 경계로 사용한다.** 지름길로 가든 직진하든 매 바퀴 반드시
+신호등 앞을 지나므로 누락이 없고, 신호등 상태 스트림을 그대로 랩 카운터 입력으로 쓸 수 있다.
+
+---
 
 ## 실행 방법
+
+대회 규정상 실행 명령은 `ros2 launch ...` 형태여야 한다.
+
 ```bash
 # 전체 시스템 (실차)
-ros2 launch main module_drive.py mode:=1
+ros2 launch main module_drive.py
 
 # bag 파일 테스트
-ros2 launch main module_drive_bag_test.py mode:=1
+ros2 launch main module_drive_bag_test.py
 
-# 수동 주행
+# 수동 주행 (Xbox 컨트롤러)
 ros2 launch manual_drive manual_drive.launch.py
+
+# bag 수집
+ros2 launch manual_drive ordabag.launch.py
 ```
 
-## 브랜치 구조
+### 단위 테스트 / 오프라인 검증
+
+```bash
+colcon test --packages-select main
+python3 -m main.tools.replay_fsm_bag <bag_path>
 ```
-main
-├── modular-main
-│    ├── modular/main
-│    ├── modular/object_detection
-│    ├── modular/lane_detection
-│    ├── modular/traffic_light
-│    ├── modular/rubbercone
-│    └── modular/control
-└── monolithic-main
-```
+
+---
+
+## 작업 현황
+
+| 패키지 / 모듈 | 상태 | 비고 |
+|---|---|---|
+| `image_resize` | 유지 | 카메라 동일, 변경 없음 |
+| `lane_detection` | 유지 | 코스 동일. `lane_detection_parameter.json` 그대로 사용 |
+| `rubbercone` | 수정중 | 라바콘 시작 지점 다름 |
+| `object_detection` | 수정 | YOLO 모델(`best.onnx`) 유지, `is_moving` 분류 추가 |
+| `traffic_light` | 재작성 | 초록 Bool → 4구 신호등 4상태 |
+| `main/main.py` | 재작성 | 옛 정수 FSM 폐기, 순수 모듈 계층 배선으로 교체 |
+| `main` 로직 모듈 | 진행 중 | FSM 전이 일부 미구현 (아래 참조) |
+| `manual_drive`, `sensors_viewer` | 유지 | 하드웨어 동일 |
+
+### 미해결 항목
+
+- `race_fsm.py` 의 `REJOIN` · `FIXED_AVOID` · `OVERTAKE` · `SHORTCUT` · `FINISH` 전이 미구현
+- `shortcut_turn.py` 미작성 (지름길 좌회전 궤적)
+- 랩 카운터 미구현 — `race_context.finish_gate_passes` 가 아직 증가하지 않음
+- 시간 제한 감시 미구현 (라바콘 1분 / 총 4분)
+- `STOP` 이 종료 상태로만 정의되어 있어, 복귀 가능한 감속 정책 필요
+- YOLO 모델이 고정장애물(고장난 차량)까지 검출하는지 미확인 —
+  미검출 시 LiDAR 클러스터 보완 또는 재학습 필요
+
+---

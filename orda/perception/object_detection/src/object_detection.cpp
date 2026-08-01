@@ -82,7 +82,7 @@ public:
         // ── YOLO 모델 초기화 ────────────────────────────────────────────
         try {
             net_ = cv::dnn::readNet(
-                "/home/xytron/xycar_ws/src/orda/modular/object_detection/best.onnx");
+                "/home/xytron/xycar_ws/src/orda/perception/object_detection/best.onnx");
             net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
             net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
             yolo_ok_ = true;
