@@ -48,9 +48,33 @@ def generate_launch_description():
         description='라바콘 종료 전 연속 누락 스캔 수'
     )
     rubbercone_end_missing_frames = LaunchConfiguration('rubbercone_end_missing_frames')
+    rubbercone_scan_max_angle_arg = DeclareLaunchArgument(
+        'rubbercone_scan_max_angle',
+        default_value='85.0',
+        description='라바콘 탐색 좌우 최대 각도 (deg, 전방 기준)'
+    )
+    rubbercone_scan_max_angle = LaunchConfiguration('rubbercone_scan_max_angle')
+    rubbercone_max_lateral_distance_arg = DeclareLaunchArgument(
+        'rubbercone_max_lateral_distance',
+        default_value='0.70',
+        description='라바콘 탐색 좌우 최대 편차 (m, 벽/옆 코스 제거)'
+    )
+    rubbercone_max_lateral_distance = LaunchConfiguration('rubbercone_max_lateral_distance')
+    rubbercone_max_cone_centers_arg = DeclareLaunchArgument(
+        'rubbercone_max_cone_centers',
+        default_value='6',
+        description='경로 추정에 사용할 콘 개수 (가까운 순)'
+    )
+    rubbercone_max_cone_centers = LaunchConfiguration('rubbercone_max_cone_centers')
+    rubbercone_boundary_points_arg = DeclareLaunchArgument(
+        'rubbercone_boundary_points',
+        default_value='3',
+        description='한쪽 경계 직선 피팅에 사용할 콘 개수'
+    )
+    rubbercone_boundary_points = LaunchConfiguration('rubbercone_boundary_points')
     rubbercone_scan_max_range_arg = DeclareLaunchArgument(
         'rubbercone_scan_max_range',
-        default_value='1.30',
+        default_value='1.10',
         description='라바콘 경계 탐색 최대 거리 (m)'
     )
     rubbercone_scan_max_range = LaunchConfiguration('rubbercone_scan_max_range')
@@ -68,16 +92,22 @@ def generate_launch_description():
     rubbercone_nominal_half_width = LaunchConfiguration('rubbercone_nominal_half_width')
     rubbercone_offset_gain_arg = DeclareLaunchArgument(
         'rubbercone_offset_gain',
-        default_value='230.0',
+        default_value='150.0',
         description='라바콘 목표점(m)에서 조향 오프셋으로 변환하는 이득'
     )
     rubbercone_offset_gain = LaunchConfiguration('rubbercone_offset_gain')
     rubbercone_offset_limit_arg = DeclareLaunchArgument(
         'rubbercone_offset_limit',
-        default_value='40.0',
+        default_value='45.0',
         description='라바콘 조향 오프셋 안전 한계'
     )
     rubbercone_offset_limit = LaunchConfiguration('rubbercone_offset_limit')
+    rubbercone_enable_gui_arg = DeclareLaunchArgument(
+        'rubbercone_enable_gui',
+        default_value='true',
+        description='라바콘 LiDAR 인식 디버그 창 표시 여부'
+    )
+    rubbercone_enable_gui = LaunchConfiguration('rubbercone_enable_gui')
 
     # ── 소프트웨어 노드 (하드웨어 드라이버 제외) ────────────────────────────
     main_node = Node(
@@ -102,10 +132,15 @@ def generate_launch_description():
             'offset_filter_alpha': rubbercone_offset_filter_alpha,
             'end_missing_frames': rubbercone_end_missing_frames,
             'scan_max_range': rubbercone_scan_max_range,
+            'scan_max_angle': rubbercone_scan_max_angle,
+            'max_lateral_distance': rubbercone_max_lateral_distance,
+            'max_cone_centers': rubbercone_max_cone_centers,
+            'boundary_points': rubbercone_boundary_points,
             'target_lookahead': rubbercone_target_lookahead,
             'nominal_half_width': rubbercone_nominal_half_width,
             'offset_gain': rubbercone_offset_gain,
             'offset_limit': rubbercone_offset_limit,
+            'enable_gui': rubbercone_enable_gui,
         }],
     )
     resize_node = Node(
@@ -133,10 +168,15 @@ def generate_launch_description():
         rubbercone_offset_filter_alpha_arg,
         rubbercone_end_missing_frames_arg,
         rubbercone_scan_max_range_arg,
+        rubbercone_scan_max_angle_arg,
+        rubbercone_max_lateral_distance_arg,
+        rubbercone_max_cone_centers_arg,
+        rubbercone_boundary_points_arg,
         rubbercone_target_lookahead_arg,
         rubbercone_nominal_half_width_arg,
         rubbercone_offset_gain_arg,
         rubbercone_offset_limit_arg,
+        rubbercone_enable_gui_arg,
         main_node,
         traffic_node,
         rubbercone_node,
