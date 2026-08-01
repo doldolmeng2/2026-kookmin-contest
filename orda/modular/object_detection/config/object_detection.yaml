@@ -1,0 +1,21 @@
+object_detector_node:
+  ros__parameters:
+    camera_topic: "/resized_image"
+
+    # ROI (세로 비율 / 가로 반폭)
+    roi_top_ratio: 0.55
+    roi_bottom_ratio: 0.95
+    corridor_half_px: 90
+
+    # 엣지 & 후처리
+    canny_low: 60
+    canny_high: 140
+    morph_size: 5
+
+    # 막힘 판정
+    block_ratio_th: 0.12        # ROI 엣지 점유율 임계(0~1)
+    min_block_area_px: 1800     # 최대 컨투어 면적 임계
+    stable_frames_on: 3         # 막힘 연속 프레임 수(ON)
+    stable_frames_off: 3        # 클리어 연속 프레임 수(OFF)
+
+    debug_view: true

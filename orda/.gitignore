@@ -1,0 +1,16 @@
+# colcon / ament build artifacts
+# (워크스페이스 루트가 아닌 곳에서 colcon build를 돌리면 여기 생깁니다)
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 편집기 임시 파일
+.*.sw[op]
+*~
+
+# 백업
+*.bak
