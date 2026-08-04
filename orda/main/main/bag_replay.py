@@ -62,6 +62,12 @@ _ALLOWED_TRANSITIONS = frozenset(
         (Mode.LANE_DRIVE, Mode.CONE_DRIVE),
         (Mode.CONE_DRIVE, Mode.REJOIN),
         (Mode.REJOIN, Mode.LANE_DRIVE),
+        (Mode.LANE_DRIVE, Mode.FIXED_AVOID),
+        (Mode.FIXED_AVOID, Mode.OVERTAKE),
+        (Mode.OVERTAKE, Mode.LANE_DRIVE),
+        (Mode.LANE_DRIVE, Mode.SHORTCUT),
+        (Mode.SHORTCUT, Mode.LANE_DRIVE),
+        (Mode.LANE_DRIVE, Mode.FINISH),
         *((mode, Mode.STOP) for mode in Mode if mode not in (Mode.FINISH, Mode.STOP)),
     }
 )

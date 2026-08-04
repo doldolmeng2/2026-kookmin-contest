@@ -1,0 +1,296 @@
+import math
+
+import pytest
+
+from main.control_selector import CommandCandidate, ControlSource, DriveCommand
+from main.mission_types import (
+    LaneTarget,
+    ObjectLane,
+    RouteTrafficSignal,
+    opposite_lane_target,
+)
+from main.mode_info import mode_info_data
+from main.race_context import RaceContext
+from main.race_fsm import Mode, RaceFSM
+from main.runtime_adapter import RaceRuntimeAdapter
+
+
+def candidate(received_at, angle=2.0, speed=6.0):
+    return CommandCandidate(DriveCommand(angle, speed), received_at)
+
+
+def object_message(*, exists=1.0, distance=1.2, lane=1.0):
+    return [exists, distance, 0.1, 0.2, 5.0, 100.0, 20.0, 30.0, 4.0, lane]
+
+
+def adapter(mode, *, lane_target=LaneTarget.LANE_ONE):
+    return RaceRuntimeAdapter(
+        fsm=RaceFSM(initial_state=mode),
+        context=RaceContext(state_entered_at=1.0, lane_target=lane_target),
+    )
+
+
+def test_object_lane_and_lane_target_domains_are_explicitly_separate():
+    assert opposite_lane_target(ObjectLane.LEFT) is LaneTarget.LANE_TWO
+    assert opposite_lane_target(ObjectLane.RIGHT) is LaneTarget.LANE_ONE
+    assert opposite_lane_target(ObjectLane.UNKNOWN) is None
+    assert ObjectLane.LEFT.value == 1
+    assert LaneTarget.LANE_TWO.value == 1
+    assert ObjectLane.LEFT != LaneTarget.LANE_TWO
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        object_message()[:-1],
+        object_message() + [0.0],
+        object_message(distance=math.nan),
+        object_message(distance=math.inf),
+        object_message(lane=1.5),
+        object_message(lane=3.0),
+        object_message(exists=0.5),
+    ],
+)
+def test_object_info_rejects_wrong_length_nonfinite_and_invalid_enums(payload):
+    runtime = adapter(Mode.FIXED_AVOID)
+
+    result = runtime.record_object_info(payload, 1.1)
+
+    assert result.accepted is False
+    assert result.warning
+    assert runtime.latest_object_snapshot is None
+
+
+def test_object_info_accepts_exact_ten_fields_and_preserves_receipt_time():
+    runtime = adapter(Mode.FIXED_AVOID)
+
+    result = runtime.record_object_info(
+        object_message(exists=0.0, lane=0.0),
+        1.1,
+    )
+    cycle = runtime.step(1.1, lane=candidate(1.1))
+
+    assert result.accepted is True
+    assert cycle.observation.object_exists is False
+    assert cycle.observation.object_distance == pytest.approx(1.2)
+    assert cycle.observation.object_lane is ObjectLane.UNKNOWN
+    assert cycle.observation.object_received_at == 1.1
+    assert cycle.control.source is ControlSource.LANE
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [[], [0], [0, 0, 0], [2, 0], [0, -1], [True, 0], [0.0, 1.0]],
+)
+def test_lane_change_state_validates_exact_two_binary_integer_fields(payload):
+    runtime = adapter(Mode.FIXED_AVOID)
+
+    result = runtime.record_lane_change_state(payload, 1.1)
+
+    assert result.accepted is False
+    assert result.warning
+
+
+def test_lane_change_success_is_a_single_fresh_rising_edge():
+    runtime = adapter(Mode.FIXED_AVOID)
+
+    assert runtime.record_lane_change_state([1, 1], 1.1).accepted
+    first = runtime.step(1.1)
+    assert runtime.record_lane_change_state([1, 1], 1.2).accepted
+    sticky = runtime.step(1.2)
+    assert runtime.record_lane_change_state([1, 0], 1.3).accepted
+    runtime.step(1.3)
+    assert runtime.record_lane_change_state([1, 1], 1.4).accepted
+    rearmed = runtime.step(1.4)
+
+    assert first.observation.lane_change_success_edge is True
+    assert sticky.observation.lane_change_success_edge is False
+    assert rearmed.observation.lane_change_success_edge is True
+
+
+def test_duplicate_lane_change_receipt_is_rejected():
+    runtime = adapter(Mode.FIXED_AVOID)
+
+    first = runtime.record_lane_change_state([0, 0], 1.1)
+    duplicate = runtime.record_lane_change_state([0, 1], 1.1)
+
+    assert first.accepted is True
+    assert duplicate.accepted is False
+
+
+def test_left_object_starts_lane_two_action_and_success_does_not_exit_fixed():
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
+
+    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.1)
+    started = runtime.step(1.1, lane=candidate(1.1))
+    assert runtime.lane_action.pending is True
+    assert runtime.context.lane_target is LaneTarget.LANE_TWO
+    assert started.control.source is ControlSource.LANE
+    assert mode_info_data(
+        runtime.fsm.state,
+        runtime.context.lane_target.value,
+        mission_lane_control_enabled=runtime.lane_action.safe_to_drive,
+        lane_change_active=runtime.lane_action.pending,
+    ) == [5, 1]
+
+    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.2)
+    runtime.record_lane_change_state([1, 1], 1.21)
+    completed = runtime.step(1.21, lane=candidate(1.21))
+
+    assert completed.transition.changed is False
+    assert runtime.fsm.state is Mode.FIXED_AVOID
+    assert runtime.lane_action.pending is False
+    assert runtime.lane_action.completed is True
+    assert mode_info_data(
+        runtime.fsm.state,
+        runtime.context.lane_target.value,
+        mission_lane_control_enabled=runtime.lane_action.safe_to_drive,
+        lane_change_active=runtime.lane_action.pending,
+    ) == [3, 1]
+
+
+def test_right_object_maps_to_lane_one():
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_TWO)
+
+    runtime.record_object_info(object_message(lane=ObjectLane.RIGHT.value), 1.1)
+    runtime.step(1.1, lane=candidate(1.1))
+
+    assert runtime.context.lane_target is LaneTarget.LANE_ONE
+    assert runtime.lane_action.target is LaneTarget.LANE_ONE
+    assert runtime.lane_action.pending is True
+
+
+def test_overtake_reuses_lane_action_and_waits_for_explicit_completion():
+    runtime = adapter(Mode.OVERTAKE, lane_target=LaneTarget.LANE_ONE)
+
+    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.1)
+    started = runtime.step(1.1, lane=candidate(1.1))
+    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.2)
+    runtime.record_lane_change_state([1, 1], 1.21)
+    success = runtime.step(1.21, lane=candidate(1.21))
+
+    assert started.control.source is ControlSource.LANE
+    assert success.transition.changed is False
+    assert runtime.fsm.state is Mode.OVERTAKE
+    assert runtime.lane_action.completed is True
+
+    runtime.record_overtake_complete(1.3)
+    completed = runtime.step(1.3, lane=candidate(1.3))
+
+    assert completed.transition.target is Mode.LANE_DRIVE
+
+
+@pytest.mark.parametrize(
+    ("payload", "step_time"),
+    [
+        (object_message(exists=1.0, lane=ObjectLane.UNKNOWN.value), 1.1),
+        (object_message(exists=1.0, lane=ObjectLane.LEFT.value), 1.5),
+    ],
+)
+def test_unknown_or_stale_object_cannot_authorize_lane_action(payload, step_time):
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
+    runtime.record_object_info(payload, 1.1)
+
+    cycle = runtime.step(step_time, lane=candidate(step_time))
+
+    assert runtime.lane_action.pending is False
+    assert runtime.lane_action.safe_to_drive is False
+    assert cycle.control.source is ControlSource.STOP
+
+
+def test_object_snapshot_from_before_state_entry_cannot_start_action():
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
+    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 0.9)
+
+    cycle = runtime.step(1.1, lane=candidate(1.1))
+
+    assert runtime.lane_action.pending is False
+    assert cycle.control.source is ControlSource.STOP
+
+
+def test_pre_action_success_is_consumed_and_cannot_complete_later_action():
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
+    runtime.record_lane_change_state([1, 1], 1.05)
+    runtime.step(1.05)
+    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.1)
+    runtime.step(1.1, lane=candidate(1.1))
+    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.2)
+    runtime.record_lane_change_state([1, 1], 1.21)
+    sticky = runtime.step(1.21, lane=candidate(1.21))
+
+    assert sticky.observation.lane_change_success_edge is False
+    assert runtime.lane_action.pending is True
+    assert runtime.lane_action.completed is False
+
+
+def test_stale_lane_command_is_zero_even_when_fixed_action_is_authorized():
+    runtime = adapter(Mode.FIXED_AVOID)
+    runtime.record_object_info(
+        object_message(exists=0.0, lane=ObjectLane.UNKNOWN.value),
+        1.1,
+    )
+
+    cycle = runtime.step(1.3, lane=candidate(1.0))
+
+    assert runtime.lane_action.safe_to_drive is True
+    assert cycle.control.source is ControlSource.STOP
+
+
+def test_internal_zone_and_complete_seams_drive_only_the_declared_chain():
+    runtime = adapter(Mode.LANE_DRIVE)
+
+    runtime.record_fixed_zone_entry(1.1)
+    fixed = runtime.step(1.1, lane=candidate(1.1))
+    runtime.record_fixed_zone_exit(1.2)
+    overtake = runtime.step(1.2, lane=candidate(1.2))
+    runtime.record_overtake_complete(1.3)
+    lane = runtime.step(1.3, lane=candidate(1.3))
+
+    assert fixed.transition.target is Mode.FIXED_AVOID
+    assert overtake.transition.target is Mode.OVERTAKE
+    assert lane.transition.target is Mode.LANE_DRIVE
+
+
+def test_bool_start_traffic_is_never_reinterpreted_as_route_or_lap_event():
+    runtime = adapter(Mode.LANE_DRIVE)
+    runtime.record_traffic(True, 1.1)
+
+    cycle = runtime.step(1.1, lane=candidate(1.1))
+
+    assert cycle.observation.green_detected is True
+    assert cycle.observation.route_traffic_signal is RouteTrafficSignal.UNKNOWN
+    assert cycle.observation.traffic_encounter_started is False
+    assert runtime.context.completed_laps == 0
+    assert runtime.fsm.state is Mode.LANE_DRIVE
+
+
+def test_red_amber_is_recoverable_zero_control_not_terminal_stop():
+    runtime = adapter(Mode.LANE_DRIVE)
+
+    runtime.record_route_traffic(RouteTrafficSignal.RED_AMBER, 1.1)
+    held = runtime.step(1.1, lane=candidate(1.1))
+    still_held = runtime.step(1.2, lane=candidate(1.2))
+    runtime.record_route_traffic(RouteTrafficSignal.STRAIGHT, 1.3)
+    resumed = runtime.step(1.3, lane=candidate(1.3))
+
+    assert held.transition.changed is False
+    assert held.control.source is ControlSource.STOP
+    assert still_held.control.source is ControlSource.STOP
+    assert runtime.fsm.state is Mode.LANE_DRIVE
+    assert resumed.control.source is ControlSource.LANE
+
+
+def test_route_encounter_seam_is_one_shot_and_updates_lap_context():
+    runtime = adapter(Mode.LANE_DRIVE)
+    runtime.record_route_traffic(
+        RouteTrafficSignal.STRAIGHT,
+        1.1,
+        encounter_started=True,
+    )
+
+    first = runtime.step(1.1, lane=candidate(1.1))
+    repeated_timer = runtime.step(1.12, lane=candidate(1.12))
+
+    assert first.observation.traffic_encounter_started is True
+    assert repeated_timer.observation.traffic_encounter_started is False
+    assert runtime.context.completed_laps == 1

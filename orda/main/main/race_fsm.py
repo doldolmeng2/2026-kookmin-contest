@@ -1,4 +1,4 @@
-"""Pure 2026 finals FSM with only approved transitions enabled."""
+"""Pure 2026 finals FSM with explicit, receipt-time mission edges."""
 
 from dataclasses import dataclass
 from enum import Enum
@@ -12,6 +12,7 @@ from .lane_validity import (
     LaneValidityDecision,
 )
 from .mission_observation import MissionObservation
+from .mission_types import RouteTrafficSignal
 from .race_context import RaceContext
 from .safety_monitor import SafetyDecision
 
@@ -83,7 +84,7 @@ class _GreenDebouncer:
 
 
 class RaceFSM:
-    """Apply approved start, cone, REJOIN, and safety transitions."""
+    """Apply the complete ten-state orchestration without ROS side effects."""
 
     TERMINAL_STATES = frozenset({Mode.FINISH, Mode.STOP})
 
@@ -94,6 +95,7 @@ class RaceFSM:
         green_min_consecutive_frames: int = 3,
         green_min_duration_s: float = 0.0,
         green_max_age_s: float = 0.5,
+        mission_event_max_age_s: float = 0.5,
         cone_entry_config: Optional[ConeEntryConfig] = None,
         lane_validity_config: Optional[LaneValidityConfig] = None,
     ) -> None:
@@ -110,10 +112,21 @@ class RaceFSM:
         ):
             raise ValueError("green_max_age_s must be finite and non-negative")
         self.green_max_age_s = green_max_age_s
+        if (
+            isinstance(mission_event_max_age_s, bool)
+            or not isinstance(mission_event_max_age_s, (int, float))
+            or not math.isfinite(mission_event_max_age_s)
+            or mission_event_max_age_s < 0.0
+        ):
+            raise ValueError(
+                "mission_event_max_age_s must be finite and non-negative"
+            )
+        self.mission_event_max_age_s = mission_event_max_age_s
         self._cone_entry = ConeEntryDebouncer(cone_entry_config)
         self._lane_validity = LaneValidityDebouncer(lane_validity_config)
         self._last_cone_drive_message_at: Optional[float] = None
         self._last_traffic_message_at: Optional[float] = None
+        self._last_mission_message_at: dict[str, float] = {}
         self._cone_exit_armed = False
         self.last_cone_entry_decision: Optional[ConeEntryDecision] = None
         self.last_lane_validity_decision: Optional[
@@ -204,6 +217,37 @@ class RaceFSM:
             return self._stay("waiting for debounced green")
 
         if self.state is Mode.LANE_DRIVE:
+            route_transition = self._handle_traffic_encounter(
+                observation,
+                context,
+            )
+            if route_transition is not None:
+                return route_transition
+
+            # Explicit course-zone evidence outranks opportunistic cone
+            # perception. Object detection is deliberately not an entry guard.
+            if (
+                not context.on_shortcut_lap
+                and observation.fixed_zone_entered is True
+                and self._accept_mission_edge(
+                    "fixed_zone_entry",
+                    observation.fixed_zone_entry_received_at,
+                    observation,
+                    context,
+                )
+            ):
+                self._cone_entry.deactivate()
+                return self._change(
+                    Mode.FIXED_AVOID,
+                    "fresh fixed-zone entry",
+                    context,
+                    observation.now,
+                )
+
+            if context.on_shortcut_lap:
+                self._cone_entry.deactivate()
+                return self._stay("normal-route missions suppressed on shortcut lap")
+
             decision = self._cone_entry.evaluate(observation)
             self.last_cone_entry_decision = decision
             if decision.triggered:
@@ -259,22 +303,160 @@ class RaceFSM:
                 )
             return self._stay(decision.reason)
 
+        if self.state is Mode.FIXED_AVOID:
+            self._cone_entry.deactivate()
+            self._lane_validity.deactivate()
+            if (
+                observation.fixed_zone_exited is True
+                and self._accept_mission_edge(
+                    "fixed_zone_exit",
+                    observation.fixed_zone_exit_received_at,
+                    observation,
+                    context,
+                )
+            ):
+                return self._change(
+                    Mode.OVERTAKE,
+                    "fresh fixed-zone exit",
+                    context,
+                    observation.now,
+                )
+            return self._stay("waiting for fresh fixed-zone exit")
+
+        if self.state is Mode.OVERTAKE:
+            self._cone_entry.deactivate()
+            self._lane_validity.deactivate()
+            if (
+                observation.overtake_complete is True
+                and self._accept_mission_edge(
+                    "overtake_complete",
+                    observation.overtake_complete_received_at,
+                    observation,
+                    context,
+                )
+            ):
+                return self._change(
+                    Mode.LANE_DRIVE,
+                    "fresh overtake complete",
+                    context,
+                    observation.now,
+                )
+            return self._stay("waiting for fresh overtake complete")
+
+        if self.state is Mode.SHORTCUT:
+            self._cone_entry.deactivate()
+            self._lane_validity.deactivate()
+            if (
+                observation.shortcut_complete is True
+                and self._accept_mission_edge(
+                    "shortcut_complete",
+                    observation.shortcut_complete_received_at,
+                    observation,
+                    context,
+                )
+            ):
+                return self._change(
+                    Mode.LANE_DRIVE,
+                    "fresh shortcut complete",
+                    context,
+                    observation.now,
+                )
+            return self._stay("waiting for fresh shortcut complete")
+
         # Cone-entry evidence must never accumulate outside LANE_DRIVE. Keep a
         # completed episode rearmed for a future LANE_DRIVE visit.
         self._cone_entry.deactivate()
         self._lane_validity.deactivate()
 
-        # finish_gate_crossed is intentionally ignored. The Gate event source
-        # and debounce contract must be fixed before lap counting is enabled.
-        #
-        # Final shortcut policy contract (not implemented in this phase):
-        # LANE_DRIVE transitions directly to SHORTCUT when a left-turn signal
-        # is confirmed, current_lap is 2 or 3, shortcut_used is false, and the
-        # shortcut-entry-ready input is true. The first valid opportunity is
-        # used. shortcut_used becomes true only when that transition commits,
-        # so repeated evaluation of one signal cannot consume it twice. There
-        # is deliberately no intermediate route-decision mode.
         return self._stay("transition not implemented in this phase")
+
+    def _handle_traffic_encounter(
+        self,
+        observation: MissionObservation,
+        context: RaceContext,
+    ) -> Optional[Transition]:
+        """Commit one typed route encounter and its deterministic branch."""
+
+        if observation.traffic_encounter_started is not True:
+            return None
+        if observation.route_traffic_signal not in (
+            RouteTrafficSignal.STRAIGHT,
+            RouteTrafficSignal.LEFT,
+        ):
+            return None
+        timestamp = observation.traffic_encounter_received_at
+        if not self._accept_mission_edge(
+            "traffic_encounter",
+            timestamp,
+            observation,
+            context,
+        ):
+            return None
+        if timestamp is None:
+            return None
+        if (
+            context.last_traffic_encounter_at is not None
+            and timestamp <= context.last_traffic_encounter_at
+        ):
+            return None
+
+        context.last_traffic_encounter_at = timestamp
+        context.completed_laps = min(
+            context.completed_laps + 1,
+            context.TOTAL_LAPS,
+        )
+        if context.completed_laps >= context.TOTAL_LAPS:
+            self._cone_entry.deactivate()
+            return self._change(
+                Mode.FINISH,
+                "three traffic encounters completed",
+                context,
+                observation.now,
+            )
+
+        if (
+            observation.route_traffic_signal is RouteTrafficSignal.LEFT
+            and context.current_lap in (2, 3)
+            and context.shortcut_lap is None
+        ):
+            context.shortcut_lap = context.current_lap
+            self._cone_entry.deactivate()
+            return self._change(
+                Mode.SHORTCUT,
+                "left route selected for shortcut lap",
+                context,
+                observation.now,
+            )
+        return None
+
+    def _accept_mission_edge(
+        self,
+        key: str,
+        timestamp: Optional[float],
+        observation: MissionObservation,
+        context: RaceContext,
+    ) -> bool:
+        """Consume each explicit edge once and qualify only its state session."""
+
+        if not self._valid_timestamp(timestamp):
+            return False
+        previous = self._last_mission_message_at.get(key)
+        if previous is not None and timestamp <= previous:
+            return False
+        # A unique edge is consumed even if it predates this state or is stale,
+        # preventing a sticky value from becoming valid on a later step.
+        self._last_mission_message_at[key] = timestamp
+
+        if not self._valid_timestamp(observation.now):
+            return False
+        if not self._valid_timestamp(context.state_entered_at):
+            return False
+        age_s = observation.now - timestamp
+        return (
+            timestamp > context.state_entered_at
+            and age_s >= -_TIMESTAMP_EPSILON_S
+            and age_s - self.mission_event_max_age_s <= _TIMESTAMP_EPSILON_S
+        )
 
     def _accept_new_traffic_message(
         self,

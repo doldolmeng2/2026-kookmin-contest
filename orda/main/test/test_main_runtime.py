@@ -14,11 +14,12 @@ from rclpy.qos import (
     qos_profile_sensor_data,
 )
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Empty, Int32MultiArray
+from std_msgs.msg import Bool, Empty, Float32MultiArray, Int32MultiArray
 
 from main.main import (
     LANE_VALIDITY_REQUIRED_RATE_HZ,
     LANE_VALIDITY_TOPIC,
+    LANE_CHANGE_STATE_TOPIC,
     MainNode,
     RUBBERCONE_INFO_TOPIC,
     RUBBERCONE_RESET_TOPIC,
@@ -30,6 +31,7 @@ from main.main import (
 from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import RaceRuntimeAdapter
+from main.mission_types import ObjectLane
 
 
 class CallbackHarness:
@@ -85,6 +87,70 @@ def test_main_scan_and_cone_callbacks_use_the_same_clock_helper():
     assert cycle.observation.scan_received_at == 3.0
     assert cycle.observation.cone_message_received_at == 3.01
     assert cycle.observation.now == 3.02
+
+
+def test_main_object_callback_records_validated_ten_field_snapshot():
+    harness = CallbackHarness([4.0])
+    message = SimpleNamespace(
+        data=[1.0, 1.2, 0.1, 0.2, 5.0, 100.0, 20.0, 30.0, 4.0, 2.0],
+    )
+
+    MainNode.object_info_callback(harness, message)
+    cycle = harness.runtime.step(4.02)
+
+    assert cycle.observation.object_exists is True
+    assert cycle.observation.object_distance == pytest.approx(1.2)
+    assert cycle.observation.object_lane is ObjectLane.RIGHT
+    assert cycle.observation.object_received_at == 4.0
+    assert harness.warnings == []
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        [1.0] * 9,
+        [1.0, float("nan"), 0.1, 0.2, 5.0, 100.0, 20.0, 30.0, 4.0, 1.0],
+        [1.0, 1.2, 0.1, 0.2, 5.0, 100.0, 20.0, 30.0, 4.0, 3.0],
+    ],
+)
+def test_main_object_callback_warns_on_invalid_payload(data):
+    harness = CallbackHarness([4.0])
+
+    MainNode.object_info_callback(harness, SimpleNamespace(data=data))
+
+    assert harness.runtime.latest_object_snapshot is None
+    assert harness.warnings[0][0] == "malformed_object_info"
+
+
+def test_main_lane_change_callback_records_one_fresh_success_edge():
+    harness = CallbackHarness([5.0, 5.1], mode=Mode.FIXED_AVOID)
+
+    MainNode.lane_change_state_callback(
+        harness,
+        SimpleNamespace(data=[1, 1]),
+    )
+    first = harness.runtime.step(5.02)
+    MainNode.lane_change_state_callback(
+        harness,
+        SimpleNamespace(data=[1, 1]),
+    )
+    sticky = harness.runtime.step(5.12)
+
+    assert first.observation.lane_change_received_at == 5.0
+    assert first.observation.lane_change_success_edge is True
+    assert sticky.observation.lane_change_success_edge is False
+    assert harness.warnings == []
+
+
+def test_main_lane_change_callback_warns_on_invalid_payload():
+    harness = CallbackHarness([5.0], mode=Mode.FIXED_AVOID)
+
+    MainNode.lane_change_state_callback(
+        harness,
+        SimpleNamespace(data=[1]),
+    )
+
+    assert harness.warnings[0][0] == "malformed_lane_change_state"
 
 
 def test_callback_and_control_cycle_read_the_same_node_clock_method():
@@ -180,6 +246,19 @@ def test_generated_ros_entities_have_exact_topic_type_and_qos():
         assert validity_sub.msg_type is Bool
         assert validity_sub.qos_profile == lane_validity_qos()
 
+        lane_change_sub = node.lane_change_state_sub
+        assert lane_change_sub.topic_name == LANE_CHANGE_STATE_TOPIC
+        assert lane_change_sub.msg_type is Int32MultiArray
+        assert lane_change_sub.qos_profile.history is HistoryPolicy.KEEP_LAST
+        assert lane_change_sub.qos_profile.depth == 10
+        assert lane_change_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
+        assert lane_change_sub.qos_profile.durability is DurabilityPolicy.VOLATILE
+
+        object_sub = node.object_info_sub
+        assert object_sub.topic_name == "/object_info"
+        assert object_sub.msg_type is Float32MultiArray
+        assert object_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
+
         mode_pub = node.mode_pub
         assert mode_pub.topic_name == "/mode_info"
         assert mode_pub.msg_type is Int32MultiArray
@@ -198,6 +277,16 @@ def test_missing_lane_validity_publisher_contract_is_explicit():
     assert qos.depth == 10
     assert qos.reliability is ReliabilityPolicy.BEST_EFFORT
     assert qos.durability is DurabilityPolicy.VOLATILE
+
+
+def test_lane_change_feedback_uses_existing_topic_without_new_mission_topics():
+    assert LANE_CHANGE_STATE_TOPIC == "/lane_change_state"
+    source = inspect.getsource(MainNode.__init__)
+
+    assert "LANE_CHANGE_STATE_TOPIC" in source
+    assert "fixed_zone" not in source
+    assert "overtake_complete" not in source
+    assert "shortcut_complete" not in source
 
 
 @pytest.mark.parametrize(

@@ -111,6 +111,56 @@ def test_cone_drive_selects_fresh_cone_and_ignores_fresh_lane():
     assert decision.command is CONE_COMMAND
 
 
+@pytest.mark.parametrize("mode", [Mode.FIXED_AVOID, Mode.OVERTAKE])
+def test_action_modes_select_lane_only_with_explicit_authorization(mode):
+    selector = ControlSelector()
+
+    unauthorized = selector.select(
+        mode,
+        10.0,
+        lane=candidate(LANE_COMMAND, 10.0),
+    )
+    authorized = selector.select(
+        mode,
+        10.0,
+        lane=candidate(LANE_COMMAND, 10.0),
+        mission_lane_authorized=True,
+    )
+
+    assert unauthorized.source is ControlSource.STOP
+    assert authorized.source is ControlSource.LANE
+    assert authorized.command is LANE_COMMAND
+
+
+def test_authorized_action_mode_still_rejects_stale_lane_command():
+    decision = ControlSelector().select(
+        Mode.FIXED_AVOID,
+        10.0,
+        lane=candidate(LANE_COMMAND, 9.0),
+        mission_lane_authorized=True,
+    )
+
+    assert decision.source is ControlSource.STOP
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [Mode.LANE_DRIVE, Mode.CONE_DRIVE, Mode.FIXED_AVOID, Mode.OVERTAKE],
+)
+def test_route_traffic_hold_overrides_motion_without_changing_mode(mode):
+    decision = ControlSelector().select(
+        mode,
+        10.0,
+        lane=candidate(LANE_COMMAND, 10.0),
+        cone=candidate(CONE_COMMAND, 10.0),
+        mission_lane_authorized=True,
+        traffic_hold=True,
+    )
+
+    assert decision.source is ControlSource.STOP
+    assert decision.reason == "recoverable route-traffic hold"
+
+
 @pytest.mark.parametrize(
     "cone",
     [None, candidate(CONE_COMMAND, 9.0)],

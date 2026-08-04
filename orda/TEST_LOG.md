@@ -172,3 +172,50 @@ Repeated sessions in one process:
 4. Require two complete `LANE -> CONE -> REJOIN -> LANE` chains, two detector
    resets, non-zero isolated cone and returned-lane control in both sessions,
    no STOP, and clean graph/process teardown.
+
+## 2026-08-05 — KMU finals FSM orchestration skeleton
+
+### Baseline and scope
+
+- Branch: `feature/2026-finals-fsm-rubbercone-integration`
+- Start/end HEAD: `9bef8f67a0d87559de052663850b1eadc6d5be04`
+- Initial worktree: clean
+- No ROS launch, hardware driver, bag playback, or motor publish was run.
+- No production ROS topic was created for zone, route, overtake-complete, or
+  shortcut-complete inputs. Those inputs exist only as typed runtime injection
+  seams until real publishers are defined.
+
+### Implemented contracts
+
+- Completed the ten-state pure FSM transition skeleton, including explicit
+  fresh receipt edges for fixed-zone entry/exit, overtake completion, shortcut
+  completion, three traffic encounters, and `FINISH`.
+- Replaced mutable Gate/shortcut flags with canonical `completed_laps` and
+  `shortcut_lap`; compatibility names are derived aliases only.
+- Added strict typed adapters for the existing ten-field `/object_info` and
+  `/lane_change_state [changing, success]` topics.
+- Added FIXED/OVERTAKE lane-action orchestration. A fresh object may select the
+  opposite lane, fresh lane-change success changes only the action output from
+  legacy mode 5 to mode 3, and only explicit mission completion exits the FSM
+  state.
+- Added an internal route-traffic contract. RED/AMBER latches a recoverable
+  zero-control override; the existing Bool `/traffic_detection` remains start
+  green only and cannot affect lap or route decisions.
+
+### Verification classification
+
+- UNIT PASS: `142 passed` for FSM, context, control selection, mode adapter, and
+  safety tests.
+- MOCK PASS: `104 passed` for typed runtime events, callbacks, QoS, action
+  orchestration, and state-contract tests.
+- Full main regression: `350 passed` (previous baseline: `280 passed`).
+- BAG PASS: retained from the 2026-08-05 scan-only rubbercone run recorded
+  above. The bag was deliberately not replayed for this change.
+- UNVERIFIED: production fixed-zone entry/exit, route traffic/lap publisher,
+  overtake-complete publisher, shortcut controller/completion, production IMU
+  wiring, fixed/overtake mission bags, and real-vehicle behavior.
+
+### Preserved backlog
+
+- Rubbercone negative-bag validation and repeated sessions in one process
+  remain the regression backlog described in the preceding section.

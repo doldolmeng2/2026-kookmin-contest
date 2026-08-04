@@ -91,11 +91,16 @@ class ControlSelector:
         *,
         lane: Optional[CommandCandidate] = None,
         cone: Optional[CommandCandidate] = None,
+        mission_lane_authorized: bool = False,
+        traffic_hold: bool = False,
     ) -> ControlDecision:
         """Select using receipt ages computed only in the caller's clock domain."""
 
         if not self._valid_number(now):
             return self._stop("invalid selection timestamp")
+
+        if traffic_hold:
+            return self._stop("recoverable route-traffic hold")
 
         if mode is Mode.LANE_DRIVE:
             valid, reason = self._candidate_is_fresh(
@@ -127,6 +132,23 @@ class ControlSelector:
                 )
             # Never inspect lane freshness here. There is intentionally no
             # lane fallback in CONE_DRIVE.
+            return self._stop(reason)
+
+        if mode in (Mode.FIXED_AVOID, Mode.OVERTAKE):
+            if not mission_lane_authorized:
+                return self._stop(f"{mode.value} lane action not authorized")
+            valid, reason = self._candidate_is_fresh(
+                lane,
+                now,
+                self.config.max_lane_age_s,
+                "lane",
+            )
+            if valid:
+                return ControlDecision(
+                    ControlSource.LANE,
+                    lane.command,
+                    f"fresh {mode.value} lane command selected",
+                )
             return self._stop(reason)
 
         if mode in (Mode.INIT, Mode.WAIT_GREEN, Mode.FINISH, Mode.STOP):
@@ -185,6 +207,8 @@ def commit_fsm_then_select_control(
     *,
     lane: Optional[CommandCandidate] = None,
     cone: Optional[CommandCandidate] = None,
+    mission_lane_authorized: bool = False,
+    traffic_hold: bool = False,
 ) -> ControlCycleResult:
     """Commit the FSM first, then arbitrate using its resulting Mode."""
 
@@ -194,5 +218,7 @@ def commit_fsm_then_select_control(
         observation.now,
         lane=lane,
         cone=cone,
+        mission_lane_authorized=mission_lane_authorized,
+        traffic_hold=traffic_hold,
     )
     return ControlCycleResult(transition=transition, control=control)

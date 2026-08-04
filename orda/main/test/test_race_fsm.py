@@ -600,16 +600,9 @@ def test_terminal_states_ignore_further_events_and_faults(terminal):
 
 @pytest.mark.parametrize(
     "state",
-    [
-        Mode.LANE_DRIVE,
-        Mode.CONE_DRIVE,
-        Mode.REJOIN,
-        Mode.FIXED_AVOID,
-        Mode.OVERTAKE,
-        Mode.SHORTCUT,
-    ],
+    [Mode.LANE_DRIVE, Mode.CONE_DRIVE, Mode.REJOIN, Mode.FIXED_AVOID],
 )
-def test_unimplemented_mission_events_self_transition(state):
+def test_legacy_unwired_mission_fields_do_not_invent_transitions(state):
     fsm = RaceFSM(initial_state=state)
     context = RaceContext(
         finish_gate_passes=1,
@@ -622,18 +615,12 @@ def test_unimplemented_mission_events_self_transition(state):
         lane_valid_received_at=11.0,
         cone_detected=True,
         cone_finished=True,
-        fixed_vehicle_detected=True,
-        fixed_avoid_complete=True,
-        interfering_vehicle_detected=True,
+        object_exists=True,
+        object_received_at=11.0,
         overtake_complete=True,
-        left_turn_signal=True,
         shortcut_complete=True,
-        finish_gate_crossed=True,
-        fixed_avoid_complete_received_at=11.0,
         overtake_complete_received_at=11.0,
-        left_turn_signal_received_at=11.0,
         shortcut_complete_received_at=11.0,
-        finish_gate_crossed_received_at=11.0,
     )
 
     transition = fsm.step(observation, context, safe())

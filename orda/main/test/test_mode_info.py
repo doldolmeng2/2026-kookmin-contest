@@ -66,6 +66,36 @@ def test_lane_change_code_exists_only_as_consumer_contract_not_fsm_mapping():
     )
 
 
+@pytest.mark.parametrize("mode", [Mode.FIXED_AVOID, Mode.OVERTAKE])
+def test_action_level_mode_info_orders_stop_change_then_lane(mode):
+    stopped = mode_info_data(mode, 0)
+    changing = mode_info_data(
+        mode,
+        1,
+        mission_lane_control_enabled=True,
+        lane_change_active=True,
+    )
+    settled = mode_info_data(
+        mode,
+        1,
+        mission_lane_control_enabled=True,
+        lane_change_active=False,
+    )
+
+    assert stopped == [0, 0]
+    assert changing == [5, 1]
+    assert settled == [3, 1]
+
+
+def test_lane_change_code_is_not_emitted_while_action_is_unsafe():
+    assert mode_info_data(
+        Mode.FIXED_AVOID,
+        0,
+        mission_lane_control_enabled=False,
+        lane_change_active=True,
+    ) == [0, 0]
+
+
 def test_rejoin_completion_changes_external_mode_to_lane_not_fixed_avoid():
     fsm = RaceFSM(
         initial_state=Mode.REJOIN,

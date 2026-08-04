@@ -36,8 +36,20 @@ def external_mode_code(mode: Any) -> LegacyModeInfoCode:
     return _CONFIRMED_MODE_CODES.get(mode, LegacyModeInfoCode.STOP)
 
 
-def mode_info_data(mode: Any, lane: Any) -> list[int]:
-    """Build the current two-field ``[mode, lane]`` external contract."""
+def mode_info_data(
+    mode: Any,
+    lane: Any,
+    *,
+    mission_lane_control_enabled: bool = False,
+    lane_change_active: bool = False,
+) -> list[int]:
+    """Build the existing two-field contract with action-level lane control."""
 
     lane_value = lane if isinstance(lane, int) and lane in (0, 1) else 1
-    return [int(external_mode_code(mode)), lane_value]
+    code = external_mode_code(mode)
+    if mode in (Mode.FIXED_AVOID, Mode.OVERTAKE):
+        if lane_change_active and mission_lane_control_enabled:
+            code = LegacyModeInfoCode.LANE_CHANGE
+        elif mission_lane_control_enabled:
+            code = LegacyModeInfoCode.LANE_DRIVE
+    return [int(code), lane_value]

@@ -35,6 +35,7 @@ from main.runtime_adapter import (
 RUBBERCONE_INFO_TOPIC = "/rubbercone_info"
 RUBBERCONE_RESET_TOPIC = "/rubbercone_reset"
 LANE_VALIDITY_TOPIC = "/lane_valid"
+LANE_CHANGE_STATE_TOPIC = "/lane_change_state"
 LANE_VALIDITY_REQUIRED_RATE_HZ = 10.0
 CONE_EVENT_WARNING_PERIOD_S = 5.0
 
@@ -201,6 +202,12 @@ class MainNode(Node):
             self.lane_validity_callback,
             lane_validity_qos(),
         )
+        self.lane_change_state_sub = self.create_subscription(
+            Int32MultiArray,
+            LANE_CHANGE_STATE_TOPIC,
+            self.lane_change_state_callback,
+            sensor_event_qos(depth=10),
+        )
         self.ultrasonic_sub = self.create_subscription(
             Int32MultiArray,
             "xycar_ultrasonic",
@@ -250,8 +257,15 @@ class MainNode(Node):
             )
 
     def object_info_callback(self, msg: Float32MultiArray) -> None:
+        received_at = self._now_seconds()
         data = msg.data
-        if len(data) < 10:
+        result = self.runtime.record_object_info(data, received_at)
+        if not result.accepted:
+            self._warn_throttled(
+                "malformed_object_info",
+                result.warning or "invalid object_info message ignored",
+                received_at,
+            )
             return
         self.obj_exists = float(data[0])
         self.object_dist = float(data[1])
@@ -263,6 +277,16 @@ class MainNode(Node):
         self.box_cy = float(data[7])
         self.box_dx = float(data[8])
         self.car_lane = int(data[9])
+
+    def lane_change_state_callback(self, msg: Int32MultiArray) -> None:
+        received_at = self._now_seconds()
+        result = self.runtime.record_lane_change_state(msg.data, received_at)
+        if not result.accepted:
+            self._warn_throttled(
+                "malformed_lane_change_state",
+                result.warning or "invalid lane_change_state message ignored",
+                received_at,
+            )
 
     def ultrasonic_callback(self, msg: Int32MultiArray) -> None:
         data = msg.data
@@ -303,8 +327,17 @@ class MainNode(Node):
         motor_msg.data = [float(angle), float(speed)]
         self.motor_pub.publish(motor_msg)
 
+        self.lane = self.runtime.context.lane_target.value
         mode_msg = Int32MultiArray()
-        mode_msg.data = mode_info_data(self.runtime.fsm.state, self.lane)
+        mode_msg.data = mode_info_data(
+            self.runtime.fsm.state,
+            self.lane,
+            mission_lane_control_enabled=self.runtime.lane_action.safe_to_drive,
+            lane_change_active=(
+                self.runtime.lane_action.pending
+                and self.runtime.lane_action.safe_to_drive
+            ),
+        )
         self.mode_pub.publish(mode_msg)
 
         self._update_debug_window(now, angle, speed)

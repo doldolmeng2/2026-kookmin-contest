@@ -273,9 +273,9 @@ main/main/
 | `LANE_DRIVE` | 3 | 차선 주행 (기본 중앙 주행) | 아래 분기 참조 |
 | `CONE_DRIVE` | 1 | 라바콘 구간 주행 | fresh `end_flag` 0→1 |
 | `REJOIN` | 2 | 라바콘 종료 후 차선 복귀 대기 | 명시적 차선 유효성 입력 |
-| `FIXED_AVOID` | 0 (STOP) | 고정장애물 구간, runtime 도달 불가 | 진입·종료 event 계약 모두 미확정 |
-| `OVERTAKE` | 0 (STOP) | 방해차량 구간, 외부 제어 미확정 | 추월 완료 |
-| `SHORTCUT` | 0 (STOP) | 지름길, 외부 제어 미확정 | 목표 yaw 도달 |
+| `FIXED_AVOID` | 기본 0, action 중 5→3 | 고정장애물 구간 | typed zone-exit edge |
+| `OVERTAKE` | 기본 0, action 중 5→3 | 방해차량 구간 | typed overtake-complete edge |
+| `SHORTCUT` | 0 (STOP) | 지름길, production controller 없음 | typed shortcut-complete edge |
 | `FINISH` | 0 (STOP) | 3바퀴 완료 | — |
 | `STOP` | 0 (STOP) | 안전 정지 | — |
 
@@ -385,9 +385,10 @@ python3 -m main.tools.replay_fsm_bag <bag_path>
 
 ### 미해결 항목
 
-- `REJOIN → LANE_DRIVE` 는 구현됨. `FIXED_AVOID` 진입과 `OVERTAKE` · `SHORTCUT` · `FINISH` 전이는 외부 event 계약 미확정
+- 10상태 순수 FSM 전이는 구현됨. fixed-zone, route traffic, overtake-complete,
+  shortcut-complete는 typed internal contract와 test injection만 있고 production publisher는 없음
 - `shortcut_turn.py` 미작성 (지름길 좌회전 궤적)
-- 랩 카운터 미구현 — `race_context.finish_gate_passes` 가 아직 증가하지 않음
+- `completed_laps`/`shortcut_lap` 랩 정책은 구현됨. 실제 traffic encounter publisher는 없음
 - 시간 제한 감시는 현재 `SafetyMonitor` 기본값(라바콘 60초 / 전체 240초)으로 동작한다.
   이는 2026-07-29 「제9회 경주 진행 방법」 p.25와 p.37의 공식 제한이다. 전체 주행시간은
   p.17에 따라 파란불의 첫 fresh 관측 시각부터 계산하며, debounce 완료 시각으로 늦추지 않는다.
