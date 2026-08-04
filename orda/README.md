@@ -350,6 +350,10 @@ ros2 launch main module_drive.py
 # bag 파일 테스트
 ros2 launch main module_drive_bag_test.py
 
+# 국민대 라바콘 FSM bag 통합 테스트 (scan-only, motor 출력 격리)
+./main/tools/run_rubbercone_bag_test.sh \
+  ~/bags/kmu_real_lidar/rubbercone_20260725_221245
+
 # 수동 주행 (Xbox 컨트롤러)
 ros2 launch manual_drive manual_drive.launch.py
 

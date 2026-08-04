@@ -24,6 +24,7 @@ RUBBERCONE_SOURCE = (
     ORDA_ROOT / "driving" / "rubbercone" / "src" / "rubbercone.cpp"
 )
 BAG_TEST_LAUNCH = ORDA_ROOT / "main" / "launch" / "module_drive_bag_test.py"
+BAG_TEST_RUNNER = ORDA_ROOT / "main" / "tools" / "run_rubbercone_bag_test.sh"
 
 
 def candidate(angle, speed, received_at):
@@ -232,3 +233,25 @@ def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
         and node.func.id == "IncludeLaunchDescription"
         for node in ast.walk(tree)
     )
+
+
+def test_rubbercone_bag_runner_enforces_safe_scan_only_playback():
+    source = BAG_TEST_RUNNER.read_text(encoding="utf-8")
+    scan_mock_stop = '\nstop_process "${SCAN_MOCK_PID}"\nSCAN_MOCK_PID=""'
+    scan_only_play = (
+        'ros2 bag play "${BAG_PATH}" --disable-keyboard-controls --topics /scan'
+    )
+
+    assert "mode:=0" in source
+    assert "kmu_test_scan_mock" in source
+    assert scan_mock_stop in source
+    assert source.index(scan_mock_stop) < source.index(scan_only_play)
+    assert source.count('assert_no_real_motor_publishers "') == 3
+    assert scan_only_play in source
+    assert source.count("--topics /scan") == 2
+    assert "--topics /scan /xycar_motor" not in source
+    assert "--topics /scan /rubbercone_info" not in source
+    assert "/bag_test/xycar_motor" in source
+    assert "FSM LANE_DRIVE -> CONE_DRIVE: cone entry confirmed" in source
+    assert "xycar_camera" not in source
+    assert "xycar_lidar" not in source
