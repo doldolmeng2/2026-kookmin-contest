@@ -24,6 +24,7 @@ TYPE_BY_TOPIC = {
     "/mode_info": "std_msgs/msg/Int32MultiArray",
     "/xycar_motor": "std_msgs/msg/Float32MultiArray",
     "/scan": "sensor_msgs/msg/LaserScan",
+    "/lane_valid": "std_msgs/msg/Bool",
 }
 
 
@@ -71,7 +72,7 @@ def test_bag_timestamp_is_the_observation_and_transition_clock():
 
     assert report["fsm"]["final_mode"] == "LANE_DRIVE"
     assert report["fsm"]["state_entered_at_s"] == 103.0
-    assert report["fsm"]["race_started_at_s"] == 103.0
+    assert report["fsm"]["race_started_at_s"] == 101.0
     assert report["fsm"]["transition_timeline"] == [
         {
             "timestamp_s": 103.0,
@@ -230,6 +231,88 @@ def test_replay_enters_cone_drive_on_unique_cone_edges_only():
     ]
 
 
+def test_replay_enters_rejoin_once_on_new_zero_to_one_session():
+    report = replay(
+        [
+            event("/scan", 0.9),
+            event("/rubbercone_info", 1.0, [4, 1, 0]),
+            event("/rubbercone_info", 1.1, [4, 1, 0]),
+            event("/rubbercone_info", 1.2, [4, 0, 80]),
+            event("/rubbercone_info", 1.3, [4, 1, 0]),
+            event("/rubbercone_info", 1.4, [4, 1, 0]),
+        ],
+        start_mode=Mode.CONE_DRIVE,
+    )
+
+    assert report["fsm"]["final_mode"] == "REJOIN"
+    assert report["fsm"]["state_entered_at_s"] == 1.3
+    assert report["fsm"]["transition_count"] == 1
+    assert report["fsm"]["transition_timeline"] == [
+        {
+            "timestamp_s": 1.3,
+            "relative_time_s": 0.4,
+            "source_mode": "CONE_DRIVE",
+            "target_mode": "REJOIN",
+            "reason": "fresh cone end flag",
+        }
+    ]
+    assert report["validation"]["invariants"][
+        "only_allowed_transitions_observed"
+    ] is True
+
+
+def test_replay_latched_one_sequence_never_ends_unarmed_session():
+    report = replay(
+        [
+            event("/scan", 0.9),
+            event("/rubbercone_info", 1.0, [0, 1, 0]),
+            event("/scan", 1.1),
+            event("/rubbercone_info", 1.2, [0, 1, 0]),
+            event("/rubbercone_info", 1.3, [0, 1, 0]),
+        ],
+        start_mode=Mode.CONE_DRIVE,
+    )
+
+    assert report["fsm"]["final_mode"] == "CONE_DRIVE"
+    assert report["fsm"]["transition_count"] == 0
+    assert report["fsm"]["state_entered_at_s"] == 0.9
+
+
+def test_replay_rejects_regressed_end_before_accepting_newer_end():
+    report = replay(
+        [
+            event("/scan", 1.8),
+            event("/rubbercone_info", 2.0, [0, 0, 80]),
+            event("/rubbercone_info", 1.9, [0, 1, 0]),
+            event("/scan", 2.1),
+            event("/rubbercone_info", 2.2, [0, 1, 0]),
+        ],
+        start_mode=Mode.CONE_DRIVE,
+    )
+
+    assert report["processing"]["timestamp_regression_count"] == 1
+    assert report["fsm"]["transition_count"] == 1
+    assert report["fsm"]["transition_timeline"][0]["timestamp_s"] == 2.2
+
+
+@pytest.mark.parametrize("shift", [0.0, 60.0, 3600.0])
+def test_replay_cone_exit_depends_on_relative_freshness_not_absolute_time(shift):
+    report = replay(
+        [
+            event("/scan", shift + 0.9),
+            event("/rubbercone_info", shift + 1.0, [0, 0, 80]),
+            event("/rubbercone_info", shift + 1.1, [0, 1, 0]),
+        ],
+        start_mode=Mode.CONE_DRIVE,
+    )
+
+    assert report["fsm"]["final_mode"] == "REJOIN"
+    assert report["fsm"]["transition_count"] == 1
+    assert report["fsm"]["transition_timeline"][0][
+        "relative_time_s"
+    ] == pytest.approx(0.2, abs=TIMING_TOLERANCE_S)
+
+
 def test_duplicate_cone_edge_does_not_advance_replay_guard():
     report = replay(
         [
@@ -340,6 +423,37 @@ def test_lane_offset_is_reference_only_and_never_infers_lane_validity():
     assert report["fsm"]["transition_count"] == 0
     assert report["fsm"]["fsm_evaluation_count"] == 0
     assert report["lane_reference"]["lane_validity_inferred"] is False
+
+
+def test_replay_rejoin_returns_to_lane_only_on_fresh_lane_validity_edges():
+    report = replay(
+        [
+            event("/scan", 1.0),
+            event("/lane_valid", 1.1, True),
+            event("/lane_valid", 1.2, True),
+            event("/lane_valid", 1.31, True),
+        ],
+        start_mode=Mode.REJOIN,
+    )
+
+    assert report["fsm"]["final_mode"] == "LANE_DRIVE"
+    assert report["fsm"]["state_entered_at_s"] == 1.31
+    assert report["fsm"]["transition_timeline"] == [
+        {
+            "timestamp_s": 1.31,
+            "relative_time_s": 0.31,
+            "source_mode": "REJOIN",
+            "target_mode": "LANE_DRIVE",
+            "reason": "fresh lane validity confirmed",
+        }
+    ]
+    assert report["validation"]["invariants"][
+        "only_allowed_transitions_observed"
+    ] is True
+    assert any(
+        "REJOIN to LANE_DRIVE" in item
+        for item in report["validation"]["verifiable_scope"]
+    )
 
 
 def test_legacy_mode_trace_never_changes_the_new_mode():
