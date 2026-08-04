@@ -90,3 +90,85 @@ exit detection or overlap the recorded scan stream.
   real-motor publisher interlocks, the isolated motor topic, safe startup, and
   absence of hardware driver commands.
 
+## 2026-08-05 — KMU REJOIN to lane integration
+
+### Baseline and cause classification
+
+- Branch: `feature/2026-finals-fsm-rubbercone-integration`
+- HEAD: `58dd9169f0acb6e3353824e13bfc458af21635dd`
+- Initial worktree: clean
+
+The production REJOIN guard accepts only explicit `/lane_valid`
+`std_msgs/msg/Bool=True` receipt edges. A qualifying sequence requires all of
+the following:
+
+- every edge was received strictly after the REJOIN entry timestamp;
+- every edge is at most 0.25 s old when evaluated;
+- at least three unique true edges are received;
+- at least 0.2 s elapses between the first and final qualifying edge.
+
+The runtime discards validity edges queued before the `CONE_DRIVE -> REJOIN`
+commit. `/lane_offset` is intentionally not treated as lane validity.
+
+The positive bag contains no `/lane_valid` topic, and scan-only playback would
+not replay it even if present. The production graph also has no `/lane_valid`
+publisher yet. The guard itself is implemented and covered by unit tests; the
+missing item is the perception-side producer contract. The previous harness
+also stopped after bag completion without requiring `REJOIN -> LANE_DRIVE`.
+
+### Test-only extension
+
+The production FSM and runtime were not changed. The harness now:
+
+1. requires `CONE_DRIVE -> REJOIN`;
+2. starts a BestEffort/Volatile 10 Hz `/lane_valid=True` test publisher only
+   after that committed transition;
+3. requires `REJOIN -> LANE_DRIVE: fresh lane validity confirmed`;
+4. captures a non-zero `/bag_test/xycar_motor` lane command after the commit;
+5. cleans up the new mock and waits through the Fast DDS graph cache window.
+
+### Successful result
+
+- Run artifacts: `/tmp/kmu_rubbercone_fsm_bag_test_20260805_023558`
+- Playback command: `ros2 bag play <bag> --disable-keyboard-controls --topics /scan`
+- `/xycar_motor` publisher count: 0 before launch, 0 immediately before
+  playback, and 0 after playback
+- Full transition chain:
+  - `INIT -> WAIT_GREEN`
+  - `WAIT_GREEN -> LANE_DRIVE`
+  - `LANE_DRIVE -> CONE_DRIVE`
+  - `CONE_DRIVE -> REJOIN`
+  - `REJOIN -> LANE_DRIVE`
+- CONE isolated sample: `[-34.0, 9.100000381469727]`
+- Post-REJOIN lane isolated sample: `[0.0, 6.800000190734863]`
+- No `-> STOP` transition
+- No hardware driver was started and the bag replayed `/scan` only
+- OS process inspection found no remaining test process. The first 5 s graph
+  check observed stale Fast DDS discovery entries, which then expired without
+  intervention; the harness convergence window is now 15 s.
+
+### Next validation plan
+
+Negative bag:
+
+1. Confirm the scene label for
+   `/home/xytron/bags/kmu_real_lidar/20260724/20260724_105545_kmu_real_lidar_C01_sensor_idle_static_10sec_raw`
+   before treating it as ground-truth no-cone data. It contains 155 `/scan`
+   messages over 15.975 s.
+2. Add an explicit `negative` expectation to the same harness while retaining
+   all motor interlocks and scan-only playback.
+3. Require no `LANE_DRIVE -> CONE_DRIVE`, no detector session reset/end latch,
+   no STOP, continued isolated lane control, and `/xycar_motor` publisher 0.
+4. Treat any cone entry as a detector false positive and retain the full scan,
+   detector, transition, and motor artifacts.
+
+Repeated sessions in one process:
+
+1. Keep one main/rubbercone launch alive and replay the positive bag twice,
+   checking `/xycar_motor` publisher 0 before each replay.
+2. Use transition occurrence counts or per-session log offsets so the second
+   session cannot pass on first-session log lines.
+3. Start and stop the lane-validity mock after each distinct REJOIN commit.
+4. Require two complete `LANE -> CONE -> REJOIN -> LANE` chains, two detector
+   resets, non-zero isolated cone and returned-lane control in both sessions,
+   no STOP, and clean graph/process teardown.

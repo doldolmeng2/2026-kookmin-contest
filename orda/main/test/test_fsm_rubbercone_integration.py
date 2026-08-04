@@ -241,6 +241,13 @@ def test_rubbercone_bag_runner_enforces_safe_scan_only_playback():
     scan_only_play = (
         'ros2 bag play "${BAG_PATH}" --disable-keyboard-controls --topics /scan'
     )
+    cone_to_rejoin = (
+        'wait_for_log "FSM CONE_DRIVE -> REJOIN: fresh cone end flag" 20'
+    )
+    lane_valid_mock = "/lane_valid std_msgs/msg/Bool '{data: true}'"
+    rejoin_to_lane = (
+        'wait_for_log "FSM REJOIN -> LANE_DRIVE: fresh lane validity confirmed" 10'
+    )
 
     assert "mode:=0" in source
     assert "kmu_test_scan_mock" in source
@@ -249,6 +256,12 @@ def test_rubbercone_bag_runner_enforces_safe_scan_only_playback():
     assert source.count('assert_no_real_motor_publishers "') == 3
     assert scan_only_play in source
     assert source.count("--topics /scan") == 2
+    assert "kmu_test_lane_valid_mock" in source
+    assert lane_valid_mock in source
+    assert source.index(cone_to_rejoin) < source.index(lane_valid_mock)
+    assert source.index(lane_valid_mock) < source.index(rejoin_to_lane)
+    assert 'stop_process "${LANE_VALID_MOCK_PID}"' in source
+    assert "rejoin_lane_motor_sample.log" in source
     assert "--topics /scan /xycar_motor" not in source
     assert "--topics /scan /rubbercone_info" not in source
     assert "/bag_test/xycar_motor" in source
