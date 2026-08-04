@@ -93,6 +93,7 @@ class RaceFSM:
         )
         self._cone_entry = ConeEntryDebouncer(cone_entry_config)
         self._last_cone_drive_message_at: Optional[float] = None
+        self._cone_exit_armed = False
         self.last_cone_entry_decision: Optional[ConeEntryDecision] = None
 
     @property
@@ -102,6 +103,10 @@ class RaceFSM:
     @property
     def cone_entry_guard(self) -> ConeEntryDebouncer:
         return self._cone_entry
+
+    @property
+    def cone_exit_armed(self) -> bool:
+        return self._cone_exit_armed
 
     def step(
         self,
@@ -119,6 +124,7 @@ class RaceFSM:
             context.stop_reason = reason
             self._green.reset()
             self._cone_entry.deactivate()
+            self._cone_exit_armed = False
             return self._change(
                 Mode.STOP,
                 reason,
@@ -160,6 +166,7 @@ class RaceFSM:
             self.last_cone_entry_decision = decision
             if decision.triggered:
                 context.cone_entered_at = observation.now
+                self._cone_exit_armed = False
                 self._last_cone_drive_message_at = (
                     observation.cone_message_received_at
                 )
@@ -172,21 +179,26 @@ class RaceFSM:
             return self._stay(decision.reason)
 
         if self.state is Mode.CONE_DRIVE:
-            if (
-                self._accept_new_cone_drive_message(observation)
-                and observation.cone_end_flag is True
-            ):
+            if not self._accept_new_cone_drive_message(observation, context):
+                return self._stay("waiting for fresh cone session evidence")
+
+            if observation.cone_end_flag is False:
+                self._cone_exit_armed = True
+                return self._stay("cone exit session armed")
+
+            if observation.cone_end_flag is True and self._cone_exit_armed:
                 # The entry latch belongs to one cone episode. Rearm it when
                 # that episode commits its exit so a later normal lap can
                 # qualify independently.
                 self._cone_entry.deactivate()
+                self._cone_exit_armed = False
                 return self._change(
                     Mode.REJOIN,
                     "fresh cone end flag",
                     context,
                     observation.now,
                 )
-            return self._stay("waiting for fresh cone end flag")
+            return self._stay("cone end flag received before session armed")
 
         # Cone-entry evidence must never accumulate outside LANE_DRIVE. Keep a
         # completed episode rearmed for a future LANE_DRIVE visit.
@@ -207,6 +219,7 @@ class RaceFSM:
     def _accept_new_cone_drive_message(
         self,
         observation: MissionObservation,
+        context: RaceContext,
     ) -> bool:
         """Accept one fresh cone receipt edge, regardless of its flag value."""
 
@@ -226,9 +239,13 @@ class RaceFSM:
         now = observation.now
         if not self._valid_timestamp(now):
             return False
+        state_entered_at = context.state_entered_at
+        if not self._valid_timestamp(state_entered_at):
+            return False
         age_s = now - timestamp
         return (
-            age_s >= -_TIMESTAMP_EPSILON_S
+            timestamp > state_entered_at
+            and age_s >= -_TIMESTAMP_EPSILON_S
             and age_s - self.cone_entry_config.max_cone_age_s
             <= _TIMESTAMP_EPSILON_S
         )

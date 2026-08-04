@@ -209,20 +209,58 @@ def test_lane_self_transition_preserves_state_and_cone_entry_times():
     assert context.cone_entered_at == 1.0
 
 
-def test_fresh_cone_end_message_enters_rejoin_and_updates_entry_time():
+def test_fresh_zero_then_separate_one_enters_rejoin_and_updates_entry_time():
     fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
     context = RaceContext(state_entered_at=1.0, cone_entered_at=0.5)
 
+    arming = fsm.step(
+        cone_observation(1.1, end_flag=False),
+        context,
+        safe(),
+    )
     transition = fsm.step(
-        cone_observation(2.0, confidence=0, end_flag=True),
+        cone_observation(1.2, confidence=0, end_flag=True),
         context,
         safe(),
     )
 
+    assert arming.changed is False
+    assert arming.reason == "cone exit session armed"
     assert transition.source is Mode.CONE_DRIVE
     assert transition.target is Mode.REJOIN
     assert transition.reason == "fresh cone end flag"
-    assert context.state_entered_at == 2.0
+    assert context.state_entered_at == 1.2
+    assert fsm.cone_exit_armed is False
+
+
+def test_repeated_fresh_ones_do_not_end_an_unarmed_cone_session():
+    fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
+    context = RaceContext(state_entered_at=1.0)
+
+    for timestamp in (1.1, 1.2, 1.3):
+        transition = fsm.step(
+            cone_observation(timestamp, confidence=0, end_flag=True),
+            context,
+            safe(),
+        )
+        assert transition.changed is False
+
+    assert fsm.state is Mode.CONE_DRIVE
+    assert fsm.cone_exit_armed is False
+    assert context.state_entered_at == 1.0
+
+
+def test_fresh_zero_arms_but_does_not_end_on_the_same_message():
+    fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
+    context = RaceContext(state_entered_at=1.0)
+
+    transition = fsm.step(cone_observation(1.1), context, safe())
+
+    assert transition.changed is False
+    assert transition.reason == "cone exit session armed"
+    assert fsm.state is Mode.CONE_DRIVE
+    assert fsm.cone_exit_armed is True
+    assert context.state_entered_at == 1.0
 
 
 def test_cached_end_flag_without_new_cone_message_is_not_consumed():
@@ -257,7 +295,34 @@ def test_derived_cone_finished_does_not_replace_actual_end_flag():
 
     assert transition.changed is False
     assert fsm.state is Mode.CONE_DRIVE
+    assert fsm.cone_exit_armed is True
     assert context.state_entered_at == 1.0
+
+
+@pytest.mark.parametrize("cone_timestamp", [0.9, 1.0])
+def test_zero_at_or_before_cone_state_entry_does_not_arm(cone_timestamp):
+    fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
+    context = RaceContext(state_entered_at=1.0)
+
+    zero = fsm.step(
+        MissionObservation(
+            now=1.1,
+            cone_end_flag=False,
+            cone_message_received_at=cone_timestamp,
+        ),
+        context,
+        safe(),
+    )
+    one = fsm.step(
+        cone_observation(1.2, confidence=0, end_flag=True),
+        context,
+        safe(),
+    )
+
+    assert zero.changed is False
+    assert one.changed is False
+    assert fsm.cone_exit_armed is False
+    assert fsm.state is Mode.CONE_DRIVE
 
 
 @pytest.mark.parametrize(
@@ -299,21 +364,74 @@ def test_duplicate_regressed_stale_or_invalid_cone_end_is_rejected(
     assert context.state_entered_at == 0.5
 
 
-def test_safety_stop_has_priority_over_fresh_cone_end():
+@pytest.mark.parametrize(
+    ("prime_timestamp", "zero_now", "zero_timestamp"),
+    [
+        (1.1, 1.2, 1.1),
+        (1.2, 1.3, 1.1),
+        (None, 2.0, 1.1),
+        (None, 2.0, 2.1),
+        (None, 2.0, math.nan),
+    ],
+)
+def test_duplicate_regressed_stale_future_or_nan_zero_does_not_arm(
+    prime_timestamp,
+    zero_now,
+    zero_timestamp,
+):
+    fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
+    context = RaceContext(state_entered_at=1.0)
+    if prime_timestamp is not None:
+        fsm.step(
+            cone_observation(
+                prime_timestamp,
+                confidence=0,
+                end_flag=True,
+            ),
+            context,
+            safe(),
+        )
+
+    zero = fsm.step(
+        MissionObservation(
+            now=zero_now,
+            cone_end_flag=False,
+            cone_message_received_at=zero_timestamp,
+        ),
+        context,
+        safe(),
+    )
+    later_one = fsm.step(
+        cone_observation(3.0, confidence=0, end_flag=True),
+        context,
+        safe(),
+    )
+
+    assert zero.changed is False
+    assert later_one.changed is False
+    assert fsm.cone_exit_armed is False
+    assert fsm.state is Mode.CONE_DRIVE
+
+
+@pytest.mark.parametrize("end_flag", [False, True])
+def test_safety_stop_has_priority_over_cone_session_evidence(end_flag):
     fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
     context = RaceContext(state_entered_at=1.0)
     safety = SafetyDecision(must_stop=True, reason="lidar fault")
+    if end_flag:
+        fsm.step(cone_observation(1.1), context, safe())
 
     transition = fsm.step(
-        cone_observation(2.0, confidence=0, end_flag=True),
+        cone_observation(1.2, confidence=0, end_flag=end_flag),
         context,
         safety,
     )
 
     assert transition.target is Mode.STOP
     assert transition.reason == "lidar fault"
-    assert context.state_entered_at == 2.0
+    assert context.state_entered_at == 1.2
     assert context.stop_reason == "lidar fault"
+    assert fsm.cone_exit_armed is False
 
 
 def test_cone_entry_latch_is_rearmed_after_rejoin_commit():
@@ -322,12 +440,19 @@ def test_cone_entry_latch_is_rearmed_after_rejoin_commit():
 
     for timestamp in (1.0, 1.1, 1.21):
         fsm.step(cone_observation(timestamp), context, safe())
-    exit_transition = fsm.step(
+    old_latched_one = fsm.step(
         cone_observation(1.3, confidence=0, end_flag=True),
         context,
         safe(),
     )
+    fsm.step(cone_observation(1.4), context, safe())
+    exit_transition = fsm.step(
+        cone_observation(1.5, confidence=0, end_flag=True),
+        context,
+        safe(),
+    )
 
+    assert old_latched_one.changed is False
     assert exit_transition.target is Mode.REJOIN
     assert fsm.cone_entry_guard.triggered is False
 
@@ -343,6 +468,23 @@ def test_cone_entry_latch_is_rearmed_after_rejoin_commit():
     assert transition.target is Mode.CONE_DRIVE
     assert context.state_entered_at == 2.21
     assert context.cone_entered_at == 2.21
+
+    second_old_one = fsm.step(
+        cone_observation(2.3, confidence=0, end_flag=True),
+        context,
+        safe(),
+    )
+    fsm.step(cone_observation(2.4), context, safe())
+    second_exit = fsm.step(
+        cone_observation(2.5, confidence=0, end_flag=True),
+        context,
+        safe(),
+    )
+
+    assert second_old_one.changed is False
+    assert second_exit.source is Mode.CONE_DRIVE
+    assert second_exit.target is Mode.REJOIN
+    assert context.state_entered_at == 2.5
 
 
 @pytest.mark.parametrize(

@@ -230,23 +230,26 @@ def test_replay_enters_cone_drive_on_unique_cone_edges_only():
     ]
 
 
-def test_replay_enters_rejoin_only_on_fresh_end_message_edge():
+def test_replay_enters_rejoin_once_on_new_zero_to_one_session():
     report = replay(
         [
-            event("/rubbercone_info", 1.0, [4, 0, 80]),
-            event("/scan", 1.1),
-            event("/rubbercone_info", 1.2, [4, 1, 0]),
-            event("/scan", 1.3),
+            event("/scan", 0.9),
+            event("/rubbercone_info", 1.0, [4, 1, 0]),
+            event("/rubbercone_info", 1.1, [4, 1, 0]),
+            event("/rubbercone_info", 1.2, [4, 0, 80]),
+            event("/rubbercone_info", 1.3, [4, 1, 0]),
+            event("/rubbercone_info", 1.4, [4, 1, 0]),
         ],
         start_mode=Mode.CONE_DRIVE,
     )
 
     assert report["fsm"]["final_mode"] == "REJOIN"
-    assert report["fsm"]["state_entered_at_s"] == 1.2
+    assert report["fsm"]["state_entered_at_s"] == 1.3
+    assert report["fsm"]["transition_count"] == 1
     assert report["fsm"]["transition_timeline"] == [
         {
-            "timestamp_s": 1.2,
-            "relative_time_s": 0.2,
+            "timestamp_s": 1.3,
+            "relative_time_s": 0.4,
             "source_mode": "CONE_DRIVE",
             "target_mode": "REJOIN",
             "reason": "fresh cone end flag",
@@ -257,9 +260,27 @@ def test_replay_enters_rejoin_only_on_fresh_end_message_edge():
     ] is True
 
 
+def test_replay_latched_one_sequence_never_ends_unarmed_session():
+    report = replay(
+        [
+            event("/scan", 0.9),
+            event("/rubbercone_info", 1.0, [0, 1, 0]),
+            event("/scan", 1.1),
+            event("/rubbercone_info", 1.2, [0, 1, 0]),
+            event("/rubbercone_info", 1.3, [0, 1, 0]),
+        ],
+        start_mode=Mode.CONE_DRIVE,
+    )
+
+    assert report["fsm"]["final_mode"] == "CONE_DRIVE"
+    assert report["fsm"]["transition_count"] == 0
+    assert report["fsm"]["state_entered_at_s"] == 0.9
+
+
 def test_replay_rejects_regressed_end_before_accepting_newer_end():
     report = replay(
         [
+            event("/scan", 1.8),
             event("/rubbercone_info", 2.0, [0, 0, 80]),
             event("/rubbercone_info", 1.9, [0, 1, 0]),
             event("/scan", 2.1),
@@ -277,6 +298,7 @@ def test_replay_rejects_regressed_end_before_accepting_newer_end():
 def test_replay_cone_exit_depends_on_relative_freshness_not_absolute_time(shift):
     report = replay(
         [
+            event("/scan", shift + 0.9),
             event("/rubbercone_info", shift + 1.0, [0, 0, 80]),
             event("/rubbercone_info", shift + 1.1, [0, 1, 0]),
         ],
@@ -287,7 +309,7 @@ def test_replay_cone_exit_depends_on_relative_freshness_not_absolute_time(shift)
     assert report["fsm"]["transition_count"] == 1
     assert report["fsm"]["transition_timeline"][0][
         "relative_time_s"
-    ] == pytest.approx(0.1, abs=TIMING_TOLERANCE_S)
+    ] == pytest.approx(0.2, abs=TIMING_TOLERANCE_S)
 
 
 def test_duplicate_cone_edge_does_not_advance_replay_guard():

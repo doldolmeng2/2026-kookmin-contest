@@ -916,7 +916,7 @@ class OfflineBagReplay:
             )
         if "/rubbercone_info" in topic_types:
             scope.append(
-                "CONE_DRIVE to REJOIN on fresh recorded rubbercone end edges"
+                "CONE_DRIVE to REJOIN on a fresh recorded rubbercone 0-to-1 session"
             )
         if "/scan" in topic_types:
             scope.append("recorded scan receipt gap statistics")

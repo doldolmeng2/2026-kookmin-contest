@@ -11,10 +11,12 @@
 //   [0] offset     : 조향 오프셋 (양수=오른쪽 편향)
 //   [1] end_flag   : 0=주행 중, 1=라바콘 구간 종료
 //   [2] confidence : 경로 추정 신뢰도 (0~100)
+// 구독: /rubbercone_reset (std_msgs/Empty) - 다음 라바콘 세션 준비
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
+#include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/int32_multi_array.hpp>
 #include <opencv2/opencv.hpp>
 
@@ -29,6 +31,7 @@ using std::placeholders::_1;
 namespace {
 
 constexpr float kPi = 3.14159265358979323846f;
+constexpr char kRubberconeResetTopic[] = "/rubbercone_reset";
 
 template<typename T>
 T clampValue(T value, T lower, T upper)
@@ -147,10 +150,43 @@ public:
         nominal_half_width_ = clampValue(
             static_cast<float>(declare_parameter<double>("nominal_half_width", 0.30)),
             0.15f, 0.70f);
-        adaptive_half_width_ = nominal_half_width_;
+
+        resetSessionState();
+
+        // Reset is an edge-triggered command. The default mutually-exclusive
+        // callback group and single-threaded spin serialize it with scanCallback.
+        auto reset_qos = rclcpp::QoS(rclcpp::KeepLast(10))
+            .reliable().durability_volatile();
+        reset_sub_ = create_subscription<std_msgs::msg::Empty>(
+            kRubberconeResetTopic, reset_qos,
+            std::bind(&LidarViewer::resetCallback, this, _1));
     }
 
 private:
+    void resetSessionState()
+    {
+        valid_frame_count_ = 0;
+        missing_frame_count_ = 0;
+        cone_section_armed_ = false;
+        end_latched_ = false;
+
+        adaptive_half_width_ = nominal_half_width_;
+        filtered_target_y_ = 0.0f;
+        has_filtered_target_y_ = false;
+        filtered_offset_ = 0.0f;
+        has_filtered_offset_ = false;
+
+        rubber_offset_value_ = 0;
+        rubber_end_value_ = 0;
+        rubber_confidence_value_ = 0;
+    }
+
+    void resetCallback(const std_msgs::msg::Empty::SharedPtr /*msg*/)
+    {
+        resetSessionState();
+        RCLCPP_INFO(get_logger(), "Rubber-cone session reset");
+    }
+
     void publishInfo()
     {
         std_msgs::msg::Int32MultiArray msg;
@@ -549,6 +585,7 @@ private:
     int32_t rubber_confidence_value_;
 
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr reset_sub_;
     rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr info_pub_;
 
     void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
