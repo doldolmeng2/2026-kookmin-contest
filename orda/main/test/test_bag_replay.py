@@ -24,6 +24,7 @@ TYPE_BY_TOPIC = {
     "/mode_info": "std_msgs/msg/Int32MultiArray",
     "/xycar_motor": "std_msgs/msg/Float32MultiArray",
     "/scan": "sensor_msgs/msg/LaserScan",
+    "/lane_valid": "std_msgs/msg/Bool",
 }
 
 
@@ -71,7 +72,7 @@ def test_bag_timestamp_is_the_observation_and_transition_clock():
 
     assert report["fsm"]["final_mode"] == "LANE_DRIVE"
     assert report["fsm"]["state_entered_at_s"] == 103.0
-    assert report["fsm"]["race_started_at_s"] == 103.0
+    assert report["fsm"]["race_started_at_s"] == 101.0
     assert report["fsm"]["transition_timeline"] == [
         {
             "timestamp_s": 103.0,
@@ -422,6 +423,37 @@ def test_lane_offset_is_reference_only_and_never_infers_lane_validity():
     assert report["fsm"]["transition_count"] == 0
     assert report["fsm"]["fsm_evaluation_count"] == 0
     assert report["lane_reference"]["lane_validity_inferred"] is False
+
+
+def test_replay_rejoin_returns_to_lane_only_on_fresh_lane_validity_edges():
+    report = replay(
+        [
+            event("/scan", 1.0),
+            event("/lane_valid", 1.1, True),
+            event("/lane_valid", 1.2, True),
+            event("/lane_valid", 1.31, True),
+        ],
+        start_mode=Mode.REJOIN,
+    )
+
+    assert report["fsm"]["final_mode"] == "LANE_DRIVE"
+    assert report["fsm"]["state_entered_at_s"] == 1.31
+    assert report["fsm"]["transition_timeline"] == [
+        {
+            "timestamp_s": 1.31,
+            "relative_time_s": 0.31,
+            "source_mode": "REJOIN",
+            "target_mode": "LANE_DRIVE",
+            "reason": "fresh lane validity confirmed",
+        }
+    ]
+    assert report["validation"]["invariants"][
+        "only_allowed_transitions_observed"
+    ] is True
+    assert any(
+        "REJOIN to LANE_DRIVE" in item
+        for item in report["validation"]["verifiable_scope"]
+    )
 
 
 def test_legacy_mode_trace_never_changes_the_new_mode():

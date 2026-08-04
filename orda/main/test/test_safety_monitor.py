@@ -79,11 +79,17 @@ def test_motion_disabled_is_not_itself_a_fault():
     assert decision.missing_inputs == ("sensor:lidar",)
 
 
-def test_default_race_timeout_is_240_seconds_even_if_motion_disabled():
+def test_official_race_timeout_stops_at_240_seconds_not_before():
     monitor = SafetyMonitor()
     context = RaceContext(race_started_at=10.0)
 
-    decision = monitor.evaluate(
+    before = monitor.evaluate(
+        Mode.LANE_DRIVE,
+        context,
+        MissionObservation(now=249.999),
+        motion_enabled=False,
+    )
+    at_limit = monitor.evaluate(
         Mode.LANE_DRIVE,
         context,
         MissionObservation(now=250.0),
@@ -91,29 +97,36 @@ def test_default_race_timeout_is_240_seconds_even_if_motion_disabled():
     )
 
     assert monitor.race_timeout_s == 240.0
-    assert decision.must_stop is True
-    assert decision.reason == "race timeout"
+    assert before.must_stop is False
+    assert at_limit.must_stop is True
+    assert at_limit.reason == "race timeout"
 
 
-def test_default_cone_timeout_only_applies_in_cone_state():
+def test_official_cone_timeout_stops_at_60_seconds_not_before():
     monitor = SafetyMonitor()
     context = RaceContext(cone_entered_at=10.0)
-    observation = MissionObservation(now=70.0)
 
-    cone_decision = monitor.evaluate(
+    before = monitor.evaluate(
         Mode.CONE_DRIVE,
         context,
-        observation,
+        MissionObservation(now=69.999),
+        motion_enabled=True,
+    )
+    at_limit = monitor.evaluate(
+        Mode.CONE_DRIVE,
+        context,
+        MissionObservation(now=70.0),
         motion_enabled=True,
     )
     lane_decision = monitor.evaluate(
         Mode.LANE_DRIVE,
         context,
-        observation,
+        MissionObservation(now=70.0),
         motion_enabled=True,
     )
 
     assert monitor.cone_timeout_s == 60.0
-    assert cone_decision.must_stop is True
-    assert cone_decision.reason == "cone timeout"
+    assert before.must_stop is False
+    assert at_limit.must_stop is True
+    assert at_limit.reason == "cone timeout"
     assert lane_decision.must_stop is False

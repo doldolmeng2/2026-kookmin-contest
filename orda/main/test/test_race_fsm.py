@@ -96,7 +96,11 @@ def test_green_requires_consecutive_frames_and_resets_on_gap():
 
     for now in (2.0, 2.1):
         transition = fsm.step(
-            MissionObservation(now=now, green_detected=True),
+            MissionObservation(
+                now=now,
+                green_detected=True,
+                traffic_message_received_at=now,
+            ),
             context,
             safe(),
         )
@@ -104,28 +108,40 @@ def test_green_requires_consecutive_frames_and_resets_on_gap():
         assert context.state_entered_at == 1.0
 
     fsm.step(
-        MissionObservation(now=2.2, green_detected=False),
+        MissionObservation(
+            now=2.2,
+            green_detected=False,
+            traffic_message_received_at=2.2,
+        ),
         context,
         safe(),
     )
 
     for now in (3.0, 3.1):
         transition = fsm.step(
-            MissionObservation(now=now, green_detected=True),
+            MissionObservation(
+                now=now,
+                green_detected=True,
+                traffic_message_received_at=now,
+            ),
             context,
             safe(),
         )
         assert transition.changed is False
 
     transition = fsm.step(
-        MissionObservation(now=3.2, green_detected=True),
+        MissionObservation(
+            now=3.2,
+            green_detected=True,
+            traffic_message_received_at=3.2,
+        ),
         context,
         safe(),
     )
 
     assert transition.target is Mode.LANE_DRIVE
     assert context.state_entered_at == 3.2
-    assert context.race_started_at == 3.2
+    assert context.race_started_at == 3.0
 
 
 def test_green_debounce_can_also_require_duration():
@@ -137,19 +153,55 @@ def test_green_debounce_can_also_require_duration():
     context = RaceContext(state_entered_at=1.0)
 
     first = fsm.step(
-        MissionObservation(now=5.0, green_detected=True),
+        MissionObservation(
+            now=5.0,
+            green_detected=True,
+            traffic_message_received_at=5.0,
+        ),
         context,
         safe(),
     )
     second = fsm.step(
-        MissionObservation(now=5.5, green_detected=True),
+        MissionObservation(
+            now=5.5,
+            green_detected=True,
+            traffic_message_received_at=5.5,
+        ),
         context,
         safe(),
     )
 
     assert first.changed is False
     assert second.target is Mode.LANE_DRIVE
-    assert context.race_started_at == 5.5
+    assert context.race_started_at == 5.0
+
+
+def test_race_clock_uses_first_fresh_green_receipt_not_debounce_commit_tick():
+    fsm = RaceFSM(
+        initial_state=Mode.WAIT_GREEN,
+        green_min_consecutive_frames=3,
+    )
+    context = RaceContext(state_entered_at=9.0)
+
+    samples = (
+        (10.05, 10.0),
+        (10.15, 10.1),
+        (10.25, 10.2),
+    )
+    for now, received_at in samples:
+        transition = fsm.step(
+            MissionObservation(
+                now=now,
+                green_detected=True,
+                traffic_message_received_at=received_at,
+            ),
+            context,
+            safe(),
+        )
+
+    assert transition.target is Mode.LANE_DRIVE
+    assert context.race_started_at == 10.0
+    assert context.state_entered_at == 10.25
 
 
 def test_safety_stop_records_reason_and_entry_time():
@@ -567,6 +619,7 @@ def test_unimplemented_mission_events_self_transition(state):
     observation = MissionObservation(
         now=11.0,
         lane_valid=True,
+        lane_valid_received_at=11.0,
         cone_detected=True,
         cone_finished=True,
         fixed_vehicle_detected=True,
@@ -576,6 +629,11 @@ def test_unimplemented_mission_events_self_transition(state):
         left_turn_signal=True,
         shortcut_complete=True,
         finish_gate_crossed=True,
+        fixed_avoid_complete_received_at=11.0,
+        overtake_complete_received_at=11.0,
+        left_turn_signal_received_at=11.0,
+        shortcut_complete_received_at=11.0,
+        finish_gate_crossed_received_at=11.0,
     )
 
     transition = fsm.step(observation, context, safe())
