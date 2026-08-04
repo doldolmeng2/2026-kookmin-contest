@@ -230,6 +230,66 @@ def test_replay_enters_cone_drive_on_unique_cone_edges_only():
     ]
 
 
+def test_replay_enters_rejoin_only_on_fresh_end_message_edge():
+    report = replay(
+        [
+            event("/rubbercone_info", 1.0, [4, 0, 80]),
+            event("/scan", 1.1),
+            event("/rubbercone_info", 1.2, [4, 1, 0]),
+            event("/scan", 1.3),
+        ],
+        start_mode=Mode.CONE_DRIVE,
+    )
+
+    assert report["fsm"]["final_mode"] == "REJOIN"
+    assert report["fsm"]["state_entered_at_s"] == 1.2
+    assert report["fsm"]["transition_timeline"] == [
+        {
+            "timestamp_s": 1.2,
+            "relative_time_s": 0.2,
+            "source_mode": "CONE_DRIVE",
+            "target_mode": "REJOIN",
+            "reason": "fresh cone end flag",
+        }
+    ]
+    assert report["validation"]["invariants"][
+        "only_allowed_transitions_observed"
+    ] is True
+
+
+def test_replay_rejects_regressed_end_before_accepting_newer_end():
+    report = replay(
+        [
+            event("/rubbercone_info", 2.0, [0, 0, 80]),
+            event("/rubbercone_info", 1.9, [0, 1, 0]),
+            event("/scan", 2.1),
+            event("/rubbercone_info", 2.2, [0, 1, 0]),
+        ],
+        start_mode=Mode.CONE_DRIVE,
+    )
+
+    assert report["processing"]["timestamp_regression_count"] == 1
+    assert report["fsm"]["transition_count"] == 1
+    assert report["fsm"]["transition_timeline"][0]["timestamp_s"] == 2.2
+
+
+@pytest.mark.parametrize("shift", [0.0, 60.0, 3600.0])
+def test_replay_cone_exit_depends_on_relative_freshness_not_absolute_time(shift):
+    report = replay(
+        [
+            event("/rubbercone_info", shift + 1.0, [0, 0, 80]),
+            event("/rubbercone_info", shift + 1.1, [0, 1, 0]),
+        ],
+        start_mode=Mode.CONE_DRIVE,
+    )
+
+    assert report["fsm"]["final_mode"] == "REJOIN"
+    assert report["fsm"]["transition_count"] == 1
+    assert report["fsm"]["transition_timeline"][0][
+        "relative_time_s"
+    ] == pytest.approx(0.1, abs=TIMING_TOLERANCE_S)
+
+
 def test_duplicate_cone_edge_does_not_advance_replay_guard():
     report = replay(
         [

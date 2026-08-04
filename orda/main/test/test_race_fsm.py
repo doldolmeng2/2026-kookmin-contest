@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 from main.cone_entry import ConeEntryConfig
@@ -205,6 +207,142 @@ def test_lane_self_transition_preserves_state_and_cone_entry_times():
     assert transition.changed is False
     assert context.state_entered_at == 2.0
     assert context.cone_entered_at == 1.0
+
+
+def test_fresh_cone_end_message_enters_rejoin_and_updates_entry_time():
+    fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
+    context = RaceContext(state_entered_at=1.0, cone_entered_at=0.5)
+
+    transition = fsm.step(
+        cone_observation(2.0, confidence=0, end_flag=True),
+        context,
+        safe(),
+    )
+
+    assert transition.source is Mode.CONE_DRIVE
+    assert transition.target is Mode.REJOIN
+    assert transition.reason == "fresh cone end flag"
+    assert context.state_entered_at == 2.0
+
+
+def test_cached_end_flag_without_new_cone_message_is_not_consumed():
+    fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
+    context = RaceContext(state_entered_at=1.0)
+
+    transition = fsm.step(
+        MissionObservation(now=2.0, cone_end_flag=True, cone_finished=True),
+        context,
+        safe(),
+    )
+
+    assert transition.changed is False
+    assert fsm.state is Mode.CONE_DRIVE
+    assert context.state_entered_at == 1.0
+
+
+def test_derived_cone_finished_does_not_replace_actual_end_flag():
+    fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
+    context = RaceContext(state_entered_at=1.0)
+
+    transition = fsm.step(
+        MissionObservation(
+            now=2.0,
+            cone_finished=True,
+            cone_end_flag=False,
+            cone_message_received_at=2.0,
+        ),
+        context,
+        safe(),
+    )
+
+    assert transition.changed is False
+    assert fsm.state is Mode.CONE_DRIVE
+    assert context.state_entered_at == 1.0
+
+
+@pytest.mark.parametrize(
+    ("first_timestamp", "end_now", "end_timestamp"),
+    [
+        (1.0, 1.1, 1.0),
+        (2.0, 2.1, 1.9),
+        (None, 2.0, 1.0),
+        (None, 2.0, math.nan),
+        (None, 2.0, 2.1),
+    ],
+)
+def test_duplicate_regressed_stale_or_invalid_cone_end_is_rejected(
+    first_timestamp,
+    end_now,
+    end_timestamp,
+):
+    fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
+    context = RaceContext(state_entered_at=0.5)
+    if first_timestamp is not None:
+        fsm.step(
+            cone_observation(first_timestamp),
+            context,
+            safe(),
+        )
+
+    transition = fsm.step(
+        MissionObservation(
+            now=end_now,
+            cone_end_flag=True,
+            cone_message_received_at=end_timestamp,
+        ),
+        context,
+        safe(),
+    )
+
+    assert transition.changed is False
+    assert fsm.state is Mode.CONE_DRIVE
+    assert context.state_entered_at == 0.5
+
+
+def test_safety_stop_has_priority_over_fresh_cone_end():
+    fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
+    context = RaceContext(state_entered_at=1.0)
+    safety = SafetyDecision(must_stop=True, reason="lidar fault")
+
+    transition = fsm.step(
+        cone_observation(2.0, confidence=0, end_flag=True),
+        context,
+        safety,
+    )
+
+    assert transition.target is Mode.STOP
+    assert transition.reason == "lidar fault"
+    assert context.state_entered_at == 2.0
+    assert context.stop_reason == "lidar fault"
+
+
+def test_cone_entry_latch_is_rearmed_after_rejoin_commit():
+    fsm = RaceFSM(initial_state=Mode.LANE_DRIVE)
+    context = RaceContext(state_entered_at=0.0)
+
+    for timestamp in (1.0, 1.1, 1.21):
+        fsm.step(cone_observation(timestamp), context, safe())
+    exit_transition = fsm.step(
+        cone_observation(1.3, confidence=0, end_flag=True),
+        context,
+        safe(),
+    )
+
+    assert exit_transition.target is Mode.REJOIN
+    assert fsm.cone_entry_guard.triggered is False
+
+    # Stand in for the later mission chain, which is intentionally outside
+    # this change. A future normal lap must be able to qualify from scratch.
+    fsm.state = Mode.LANE_DRIVE
+    for timestamp in (2.0, 2.1):
+        transition = fsm.step(cone_observation(timestamp), context, safe())
+        assert transition.changed is False
+    transition = fsm.step(cone_observation(2.21), context, safe())
+
+    assert transition.source is Mode.LANE_DRIVE
+    assert transition.target is Mode.CONE_DRIVE
+    assert context.state_entered_at == 2.21
+    assert context.cone_entered_at == 2.21
 
 
 @pytest.mark.parametrize(

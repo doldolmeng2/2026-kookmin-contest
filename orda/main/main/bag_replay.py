@@ -57,6 +57,7 @@ _ALLOWED_TRANSITIONS = frozenset(
         (Mode.INIT, Mode.WAIT_GREEN),
         (Mode.WAIT_GREEN, Mode.LANE_DRIVE),
         (Mode.LANE_DRIVE, Mode.CONE_DRIVE),
+        (Mode.CONE_DRIVE, Mode.REJOIN),
         *((mode, Mode.STOP) for mode in Mode if mode not in (Mode.FINISH, Mode.STOP)),
     }
 )
@@ -913,6 +914,10 @@ class OfflineBagReplay:
             scope.append(
                 "provisional LANE_DRIVE to CONE_DRIVE guard and transition timing"
             )
+        if "/rubbercone_info" in topic_types:
+            scope.append(
+                "CONE_DRIVE to REJOIN on fresh recorded rubbercone end edges"
+            )
         if "/scan" in topic_types:
             scope.append("recorded scan receipt gap statistics")
         return scope
@@ -920,7 +925,7 @@ class OfflineBagReplay:
     @staticmethod
     def _unverifiable_scope(topic_types: Mapping[str, str]) -> List[str]:
         scope = [
-            "CONE_DRIVE to REJOIN and REJOIN to LANE_DRIVE",
+            "REJOIN to FIXED_AVOID",
             "fixed-vehicle avoidance and moving-vehicle overtake",
             "lap/Gate counting and FINISH entry",
             "left-turn recognition, shortcut readiness, and SHORTCUT entry",
