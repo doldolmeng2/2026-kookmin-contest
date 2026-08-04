@@ -17,11 +17,7 @@ from std_msgs.msg import (
     Int32MultiArray,
 )
 
-from main.control import (
-    Controller,
-    LANE_DRIVE as CONTROLLER_LANE_DRIVE,
-    RUBBERCONE_DRIVE as CONTROLLER_CONE_DRIVE,
-)
+from main.control import Controller
 from main.control_selector import (
     CommandCandidate,
     ControlSource,
@@ -44,8 +40,11 @@ CONE_EVENT_WARNING_PERIOD_S = 5.0
 
 # The controller gains remain the proven legacy implementation. These limits
 # are output shaping only; they do not participate in mission transitions.
-RUBBERCONE_ACCEL_STEP = 0.10
-RUBBERCONE_DECEL_STEP = 0.20
+# 0.10 (5.0/s) took 2.2 s to reach the tuned 11.0 cruise speed in short
+# rubber-cone sections. The tuned steps reach it in about 0.9 s while keeping
+# deceleration faster than acceleration.
+RUBBERCONE_ACCEL_STEP = 0.25
+RUBBERCONE_DECEL_STEP = 0.35
 RUBBERCONE_STEERING_STEP = 3.0
 
 # Keep the launch file's existing integer ``mode`` parameter usable for the
@@ -120,8 +119,8 @@ class MainNode(Node):
             fsm=RaceFSM(initial_state=initial_mode),
             safety_monitor=runtime_safety_monitor(),
         )
-        self.lane_controller = Controller(self)
-        self.cone_controller = Controller(self)
+        self.lane_controller = Controller()
+        self.cone_controller = Controller()
 
         self.lane = 1
         self.object_dist = float("inf")
@@ -316,7 +315,7 @@ class MainNode(Node):
         lane_offset = self.runtime.latest_lane_offset
         if lane_received_at is not None and lane_offset is not None:
             self.lane_controller.update(
-                CONTROLLER_LANE_DRIVE,
+                Mode.LANE_DRIVE,
                 lane_offset,
                 self.object_dist,
                 100,
@@ -333,7 +332,7 @@ class MainNode(Node):
         cone_event = self.runtime.latest_cone_event
         if cone_event is not None and not cone_event.end_flag:
             self.cone_controller.update(
-                CONTROLLER_CONE_DRIVE,
+                Mode.CONE_DRIVE,
                 cone_event.offset,
                 self.object_dist,
                 cone_event.confidence,
