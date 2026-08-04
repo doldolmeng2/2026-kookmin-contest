@@ -44,7 +44,7 @@ class ObjectSnapshot:
     """Validated minimum subset of one existing ``/object_info`` message."""
 
     exists: bool
-    distance: float
+    distance: Optional[float]
     lane: ObjectLane
     received_at: float
 

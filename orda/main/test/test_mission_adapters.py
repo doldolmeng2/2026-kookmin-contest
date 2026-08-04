@@ -23,6 +23,12 @@ def object_message(*, exists=1.0, distance=1.2, lane=1.0):
     return [exists, distance, 0.1, 0.2, 5.0, 100.0, 20.0, 30.0, 4.0, lane]
 
 
+def no_cluster_message():
+    """Exact defaults emitted after object_detection::publishEmpty()."""
+
+    return [0.0, math.inf, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+
 def adapter(mode, *, lane_target=LaneTarget.LANE_ONE):
     return RaceRuntimeAdapter(
         fsm=RaceFSM(initial_state=mode),
@@ -61,21 +67,84 @@ def test_object_info_rejects_wrong_length_nonfinite_and_invalid_enums(payload):
     assert runtime.latest_object_snapshot is None
 
 
-def test_object_info_accepts_exact_ten_fields_and_preserves_receipt_time():
+def test_object_info_accepts_publisher_no_cluster_payload_as_absent_snapshot():
     runtime = adapter(Mode.FIXED_AVOID)
 
-    result = runtime.record_object_info(
-        object_message(exists=0.0, lane=0.0),
-        1.1,
-    )
+    result = runtime.record_object_info(no_cluster_message(), 1.1)
     cycle = runtime.step(1.1, lane=candidate(1.1))
 
     assert result.accepted is True
     assert cycle.observation.object_exists is False
-    assert cycle.observation.object_distance == pytest.approx(1.2)
+    assert cycle.observation.object_distance is None
     assert cycle.observation.object_lane is ObjectLane.UNKNOWN
     assert cycle.observation.object_received_at == 1.1
+    assert runtime.perception_received_at["object_info"] == 1.1
+    assert runtime.lane_action.pending is False
     assert cycle.control.source is ControlSource.LANE
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        object_message(exists=0.0, distance=math.nan, lane=0.0),
+        object_message(exists=0.0, distance=math.inf, lane=3.0),
+        [0.0, math.inf, 0.0, 0.0, 0.0, math.inf, 0.0, 0.0, 0.0, 0.0],
+    ],
+)
+def test_absent_object_does_not_hide_malformed_payload(payload):
+    runtime = adapter(Mode.FIXED_AVOID)
+
+    result = runtime.record_object_info(payload, 1.1)
+
+    assert result.accepted is False
+    assert runtime.latest_object_snapshot is None
+
+
+def test_no_object_then_valid_object_restores_actionable_snapshot():
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
+
+    assert runtime.record_object_info(no_cluster_message(), 1.1).accepted
+    absent = runtime.step(1.1, lane=candidate(1.1))
+    assert runtime.record_object_info(
+        object_message(lane=ObjectLane.LEFT.value),
+        1.2,
+    ).accepted
+    detected = runtime.step(1.2, lane=candidate(1.2))
+
+    assert absent.observation.object_distance is None
+    assert absent.observation.object_lane is ObjectLane.UNKNOWN
+    assert detected.observation.object_distance == pytest.approx(1.2)
+    assert detected.observation.object_lane is ObjectLane.LEFT
+    assert runtime.lane_action.pending is True
+    assert runtime.context.lane_target is LaneTarget.LANE_TWO
+
+
+def test_valid_object_then_no_object_cannot_complete_pending_action():
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
+
+    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.1)
+    runtime.step(1.1, lane=candidate(1.1))
+    assert runtime.record_object_info(no_cluster_message(), 1.2).accepted
+    absent = runtime.step(1.2, lane=candidate(1.2))
+
+    assert absent.observation.object_exists is False
+    assert absent.observation.object_distance is None
+    assert absent.observation.object_lane is ObjectLane.UNKNOWN
+    assert runtime.lane_action.pending is True
+    assert runtime.lane_action.completed is False
+
+
+def test_stale_pre_entry_no_object_cannot_start_or_complete_action():
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
+
+    assert runtime.record_object_info(no_cluster_message(), 0.9).accepted
+    cycle = runtime.step(1.1, lane=candidate(1.1))
+
+    assert cycle.observation.object_exists is False
+    assert runtime.lane_action.pending is False
+    assert runtime.lane_action.completed is False
+    assert runtime.lane_action.safe_to_drive is False
+    assert cycle.control.source is ControlSource.STOP
 
 
 @pytest.mark.parametrize(

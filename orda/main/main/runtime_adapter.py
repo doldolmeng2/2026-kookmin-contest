@@ -301,27 +301,62 @@ class RaceRuntimeAdapter:
             return InputRecordResult(False, "object_info requires exactly 10 fields")
         if not self._valid_timestamp(received_at):
             return InputRecordResult(False, "invalid object_info receipt timestamp")
-        if any(not self._valid_number(value) for value in values):
-            return InputRecordResult(False, "object_info fields must be finite numbers")
+        if any(
+            not isinstance(value, (int, float)) or isinstance(value, bool)
+            for value in values
+        ):
+            return InputRecordResult(False, "object_info fields must be numbers")
 
-        exists_value = float(values[0])
+        numeric_values = [float(value) for value in values]
+        if any(math.isnan(value) for value in numeric_values):
+            return InputRecordResult(False, "object_info fields must not contain NaN")
+
+        exists_value = numeric_values[0]
         if exists_value not in (0.0, 1.0):
             return InputRecordResult(False, "object_info exists must be 0 or 1")
-        distance = float(values[1])
-        if distance < 0.0:
-            return InputRecordResult(False, "object_info distance must be non-negative")
-        lane_value = float(values[9])
-        if not lane_value.is_integer():
+        lane_value = numeric_values[9]
+        if not math.isfinite(lane_value) or not lane_value.is_integer():
             return InputRecordResult(False, "object_info lane label must be an integer")
         try:
             lane = ObjectLane(int(lane_value))
         except ValueError:
             return InputRecordResult(False, "object_info lane label must be 0, 1, or 2")
 
+        distance = numeric_values[1]
+        if exists_value == 1.0:
+            if any(not math.isfinite(value) for value in numeric_values):
+                return InputRecordResult(
+                    False,
+                    "detected object_info fields must be finite numbers",
+                )
+            if distance < 0.0:
+                return InputRecordResult(
+                    False,
+                    "object_info distance must be non-negative",
+                )
+            snapshot_distance: Optional[float] = distance
+            snapshot_lane = lane
+        else:
+            # The existing detector intentionally emits +inf for min_dist when
+            # no LiDAR cluster exists.  Keep the heartbeat/receipt, but do not
+            # expose stale bbox/lane or the sentinel as actionable evidence.
+            if distance < 0.0 or distance == -math.inf:
+                return InputRecordResult(
+                    False,
+                    "absent object_info distance must be non-negative or +inf",
+                )
+            if any(not math.isfinite(value) for value in numeric_values[2:9]):
+                return InputRecordResult(
+                    False,
+                    "absent object_info metadata must be finite numbers",
+                )
+            snapshot_distance = None
+            snapshot_lane = ObjectLane.UNKNOWN
+
         self.latest_object_snapshot = ObjectSnapshot(
             exists=bool(exists_value),
-            distance=distance,
-            lane=lane,
+            distance=snapshot_distance,
+            lane=snapshot_lane,
             received_at=received_at,
         )
         self.perception_received_at["object_info"] = received_at

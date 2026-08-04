@@ -105,6 +105,23 @@ def test_main_object_callback_records_validated_ten_field_snapshot():
     assert harness.warnings == []
 
 
+def test_main_object_callback_accepts_and_normalizes_no_cluster_heartbeat():
+    harness = CallbackHarness([4.0], mode=Mode.FIXED_AVOID)
+    message = SimpleNamespace(
+        data=[0.0, float("inf"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+
+    MainNode.object_info_callback(harness, message)
+    cycle = harness.runtime.step(4.02)
+
+    assert cycle.observation.object_exists is False
+    assert cycle.observation.object_distance is None
+    assert cycle.observation.object_lane is ObjectLane.UNKNOWN
+    assert cycle.observation.object_received_at == 4.0
+    assert harness.runtime.lane_action.pending is False
+    assert harness.warnings == []
+
+
 @pytest.mark.parametrize(
     "data",
     [

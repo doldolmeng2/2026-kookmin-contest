@@ -219,3 +219,79 @@ Repeated sessions in one process:
 
 - Rubbercone negative-bag validation and repeated sessions in one process
   remain the regression backlog described in the preceding section.
+
+## 2026-08-05 — Object absence contract and fixed-source audit
+
+### Checkpoint
+
+- The preceding 19-file FSM skeleton was committed as
+  `d5aedbde4d2bb242917f126c41068d47af548f91` with message
+  `feat(kmu-real): complete finals FSM orchestration skeleton` after
+  `350 passed` and `git diff --check`.
+- The checkpoint was not pushed. This section's adapter/test changes remain
+  uncommitted for review.
+
+### Actual `/object_info` publisher contract
+
+- Source: `perception/object_detection/src/object_detection.cpp`.
+- `onScan()` calls `publishEmpty()` when no usable cluster exists;
+  `resetLidarState()` stores `lidar_valid=false`, `min_dist=+inf`, angle/span
+  zero, and cluster count zero.
+- `onImage()` independently resets no-box image fields to box size/cx/cy/dx
+  zero and lane label zero. Therefore the full no-cluster/no-box payload is
+  `[0, +inf, 0, 0, 0, 0, 0, 0, 0, 0]`. If an image box exists while LiDAR is
+  absent, the last five image-derived fields can be finite non-zero values but
+  are not actionable object evidence.
+- `onPublishTick()` creates exactly ten fields and publishes every 20 ms
+  (50 Hz) with KeepLast(10), BestEffort, Volatile QoS. `exists` is exactly 0
+  or 1. A later valid scan/image overwrites the reset state, so detection
+  values recover without a sticky no-detection latch.
+- The runtime adapter previously required all ten values to be finite and
+  rejected this normal `exists=0, min_dist=+inf` heartbeat.
+
+### Adapter correction
+
+- `exists=0` now retains the receipt timestamp but normalizes typed distance
+  to `None` and lane to `ObjectLane.UNKNOWN`; no lane-change action starts.
+- `exists=1` still requires all fields to be finite, a non-negative distance,
+  and a valid lane enum. NaN, invalid length/enum, negative values, and
+  non-publisher infinities in absent metadata remain malformed rather than
+  being silently converted to no-object.
+- UNIT PASS: `36 passed` in `test_mission_adapters.py`, including the exact
+  publisher sentinel, no-object/object recovery in both directions, and
+  stale/pre-entry/action-completion isolation.
+- MOCK PASS: `28 passed` in `test_main_runtime.py`, including callback receipt
+  and no-cluster normalization.
+- Full regression: `357 passed` (checkpoint baseline: `350 passed`).
+
+### Fixed-zone source decision
+
+| Decision | Available source | Meaning | Missing information |
+|---|---|---|---|
+| FIXED entry | `/object_info` plus internal race phase | Fresh LiDAR cluster and optional image lane label after the preceding phase | No fixed-zone identity, explicit boundary, active debounce, or validated distance threshold |
+| Lane-change start | `/mode_info [5, target]` action output | Requests the lane detector's existing reference transition | Requires a trustworthy FIXED entry and valid fresh object lane |
+| Lane-change complete | Declared `/lane_change_state [changing, success]` | Intended offset spike/settle success pulse | `updateLaneChangeState()` has no call site in current C++; inspected bags record zero messages |
+| Obstacle passed | `/object_info exists=0` is the only possible clear observation | Current detector saw no qualifying LiDAR cluster | Cannot distinguish a passed obstacle from occlusion, scan dropout, or temporary clustering miss |
+| FIXED exit | Internal typed test seam only | Explicit fresh edge used by the pure FSM tests | No production publisher, position/zone boundary, or independently validated pass evidence |
+
+- The object detector has no temporal debounce. Its defaults accept points only
+  through 2.0 m while `detect_threshold_m` defaults to 6.0 m, so every accepted
+  cluster becomes `exists=1` and is not a course-zone classification.
+- `perception/object_detection/config/object_detection.yaml` mentions three
+  stable on/off frames for a different `object_detector_node` contract, but
+  the current executable does not declare those parameters, CMake does not
+  install the YAML, and neither production nor bag-test launch loads it.
+- `pass_car`/`car` bag metadata contains raw scan/image/ultrasonic and, in some
+  runs, a declared lane-change topic, but no fixed-entry/exit/pass topic. The
+  inspected 2026-08-01 bag has 648 `/object_info` messages and zero
+  `/lane_change_state` messages; it also has no zone/complete source.
+- Decision: do not wire object evidence to FIXED entry and do not enable a
+  partial production path. The existing internal timestamped entry/exit seams
+  remain test-only; no ROS topic, threshold, debounce, or production transition
+  was added.
+
+### Unverified
+
+- No bag was replayed and no launch, driver, hardware, or motor publisher was
+  run. Fixed-zone identity, object-clear/pass semantics, operational
+  lane-change completion, and real-vehicle behavior remain UNVERIFIED.
