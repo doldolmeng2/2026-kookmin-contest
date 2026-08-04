@@ -270,7 +270,7 @@ Repeated sessions in one process:
 |---|---|---|---|
 | FIXED entry | `/object_info` plus internal race phase | Fresh LiDAR cluster and optional image lane label after the preceding phase | No fixed-zone identity, explicit boundary, active debounce, or validated distance threshold |
 | Lane-change start | `/mode_info [5, target]` action output | Requests the lane detector's existing reference transition | Requires a trustworthy FIXED entry and valid fresh object lane |
-| Lane-change complete | Declared `/lane_change_state [changing, success]` | Intended offset spike/settle success pulse | `updateLaneChangeState()` has no call site in current C++; inspected bags record zero messages |
+| Lane-change complete | Declared `/lane_change_state [changing, success]` | Intended offset spike/settle success pulse | At audit time `updateLaneChangeState()` had no call site; inspected bags record zero messages |
 | Obstacle passed | `/object_info exists=0` is the only possible clear observation | Current detector saw no qualifying LiDAR cluster | Cannot distinguish a passed obstacle from occlusion, scan dropout, or temporary clustering miss |
 | FIXED exit | Internal typed test seam only | Explicit fresh edge used by the pure FSM tests | No production publisher, position/zone boundary, or independently validated pass evidence |
 
@@ -295,3 +295,68 @@ Repeated sessions in one process:
 - No bag was replayed and no launch, driver, hardware, or motor publisher was
   run. Fixed-zone identity, object-clear/pass semantics, operational
   lane-change completion, and real-vehicle behavior remain UNVERIFIED.
+
+## 2026-08-05 — Lane-change state feedback activation
+
+### No-object checkpoint
+
+- Committed the preceding five-file absent-object correction as
+  `f9a1b1773cc7fb27421262d091385e70d9ca5a65` with message
+  `fix(kmu-real): normalize absent object observations`.
+- Before commit: adapter `36 passed`, main callback mocks `28 passed`, full
+  Python regression `357 passed`, compileall and `git diff --check` passed.
+- The checkpoint was not pushed and its worktree was clean before this
+  lane-change work began.
+
+### Actual lane callback and prior blocker
+
+- Package: `lane_detection` (`ament_cmake`). The node subscribes to
+  `/resized_image` with SensorData BestEffort QoS and `/mode_info [mode, lane]`
+  with KeepLast(10), BestEffort, Volatile QoS.
+- Each decoded non-empty image runs yellow-lane preprocessing, BEV/noise
+  suppression, fitting, and offset calculation. A failed fit explicitly sets
+  `valid=false` but reuses the previous fit/offset for legacy lane-control
+  output.
+- `/lane_change_state` was already declared as an `Int32MultiArray` publisher
+  with KeepLast(10), BestEffort, Volatile QoS. Its
+  `updateLaneChangeState()` publisher function had no call site, so the node
+  could appear in the ROS graph without emitting feedback messages.
+
+### Minimal wiring and state contract
+
+- Added one call at the end of the successfully decoded image-processing path,
+  after the current frame's fitting validity and offset are known. There is no
+  timer and no stale geometry is accepted as completion evidence.
+- Preserved the configured algorithm and values: spike 400 px, straight settle
+  50 px, curve settle 300 px, eight settle frames, curve split `|m| >= 0.1`.
+- A small ROS-independent tracker treats only mode 5 with target 0 or 1 as a
+  valid action. Repeated mode-5 messages for the same target retain one command
+  epoch; mode exit, invalid target, or target change resets/rearms safely.
+- A valid action publishes `[1, 0]` until spike plus settle completes, then
+  publishes one `[1, 1]` edge. The same action cannot generate another edge;
+  the next processed frame is success-low. Invalid fitting resets progress but
+  cannot produce success. Idle/completed/cancelled actions publish `[0, 0]`.
+- No lane fitting, BEV, steering, topic fields, numeric mode meaning, or
+  threshold was changed.
+
+### Verification
+
+- BUILD PASS: `colcon build --packages-select lane_detection --symlink-install`.
+- UNIT/SYNTHETIC PASS: four GTests cover idle, incomplete action, single spike,
+  settle completion, one-shot behavior, cancel, a second action, invalid
+  target/fit, and target-change reset.
+- STATIC PASS: `cppcheck`, CMake lint, XML lint, and uncrustify for the two new
+  files. Full package `colcon test` still reports pre-existing whole-file
+  uncrustify debt in four legacy sources, including the file-wide style of
+  `lane_detection.cpp`; the new GTest itself passes.
+- MOCK PASS: existing Python object/lane-change adapters and main callbacks,
+  `64 passed`.
+- Full Python regression: `357 passed`; compileall and `git diff --check`
+  passed.
+- BAG UNVERIFIED: available recordings are not labeled with a deterministic
+  mode-5 spike/settle ground truth, so no bag was replayed and the old zero
+  message count was not treated as a pass.
+- REAL-VEHICLE UNVERIFIED: no launch, camera/hardware driver, motor node, or
+  `/xycar_motor` publisher was run.
+- Fixed-zone production entry/exit remains disabled. Lane-change feedback is
+  action feedback only and is not used as fixed-zone evidence.

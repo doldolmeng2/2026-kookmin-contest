@@ -33,6 +33,7 @@
 #include <functional>
 #include <algorithm>
 #include <chrono>
+#include "lane_change_state_tracker.hpp"
 #include "parameter_loader.hpp"
 
 using namespace std;
@@ -66,7 +67,12 @@ public:
       roi_top_y_       (static_cast<int>(frame_height_ * config_.roi_top_y_coefficient)),
       roi_bottom_y_    (static_cast<int>(frame_height_ * config_.roi_bottom_y_coefficient)),
       center_reference_lane_one_(config_.center_reference_lane_one),
-      center_reference_lane_two_(config_.center_reference_lane_two)
+      center_reference_lane_two_(config_.center_reference_lane_two),
+      lane_change_tracker_(config_.lane_change_tol_straight,
+                           config_.lane_change_tol_curve,
+                           config_.lane_change_tol_change,
+                           config_.lane_change_streak_need,
+                           config_.lane_change_m_split)
     {
         // QoS 프로파일
         // - qos_sensor: 영상/센서처럼 최신성 우선, 유실 허용 (Best Effort)
@@ -886,38 +892,14 @@ public:
     // 발행 형식: [변경중여부(0/1), 성공여부(0/1)]
     // ─────────────────────────────────────────────────────────────────────
     void updateLaneChangeState(bool valid, const LineFit& center_fit, float offset) {
-        const bool mode_changing = (current_mode_ == 5);
-        int changing_flag = mode_changing ? 1 : 0;
-
-        if (mode_changing && valid) {
-            const float off        = std::abs(offset);
-            const bool  is_curve   = (std::abs(center_fit.m) >= M_SPLIT_);
-            const float tol_settle = is_curve ? TOL_CURVE_ : TOL_STRAIGHT_;
-
-            if (change_phase_ == WAIT_SPIKE) {
-                if (off >= TOL_CHANGE_) {
-                    change_phase_  = WAIT_SETTLE;
-                    stable_streak_ = 0;
-                }
-            } else {  // WAIT_SETTLE
-                if (off <= tol_settle) stable_streak_++;
-                else                   stable_streak_ = 0;
-
-                if (stable_streak_ >= STREAK_NEED_) {
-                    success_pulse_ = success_pulse_frames_;
-                    change_phase_  = WAIT_SPIKE;
-                    stable_streak_ = 0;
-                }
-            }
-        } else {
-            change_phase_  = WAIT_SPIKE;
-            stable_streak_ = 0;
-        }
+        const auto feedback = lane_change_tracker_.update(
+            valid,
+            center_fit.m,
+            offset);
 
         std_msgs::msg::Int32MultiArray st;
-        st.data = { changing_flag, (success_pulse_ > 0 ? 1 : 0) };
+        st.data = {feedback.changing, feedback.success};
         lane_change_state_pub_->publish(st);
-        if (success_pulse_ > 0) success_pulse_--;
     }
 
     // 차선 모드에 대응하는 목표 ref 비율(0~1) 반환
@@ -998,20 +980,7 @@ private:
     // ── 모드/차선 상태 ──────────────────────────────────────────────────
     int  current_mode_ = 0;
     int  current_lane_ = 0;
-    bool check_active_ = false;  // 모드 5 진입 후 검증 진행 중 여부
-
-    // ── 차선 변경 감지 임계값 ───────────────────────────────────────────
-    float TOL_STRAIGHT_ = config_.lane_change_tol_straight;
-    float TOL_CURVE_    = config_.lane_change_tol_curve;
-    float TOL_CHANGE_   = config_.lane_change_tol_change;
-    int   STREAK_NEED_  = config_.lane_change_streak_need;
-    float M_SPLIT_      = config_.lane_change_m_split;
-
-    // ── 차선 변경 상태 머신 ─────────────────────────────────────────────
-    enum Phase { WAIT_SPIKE = 0, WAIT_SETTLE = 1 } change_phase_ = WAIT_SPIKE;
-    int stable_streak_        = 0;
-    int success_pulse_        = 0;
-    int success_pulse_frames_ = 1;  // 성공 신호 펄스 길이 (프레임 수)
+    lane_detection::LaneChangeStateTracker lane_change_tracker_;
 
     // ── ref 비율 스무딩 전환 변수 ───────────────────────────────────────
     bool         smooth_enabled_              = config_.change_ref_smoothly;
@@ -1131,6 +1100,11 @@ private:
         // (6) 토픽 발행 + 디버그 출력
         publishAndDebug(frame, offset, center_fit, show_dbg,
                         dbg.empty() ? nullptr : &dbg);
+
+        // Use this frame's explicit fitting validity. A failed fit may reuse
+        // the prior offset for lane control, but it must reset completion
+        // progress rather than treating stale geometry as fresh evidence.
+        updateLaneChangeState(valid, center_fit, offset);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1149,13 +1123,17 @@ private:
         const int new_mode  = msg->data[0];
         const int new_lane  = msg->data[1];
         const int prev_mode = current_mode_;
+        const bool valid_lane_target = new_lane == 0 || new_lane == 1;
+
+        lane_change_tracker_.handleCommand(new_mode, new_lane);
 
         current_mode_ = new_mode;
         current_lane_ = new_lane;
 
         // lane_mode_ 갱신: 모드 5이거나 비3 → 3 전환 시에만 업데이트
         LaneMode old_lane_mode = lane_mode_;
-        if (new_mode == 5 || (prev_mode != 3 && new_mode == 3)) {
+        if (valid_lane_target &&
+            (new_mode == 5 || (prev_mode != 3 && new_mode == 3))) {
             lane_mode_ = (new_lane == 0) ? LaneMode::LANE_ONE : LaneMode::LANE_TWO;
         }
 
@@ -1163,21 +1141,6 @@ private:
         if (smooth_enabled_ && lane_mode_ != old_lane_mode)
             startRefTransition(lane_mode_);
 
-        // 모드 5 진입 시 차선 변경 감지 상태 초기화
-        if (prev_mode != 5 && current_mode_ == 5) {
-            check_active_  = true;
-            stable_streak_ = 0;
-            success_pulse_ = 0;
-            change_phase_  = WAIT_SPIKE;
-        }
-
-        // 모드 5 이탈 시 감지 상태 리셋
-        if (prev_mode == 5 && current_mode_ != 5) {
-            check_active_  = false;
-            stable_streak_ = 0;
-            success_pulse_ = 0;
-            change_phase_  = WAIT_SPIKE;
-        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
