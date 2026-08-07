@@ -60,6 +60,9 @@ class SafetyMonitor:
         race_timeout_s: float = 240.0,
         cone_timeout_s: float = 60.0,
     ) -> None:
+        # Official limits from "2026 제9회 경주 진행 방법" (2026-07-29):
+        # p.37 limits the whole race to four minutes, and p.25 requires the
+        # rubber-cone section to be completed within one minute.
         if stale_after_s <= 0.0:
             raise ValueError("stale_after_s must be positive")
         if race_timeout_s <= 0.0 or cone_timeout_s <= 0.0:

@@ -22,7 +22,9 @@ class MissionObservation:
     perception_received_at: Mapping[str, float] = field(default_factory=dict)
 
     green_detected: bool = False
+    traffic_message_received_at: Optional[float] = None
     lane_valid: bool = False
+    lane_valid_received_at: Optional[float] = None
     cone_detected: bool = False
     cone_finished: bool = False
     cone_confidence: Optional[int] = None
@@ -36,6 +38,11 @@ class MissionObservation:
     left_turn_signal: bool = False
     shortcut_complete: bool = False
     finish_gate_crossed: bool = False
+    fixed_avoid_complete_received_at: Optional[float] = None
+    overtake_complete_received_at: Optional[float] = None
+    left_turn_signal_received_at: Optional[float] = None
+    shortcut_complete_received_at: Optional[float] = None
+    finish_gate_crossed_received_at: Optional[float] = None
 
     def __post_init__(self) -> None:
         # Copy caller-owned dictionaries so this object remains a true snapshot.
