@@ -53,7 +53,7 @@ public:
         // OpenCV imshow 디버그 창 활성화 여부
         enable_gui_         = this->declare_parameter<bool>("enable_gui",             true);
         // 박스 중심이 중앙선에서 ±lane_split_margin_px_ 이상 벗어나면 차선 레이블 부여
-        lane_split_margin_px_ = this->declare_parameter<double>("lane_split_margin_px", 6.0);
+        lane_split_margin_px_ = this->declare_parameter<double>("lane_split_margin_px", 10.0);
         // lane_fit이 프레임 좌표계면 true (BEV 좌표계면 false)
         lane_fit_is_frame_  = this->declare_parameter<bool>("lane_fit_is_frame",     true);
 
@@ -414,10 +414,23 @@ private:
                     cv::dnn::NMSBoxes(boxes, confs, conf_threshold_, nms_threshold_, keep);
 
                     if (!keep.empty()) {
-                        // 신뢰도 가장 높은 박스 선택
+                        // 가장 '가까운'(=박스 면적이 가장 큰) 장애물을 선택한다.
+                        //
+                        // 예전에는 신뢰도가 가장 높은 박스를 골랐는데, 차선마다
+                        // 방해차량이 있어 두 대가 동시에 잡히면 신뢰도가 엎치락뒤치락
+                        // 하면서 프레임마다 다른 차가 선택되고, 그 결과 lane_label
+                        // (=car_lane)이 L1/L2 사이를 계속 뒤집혔다. 게다가 정작
+                        // 충돌 위험이 있는 건 '가장 가까운' 차인데 멀리 있는 차의
+                        // 차선을 판정해 버리는 문제도 있었다.
+                        // box_area 는 이미 접근도 지표로 쓰이므로(box_size > 1900
+                        // 트리거) 면적 기준 선택이 나머지 로직과도 일관된다.
+                        auto area_of = [&](int i) {
+                            return static_cast<long>(boxes[i].width) *
+                                   static_cast<long>(boxes[i].height);
+                        };
                         int best = keep[0];
                         for (int idx : keep)
-                            if (confs[idx] > confs[best]) best = idx;
+                            if (area_of(idx) > area_of(best)) best = idx;
 
                         best_box = boxes[best];
                         box_area = static_cast<float>(best_box.width) *

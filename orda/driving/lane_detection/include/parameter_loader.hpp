@@ -86,6 +86,10 @@ struct Config {
     // ── ref 전환 및 디버그 설정 ──────────────────────────────────────────
     float lane_ref_transition_duration_sec;  // 차선 전환 시 ref 선형 보간 소요 시간 (초)
     bool  debug_view;           // true면 OpenCV imshow 디버그 창 표시
+    // false면 보조 차선 디버그 창(YCrCb channels, ROI Polygon, BEV-Yellow 3종,
+    // Lane View + Offset)을 숨기고 SlidingWindows / Mask-Yellow만 표시한다.
+    // debug_view가 false면 이 값과 무관하게 모든 창이 꺼진다.
+    bool  debug_lane_view;
     bool  change_ref_smoothly;  // true면 차선 전환 시 ref를 선형 보간
 };
 

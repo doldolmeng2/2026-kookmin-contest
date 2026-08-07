@@ -175,6 +175,9 @@ main/main/
          /lane_fit                      (std_msgs/Float32MultiArray, [m, b]) [유지]
          /lane_change_state             (std_msgs/Int32MultiArray)        [유지]
          [변경중, 성공여부]
+         /lane_position                 (std_msgs/Int16)                  [신규]
+         -1 = 미확정, 0 = 1차선, 1 = 2차선
+         노란 중앙선의 화면상 좌우 위치로 판정한 **실측** 현재 차선
 
   object_node
     sub: /scan, /resized_image, /lane_fit
@@ -186,8 +189,8 @@ main/main/
 
 [제어]
   main_node
-    sub: /rubbercone_info, /lane_offset, /lane_change_state, /object_info,
-         /traffic_detection, /imu, /joy, /xycar_ultrasonic
+    sub: /rubbercone_info, /lane_offset, /lane_change_state, /lane_position,
+         /object_info, /traffic_detection, /imu, /joy, /xycar_ultrasonic
     pub: /xycar_motor                   (std_msgs/Float32MultiArray)      [유지]
          [angle, speed]
          /mode_info                     (std_msgs/Int32MultiArray)        [변경]
@@ -201,6 +204,7 @@ main/main/
 | `/traffic_detection` | `Bool` → `Int32` (4상태) | 4구 신호등의 좌회전 화살표를 구분해야 지름길 판단이 가능 |
 | `/object_info` | `is_moving` 필드 추가 | 고정장애물 회피와 방해차량 추월은 **규칙이 다른 별개 미션** (추월 중에는 차선 이탈이 허용됨) |
 | `/mode_info` | `[mode, lane]` → `[mode, lap, shortcut_used, lane_target]` | 1·2차선 구분이 폐지되어 `lane` 은 무의미해졌고, 3바퀴·지름길 1회 판단에 랩 수와 사용 여부가 필요 |
+| `/lane_position` | 신설 | `lane_target` 은 **명령**(가고 싶은 차선)이라 차선 변경 도중에도 목표값을 가리킨다. 방해차량이 내 차선에 있는지 판단하려면 **지금 실제로 어디 있는지**가 필요하므로 실측 채널을 분리 |
 
 `car_lane` 과 `lane_target` 은 **같은 정수 규약(0=중앙, 1=왼쪽, 2=오른쪽)** 을 쓴다.
 방해차량이 있는 쪽의 반대편을 추월 방향으로 그대로 뒤집어 쓸 수 있게 하기 위함이다.
@@ -254,6 +258,88 @@ main/main/
 > ⚠️ 방해차량은 **1차선과 2차선을 오가며 주행한다**(규정 p.32). `car_lane` 은 한 번 읽고
 > 마는 값이 아니라 추월 직전까지 계속 갱신해야 하며, 접근 중에 방해차량이 차선을 바꾸면
 > 추월 방향도 다시 결정해야 한다.
+
+---
+
+## 차선 인식 안정화 (lane_detection)
+
+노란 중앙선에 피팅한 직선이 주행 중 좌우로 크게 튀는 문제를 잡기 위한 수정이다.
+
+| 수정 | 내용 |
+|---|---|
+| `keepLongestComponent()` | BEV 이진 마스크에서 `connectedComponentsWithStats` 로 **가장 큰 연결 성분만 남긴다.** 반사광·노면 얼룩 같은 작은 덩어리가 피팅에 끌려들어가지 않는다 |
+| `ref_hist_sigma_ratio` : 999.0 → **0.35** | 직전 프레임 차선 위치 주변에 가우시안 가중을 준다. 999.0 은 사실상 가중치 없음(균등)이라 히스토그램 피크가 매 프레임 엉뚱한 곳으로 점프했다 |
+| `ref_hist_min_weight` : 1.0 → **0.5** | 위 가중의 하한. 0.5 라서 멀리 있는 후보도 완전히 죽지는 않아 **차선 변경 같은 실제 큰 이동은 따라간다** |
+| `sliding_window_minpix` : 5 → **15** | 윈도 재중심화 최소 픽셀 수. 5 는 노이즈 몇 개만으로 윈도가 끌려갔다 |
+
+> 시도했다가 **되돌린** 것: 오프셋 EMA 평활, 근거리 픽셀 가중, 직전 기울기와의
+> 방향 일치 가중. 셋 다 피팅을 더 나쁘게 만들었다. 특히 근거리 가중은 오해였는데,
+> 주행 중에는 모션 시차 때문에 **가까운 픽셀이 오히려 더 뭉개진다.**
+
+### 실측 차선 판정
+
+노란 중앙선의 화면상 x 위치 비율로 현재 차선을 정하고 `/lane_position` 으로 발행한다.
+
+- `classifyLaneFromRatio()` — 화면 중앙 기준 **±0.05 데드존**. 그 안이면 `-1`(미확정)을
+  반환해 애매한 프레임에서 억지 판정을 하지 않는다.
+- `updateAndPublishDetectedLane()` — 같은 판정이 **5 프레임 연속**일 때만 값을 바꾼다
+  (디바운스). 한 프레임 튐으로 차선 인식이 뒤집히는 것을 막는다.
+
+`debug_lane_view` (기본 `false`) 로 BEV·윈도 시각화 창을 켜고 끌 수 있다.
+실차에서는 반드시 `false` — imshow 가 인지 콜백을 지연시킨다.
+
+---
+
+## 방해차량 충돌 대응
+
+인지(YOLO 검출·차선 피팅)는 정상인데 **회피 조향이 너무 늦게 나가 앞차를 들이받는**
+문제가 있었다. bag 재생으로 계측한 결과 원인은 두 가지였다.
+
+### 1. 박스 선택 기준: 신뢰도 → 면적 (근본 원인)
+
+`object_detection` 은 NMS 통과 박스 중 **신뢰도가 가장 높은 것**을 골라 `/object_info` 로
+내보내고 있었다. 차선마다 방해차량이 한 대씩 있으면 두 대가 동시에 검출되는데,
+신뢰도는 프레임마다 엎치락뒤치락하므로 **바로 앞 차와 멀리 있는 차가 번갈아 선택**된다.
+그 결과 `car_lane` 이 계속 뒤집히고, `box_size` 도 큰 값과 작은 값을 오가서
+차선 변경 트리거가 계속 미뤄졌다.
+
+→ **면적이 가장 큰 박스(= 가장 가까운 차)** 를 고르도록 변경했다.
+충돌 위험을 만드는 것은 언제나 제일 가까운 차이므로 판단 대상이 흔들리지 않는다.
+
+계측값 (bag `rosbag2_car_5`):
+
+| | 변경 전 | 변경 후 |
+|---|---|---|
+| 차선변경 트리거 시점의 `box_size` 평균 | 13,540 px² | **2,096 px²** |
+| `car_lane` 뒤집힘 (접근 구간) | 8 회 | 0 회 |
+
+트리거 박스가 작을수록 **멀리서 미리 피한 것**이다. 관측된 최대 박스가 27,258 px²
+(= 눈앞) 이므로, 변경 전에는 사실상 코앞에서야 조향이 시작되고 있었다.
+
+### 2. 같은 차선일 때만 회피 (`is_obstacle_in_ego_lane`)
+
+방해차량이 옆 차선에 있는데도 차선을 바꾸면 불필요한 이탈 위험만 커진다.
+FSM 이 차선 변경을 걸기 전에 아래 게이트를 통과하도록 했다.
+
+```
+obstacle_lane = car_lane 을 0/1 로 환산      (/object_info)
+ego_lane      = /lane_position (실측)         ← 없으면 lane_target 으로 폴백
+차선 변경은 obstacle_lane == ego_lane 일 때만
+```
+
+`car_lane` 이 0(중앙)·미확정이면 **보수적으로 "내 차선에 있다"고 본다.**
+회피를 놓치는 쪽이 불필요하게 피하는 쪽보다 비용이 크기 때문이다.
+
+> 별도의 긴급 회피·후진 같은 안전장치는 넣지 않았다. 시도해 봤으나 방금 지나친 차가
+> 여전히 크게 보여 회피가 즉시 재발동하며 진동했고(트리거 4회 → 74회),
+> 위 두 가지 수정만으로 충돌이 해소되어 불필요했다.
+
+### 조향 관련 보조 수정
+
+- `control.py` 에 `MAX_ANGLE = 100.0` 클램프 추가 — PD 출력이 물리 조향 범위를
+  넘어 튀는 것을 막는다.
+- `control.reset(offset)` 이 `prev_offset` 을 **현재 오프셋으로 시드**한다.
+  모드 전환 직후 미분항이 `0 - offset` 으로 계산되어 한 프레임 급조향이 나가던 문제.
 
 ---
 
@@ -338,8 +424,8 @@ LANE_DRIVE ─(3바퀴 완료)─▶ FINISH
 # 전체 시스템 (실차)
 ros2 launch main module_drive.py
 
-# bag 파일 테스트
-ros2 launch main module_drive_bag_test.py
+# bag 파일 테스트 — 아래 launch 는 --clock 재생을 전제로 한다 (설명은 다음 절)
+ros2 launch main module_drive_bag_test.py mode:=3 show_debug:=true
 
 # 수동 주행 (Xbox 컨트롤러)
 ros2 launch manual_drive manual_drive.launch.py
@@ -347,6 +433,41 @@ ros2 launch manual_drive manual_drive.launch.py
 # bag 수집
 ros2 launch manual_drive ordabag.launch.py
 ```
+
+### bag 재생 시 주의 — `--clock` 필수
+
+`module_drive_bag_test.py` 는 `main_node` 를 `use_sim_time: True` 로 띄운다.
+따라서 bag 은 **반드시 `--clock` 과 함께** 재생해야 한다.
+
+```bash
+ros2 bag play <bag_path> --clock --loop
+```
+
+`--clock` 없이 재생하면 `/clock` 이 발행되지 않아 ROS 시계가 0 에 멈추고,
+`create_timer` 가 **한 번도 발동하지 않는다.** 상태 창이 뜨지 않거나 모드가
+그대로 굳어 있으면 대부분 이 경우다.
+
+`use_sim_time` 을 켜 두는 이유는 `--loop` 재생 때문이다. 루프가 돌면 bag 시각이
+뒤로 튀는데, `main_node` 는 **2 초 이상의 시각 역행**(`bag_loop_backjump_sec`)을
+"bag 이 처음부터 다시 재생됨"으로 판정하고 내부 상태를 초기화한다.
+이것이 없으면 2 회차부터 경과 시간이 음수가 되어 `Lane Change` 표시가 계속
+`ACTIVE` 로 붙어 있는 등의 오동작이 생긴다.
+
+### 상태 디버그 창 (`show_debug:=true`)
+
+`main_node` 가 OpenCV 창 하나에 현재 판단 근거를 그린다.
+
+| 항목 | 의미 |
+|---|---|
+| `Current Lane` | `/lane_position` 기반 **실측** 현재 차선 (Lane 1 / Lane 2 / Unknown) |
+| `Lane Change` | 차선 변경 명령이 나간 직후 `ACTIVE` — 표시 전용이며 제어에 영향 없음 |
+| `Target lane` | `lane_target`, 즉 **가려는** 차선 (`Current Lane` 과 다를 수 있음) |
+| `Box` | 검출 박스 면적(px²) 과 `car_lane`. 차선 변경 트리거 판단의 직접 입력 |
+| `Box shrink rate` | 박스 면적 변화율(px/s, EMA). **양수 = 멀어지는 중**(추월 성공), 음수 = 접근 중 |
+
+`imshow` / `waitKey` 는 rclpy 콜백에서 직접 부르지 않고 **전용 표시 스레드**
+(`_display_loop`)에 넘긴다. WSLg 환경에서 콜백 안 imshow 가 창을 띄우지 못하거나
+인지 주기를 늘어뜨리는 문제가 있었다.
 
 ### 단위 테스트 / 오프라인 검증
 
@@ -362,13 +483,19 @@ python3 -m main.tools.replay_fsm_bag <bag_path>
 | 패키지 / 모듈 | 상태 | 비고 |
 |---|---|---|
 | `image_resize` | 유지 | 카메라 동일, 변경 없음 |
-| `lane_detection` | 유지 | 코스 동일. `lane_detection_parameter.json` 그대로 사용 |
+| `lane_detection` | 수정 | 피팅 안정화 + `/lane_position` 신설. 파라미터 재튜닝 ([차선 인식 안정화](#차선-인식-안정화-lane_detection)) |
 | `rubbercone` | 수정중 | 라바콘 시작 지점 다름 |
-| `object_detection` | 수정 | YOLO 모델(`best.onnx`) 유지, `is_moving` 분류 추가 |
+| `object_detection` | 수정 | YOLO 모델(`best.onnx`) 유지, `is_moving` 분류 추가. **박스 선택을 신뢰도 → 면적 기준으로 변경** ([방해차량 충돌 대응](#방해차량-충돌-대응)) |
 | `traffic_light` | 재작성 | 초록 Bool → 4구 신호등 4상태 |
 | `main/main.py` | 재작성 | 옛 정수 FSM 폐기, 순수 모듈 계층 배선으로 교체 |
+| `main/control.py` | 수정 | `MAX_ANGLE` 클램프, `reset(offset)` 시드 |
 | `main` 로직 모듈 | 진행 중 | FSM 전이 일부 미구현 (아래 참조) |
 | `manual_drive`, `sensors_viewer` | 유지 | 하드웨어 동일 |
+
+### 검증 현황
+
+`rosbag2_car_5_2026_07_24-14_50_54` 로 6개 노드 전체 재생 확인 — 에러 0건,
+차선변경 트리거 `box_size` 1,960 / 2,470 (평균 2,215) 으로 여유 있게 회피.
 
 ### 미해결 항목
 

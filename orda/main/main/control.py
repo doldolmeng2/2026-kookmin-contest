@@ -86,6 +86,11 @@ PDParams    = namedtuple('PDParams',    ['kp', 'kd', 'alpha'])
 
 
 class Controller:
+    # manual_drive(joystic.py)가 조이스틱 axes(-1.0~1.0) × 100으로 조향각을
+    # 만드므로, 하드웨어가 실제로 기대하는 각도 범위는 대략 ±100으로 추정된다.
+    # get_angle()에서 이 범위로 clamp해 서보에 비정상적으로 큰 값이 나가는 것을 막는다.
+    MAX_ANGLE = 100.0
+
     def __init__(self, node):
         """
         Controller 초기화
@@ -126,7 +131,7 @@ class Controller:
         """
         # 모드 전환 감지 → 내부 상태 초기화
         if mode != self.prev_mode:
-            self.reset()
+            self.reset(offset)
             self.prev_mode = mode
 
         if mode == TRAFFIC_WAIT:
@@ -233,14 +238,26 @@ class Controller:
         )
         return min(confidence_speed, turn_speed)
 
-    def reset(self):
-        """내부 제어 상태 초기화 (모드 전환 시 호출)"""
-        self.prev_offset       = 0.0
+    def reset(self, offset: float = 0.0):
+        """
+        내부 제어 상태 초기화 (모드 전환 시 호출)
+        prev_offset을 0이 아니라 현재 offset으로 시드한다. 0으로 리셋하면
+        모드 전환 직후 diff(= error - prev_offset)가 실제 변화율이 아니라
+        offset 절댓값 그 자체가 되어버려, 매 모드 전환마다 인위적인 조향각
+        스파이크가 발생했다. 현재 offset으로 시드하면 전환 직후 diff=0에서
+        시작해 진짜 변화율만 반영된다.
+        """
+        self.prev_offset       = float(offset)
         self.obstacle_integral = 0.0
 
     def get_angle(self) -> float:
-        """현재 계산된 조향각 반환"""
-        return self.angle
+        """
+        현재 계산된 조향각 반환.
+        manual_drive(조이스틱 수동 조작)의 각도 범위(axes × ±100)를 기준으로
+        ±MAX_ANGLE로 clamp한다. 계산 로직(update() 등)은 그대로 두고, 외부로
+        나가는 값만 안전 범위로 제한하므로 다른 동작에는 영향이 없다.
+        """
+        return max(-self.MAX_ANGLE, min(self.MAX_ANGLE, self.angle))
 
     def get_speed(self) -> float:
         """현재 계산된 속도 반환"""

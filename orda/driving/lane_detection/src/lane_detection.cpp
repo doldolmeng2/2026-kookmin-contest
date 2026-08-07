@@ -13,6 +13,12 @@
 // 발행: /lane_offset       (std_msgs/Int16, 픽셀 단위 오프셋)
 //       /lane_fit           (std_msgs/Float32MultiArray, [m, b])
 //       /lane_change_state  (std_msgs/Int32MultiArray, [변경중, 성공여부])
+//       /lane_position      (std_msgs/Int16, 실측 현재 차선: -1=미확정, 0=Lane1, 1=Lane2)
+//
+// /lane_position 은 /mode_info로 "명령"받은 차선(제어 목표, 차선변경 시작과
+// 동시에 미리 토글되어야 함)과는 별개로, 감지된 노란 중앙분리선의 BEV상
+// 실제 위치(center_reference_lane_one/two 중 어느 기준에 더 가까운지)로부터
+// "차량이 지금 실제로 어느 차선에 있는지"를 역산한 순수 인지(perception) 값이다.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <rclcpp/rclcpp.hpp>
@@ -105,6 +111,10 @@ public:
         lane_change_state_pub_ = this->create_publisher<std_msgs::msg::Int32MultiArray>(
             "/lane_change_state", qos_fast);
 
+        // 실측 현재 차선 발행: /lane_position (-1=미확정, 0=Lane1, 1=Lane2)
+        lane_position_pub_ = this->create_publisher<std_msgs::msg::Int16>(
+            "/lane_position", qos_fast);
+
         // BEV 호모그래피 행렬 계산 (ROI 사다리꼴 → 직사각형)
         buildHomography();
 
@@ -159,8 +169,8 @@ public:
                 Scalar(config_.yellow_ycrcb_max_y,  config_.yellow_ycrcb_max_cr, config_.yellow_ycrcb_max_cb),
                 y_ycc);
 
-        // YCrCb 채널 합산 디버그 시각화 (debug_view 설정 시)
-        if (config_.debug_view) {
+        // YCrCb 채널 합산 디버그 시각화 (debug_lane_view 설정 시)
+        if (config_.debug_view && config_.debug_lane_view) {
             std::vector<cv::Mat> ch;
             split(ycrcb, ch);
             imshow("YCrCb channels", (ch[0] + ch[1] + ch[2]) / 3);
@@ -440,6 +450,37 @@ public:
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // 최장 연결 성분만 남기기
+    //
+    // 그림자, 반사, 잡음 등은 대체로 세로로 짧고 끊어진 덩어리로 나타나는
+    // 반면, 실제 차선은 세로로 길게 이어진 하나의 연결 성분으로 나타난다.
+    // cv::connectedComponentsWithStats로 이진 영상의 모든 연결 성분을 찾고,
+    // 그중 세로 방향 길이(bounding box height)가 가장 긴 성분 하나만 남기고
+    // 나머지는 전부 지운다. 슬라이딩 윈도우/히스토그램 모두 이 필터링된
+    // 영상을 사용하므로, 노이즈 덩어리는 애초에 후보에서 배제된다.
+    // ─────────────────────────────────────────────────────────────────────
+    cv::Mat keepLongestComponent(const cv::Mat& bev_in) const {
+        cv::Mat labels, stats, centroids;
+        const int n = cv::connectedComponentsWithStats(bev_in, labels, stats, centroids, 8, CV_32S);
+
+        if (n <= 1) return bev_in.clone();  // 배경(0)뿐, 성분 없음
+
+        int best_label  = -1;
+        int best_height = -1;
+        for (int label = 1; label < n; ++label) {
+            const int height = stats.at<int>(label, cv::CC_STAT_HEIGHT);
+            if (height > best_height) {
+                best_height = height;
+                best_label  = label;
+            }
+        }
+
+        cv::Mat out = cv::Mat::zeros(bev_in.size(), CV_8UC1);
+        out.setTo(255, labels == best_label);
+        return out;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // (4) 슬라이딩 윈도우 직선 피팅
     //
     // BEV 이진 영상에서 중앙선을 슬라이딩 윈도우로 추적하고
@@ -596,10 +637,15 @@ public:
         // ── 6) 최소자승 직선 피팅: x = m*y + b (SVD 방식) ─────────────
         // 설계행렬 X(Nx2): 각 행 = [y_i, 1]
         // 타겟벡터 Y(Nx1): 각 행 = x_i
-        // 해 θ = [m, b] 를 SVD로 수치 안정적으로 계산
+        //
+        // (근거리 가중치, 방향 일관성 가중치를 각각 시도했으나 모두 되돌림:
+        //  근거리 가중치는 모션 블러가 근거리에서 더 심해 역효과였고,
+        //  방향 일관성 가중치는 첫 윈도우(기준점) 자체가 노이즈였을 때 그
+        //  잘못된 추세를 계속 따라가며 오히려 노이즈를 진짜 선보다 더
+        //  신뢰하게 되는 문제가 있었다. 단순 비가중 최소자승이 가장 안정적.)
         Mat X(pts.size(), 2, CV_32F), Y(pts.size(), 1, CV_32F);
         for (size_t i = 0; i < pts.size(); ++i) {
-            float yf = static_cast<float>(pts[i].y);
+            const float yf = static_cast<float>(pts[i].y);
             X.at<float>(i, 0) = yf;
             X.at<float>(i, 1) = 1.f;
             Y.at<float>(i, 0) = static_cast<float>(pts[i].x);
@@ -755,10 +801,15 @@ public:
         if (debug_view_ && show_dbg && dbg_from_fit && !dbg_from_fit->empty())
             cv::imshow("SlidingWindows", *dbg_from_fit);
 
-        // 오프셋 슬라이더 창 표시
-        if (debug_view_ && show_dbg) {
+        // 오프셋 슬라이더 창 표시 (debug_lane_view 설정 시)
+        // waitKey는 debug_lane_view와 무관하게 호출해야 한다. HighGUI 이벤트 펌프
+        // 역할을 하므로, 이걸 건너뛰면 남아있는 창(SlidingWindows/Mask-Yellow)이
+        // 갱신되지 않는다.
+        if (debug_view_ && show_dbg && debug_lane_view_) {
             cv::Mat vis = drawOffsetSlider(frame, offset, lane_mode_);
             cv::imshow("Lane View + Offset", vis);
+            cv::waitKey(1);
+        } else {
             cv::waitKey(1);
         }
     }
@@ -941,6 +992,55 @@ public:
         ref_transition_active_ = true;
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // 실측 현재 차선 판정 (인지 기반, 제어 목표(lane_mode_)와 무관)
+    //
+    // 감지된 중앙분리선의 BEV 하단(차량과 가장 가까운 지점) x 위치가
+    // center_reference_lane_one_(1차선 기준)과 center_reference_lane_two_
+    // (2차선 기준) 중 어느 쪽에 더 가까운지로 실제 차선을 역산한다.
+    // 차선 변경 중 일시적으로 선 위치가 두 기준 사이를 지나가므로,
+    // N 프레임 연속 동일 판정일 때만 확정하는 디바운스를 적용한다.
+    //
+    // 두 기준값의 정중앙 부근(데드존)은 노이즈만으로도 쉽게 뒤집힐 수 있는
+    // 애매한 영역이라, 이 구간에서는 -1(판정 보류)을 반환해 디바운스
+    // 카운터에 아예 반영되지 않게 한다 — 애매한 프레임이 우연히 5번
+    // 연속으로 한쪽에 쏠려도 잘못 확정되지 않도록 하기 위함이다.
+    //
+    // 반환값: 0=Lane1, 1=Lane2, -1=판정 보류(애매함)
+    // ─────────────────────────────────────────────────────────────────────
+    int classifyLaneFromRatio(float x_ratio) const {
+        const float d1 = std::fabs(x_ratio - center_reference_lane_one_);
+        const float d2 = std::fabs(x_ratio - center_reference_lane_two_);
+        // 두 거리의 차이가 데드존보다 작으면(=정중앙 부근) 판정 보류
+        if (std::fabs(d1 - d2) < LANE_CLASSIFY_DEADZONE_RATIO_) return -1;
+        return (d1 <= d2) ? 0 : 1;
+    }
+
+    // 디바운스 적용 후 detected_lane_ 갱신 및 /lane_position 발행
+    void updateAndPublishDetectedLane(const LineFit& fit_bev, bool fit_ok) {
+        if (fit_ok && bev_size_.width > 0 && bev_size_.height > 0) {
+            const float x_near = fit_bev.m * static_cast<float>(bev_size_.height - 1) + fit_bev.b;
+            const float ratio  = x_near / static_cast<float>(bev_size_.width);
+            const int   cls    = classifyLaneFromRatio(ratio);
+
+            if (cls == -1) {
+                // 애매한 프레임: 디바운스 상태를 건드리지 않고 이전 상태 유지
+            } else if (cls == pending_lane_) {
+                ++pending_streak_;
+            } else {
+                pending_lane_   = cls;
+                pending_streak_ = 1;
+            }
+            if (pending_streak_ >= LANE_DETECT_STREAK_NEED_) {
+                detected_lane_ = pending_lane_;
+            }
+        }
+
+        std_msgs::msg::Int16 msg;
+        msg.data = static_cast<int16_t>(detected_lane_);
+        lane_position_pub_->publish(msg);
+    }
+
     // 매 프레임 호출하여 ref_ratio_current_를 선형 보간 갱신
     void updateRefRatio() {
         if (!smooth_enabled_ || !ref_transition_active_) return;
@@ -964,6 +1064,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr              offset_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr  fit_pub_;
     rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr    lane_change_state_pub_;
+    rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr              lane_position_pub_;
 
     // ── 조향/속도 명령 시각화 (정성적 근사, 실측 휠베이스/조향각 보정값 아님) ──
     float last_steer_cmd_  = 0.f;  // /xycar_motor에서 수신한 마지막 조향 명령
@@ -994,11 +1095,20 @@ private:
     int  frame_count_  = 0;
     int  debug_stride_ = 1;   // 디버그 출력 주기 (1이면 매 프레임)
     bool debug_view_   = config_.debug_view;
+    // false면 SlidingWindows / Mask-Yellow만 남기고 나머지 차선 디버그 창은 숨긴다.
+    bool debug_lane_view_ = config_.debug_lane_view;
 
     // ── 모드/차선 상태 ──────────────────────────────────────────────────
     int  current_mode_ = 0;
     int  current_lane_ = 0;
     bool check_active_ = false;  // 모드 5 진입 후 검증 진행 중 여부
+
+    // ── 실측 현재 차선 판정 상태 (인지 기반) ────────────────────────────
+    int detected_lane_             = -1;  // 확정된 실측 차선 (-1=미확정)
+    int pending_lane_              = -1;  // 디바운스 중인 후보 차선
+    int pending_streak_            = 0;   // 후보 차선 연속 프레임 수
+    static constexpr int   LANE_DETECT_STREAK_NEED_ = 5;      // 확정에 필요한 연속 프레임 수
+    static constexpr float LANE_CLASSIFY_DEADZONE_RATIO_ = 0.05f;  // 애매한 경계로 판단할 |d1-d2| 임계값
 
     // ── 차선 변경 감지 임계값 ───────────────────────────────────────────
     float TOL_STRAIGHT_ = config_.lane_change_tol_straight;
@@ -1048,8 +1158,8 @@ private:
         Mat frame = cv_ptr->image;
         if (frame.empty()) return;
 
-        // ROI 사다리꼴 디버그 시각화
-        if (debug_view_) {
+        // ROI 사다리꼴 디버그 시각화 (debug_lane_view 설정 시)
+        if (debug_view_ && debug_lane_view_) {
             Mat frame_roi_vis = frame.clone();
             drawROIPolygon(frame_roi_vis);
             imshow("ROI Polygon", frame_roi_vis);
@@ -1063,7 +1173,7 @@ private:
         Mat bev_yellow;
         warpPerspective(yellow_edges, bev_yellow, H_, bev_size_,
                         INTER_LINEAR, BORDER_CONSTANT, Scalar(0));
-        if (debug_view_) imshow("BEV-Yellow", bev_yellow);
+        if (debug_view_ && debug_lane_view_) imshow("BEV-Yellow", bev_yellow);
 
         // (3) 노이즈 억제 준비: corridor 범위 및 디버그 캔버스 준비
         const int y_start_chk = (int)std::round(bev_size_.height * 0.0f);
@@ -1105,8 +1215,14 @@ private:
         );
         if (suppressed2) bev_yellow = bev_clean2;
 
-        if (debug_view_)
+        if (debug_view_ && debug_lane_view_)
             cv::imshow("BEV-Yellow (suppressed rows/columns in red)", bev_color);
+
+        // (3-c) 최장 연결 성분만 남기기: 세로로 길게 이어진 진짜 차선 후보만
+        // 남기고, 그림자/반사 등 짧게 끊긴 노이즈 덩어리는 제거한다.
+        cv::Mat bev_longest = keepLongestComponent(bev_yellow);
+        if (debug_view_ && debug_lane_view_)
+            cv::imshow("BEV-Yellow (longest component only)", bev_longest);
 
         // (4) 슬라이딩 윈도우 직선 피팅
         frame_count_++;
@@ -1114,7 +1230,7 @@ private:
 
         bool valid = false;
         cv::Mat dbg;
-        LineFit center_fit = fitLaneFromBEV(bev_yellow, valid, show_dbg ? &dbg : nullptr);
+        LineFit center_fit = fitLaneFromBEV(bev_longest, valid, show_dbg ? &dbg : nullptr);
 
         // (5) 오프셋 계산 및 히스토리 갱신
         float offset = 0.f;
@@ -1131,6 +1247,10 @@ private:
         // (6) 토픽 발행 + 디버그 출력
         publishAndDebug(frame, offset, center_fit, show_dbg,
                         dbg.empty() ? nullptr : &dbg);
+
+        // 실측 현재 차선 판정 및 /lane_position 발행 (제어 목표와 무관한 인지값)
+        const LineFit& effective_fit = valid ? center_fit : prev_center_fit_;
+        updateAndPublishDetectedLane(effective_fit, valid || has_prev_center_fit_);
     }
 
     // ─────────────────────────────────────────────────────────────────────

@@ -102,6 +102,8 @@ Config load_config(const std::string& path) {
     // ── ref 전환 및 디버그 설정 ───────────────────────────────────────
     config.lane_ref_transition_duration_sec = j["lane_ref_transition_duration_sec"];
     config.debug_view          = j["debug_view"];
+    // 키가 없는 구버전 JSON에서는 false(보조 창 숨김)로 동작한다.
+    config.debug_lane_view     = j.value("debug_lane_view", false);
     config.change_ref_smoothly = j["change_ref_smoothly"];
 
     return config;
