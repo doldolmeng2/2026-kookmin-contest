@@ -18,6 +18,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include "std_msgs/msg/int16.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/int32_multi_array.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
 #include <cv_bridge/cv_bridge.h>
@@ -103,6 +104,9 @@ public:
 
         // 오프셋 발행: /lane_offset (픽셀 단위 Int16)
         offset_pub_ = this->create_publisher<std_msgs::msg::Int16>("/lane_offset", qos_fast);
+
+        // 현재 프레임 차선 피팅 유효성 발행
+        validity_pub_ = this->create_publisher<std_msgs::msg::Bool>("/lane_valid", qos_fast);
 
         // 차선 회귀 파라미터 발행: /lane_fit ([m, b], 프레임 좌표계)
         fit_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/lane_fit", qos_fast);
@@ -944,6 +948,7 @@ private:
     rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr mode_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr motor_sub_;
     rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr              offset_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr               validity_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr  fit_pub_;
     rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr    lane_change_state_pub_;
 
@@ -1084,6 +1089,10 @@ private:
         bool valid = false;
         cv::Mat dbg;
         LineFit center_fit = fitLaneFromBEV(bev_yellow, valid, show_dbg ? &dbg : nullptr);
+
+        std_msgs::msg::Bool validity_msg;
+        validity_msg.data = valid;
+        validity_pub_->publish(validity_msg);
 
         // (5) 오프셋 계산 및 히스토리 갱신
         float offset = 0.f;

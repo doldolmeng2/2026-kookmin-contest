@@ -14,6 +14,7 @@ from std_msgs.msg import (
     Empty,
     Float32MultiArray,
     Int16,
+    Int32,
     Int32MultiArray,
 )
 
@@ -23,6 +24,7 @@ from main.control_selector import (
     ControlSource,
     DriveCommand,
 )
+from main.mission_types import RouteTrafficSignal
 from main.mode_info import mode_info_data
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
@@ -100,7 +102,7 @@ def sensor_event_qos(*, depth: int = 1) -> QoSProfile:
 
 
 def lane_validity_qos() -> QoSProfile:
-    """Return the required QoS for the currently missing validity publisher."""
+    """Return the required QoS for the explicit lane-validity publisher."""
 
     return sensor_event_qos(depth=10)
 
@@ -141,6 +143,7 @@ class MainNode(Node):
         self.now_angle = 0.0
         self.last_debug_time: Optional[float] = None
         self._warning_times: dict[str, float] = {}
+        self._traffic_encounter_active = False
 
         qos_fast = sensor_event_qos()
         qos_command = QoSProfile(
@@ -185,7 +188,7 @@ class MainNode(Node):
             qos_fast,
         )
         self.traffic_sub = self.create_subscription(
-            Bool,
+            Int32,
             "traffic_detection",
             self.traffic_callback,
             qos_fast,
@@ -238,15 +241,55 @@ class MainNode(Node):
                 received_at,
             )
 
-    def traffic_callback(self, msg: Bool) -> None:
+    def traffic_callback(self, msg: Int32) -> None:
         received_at = self._now_seconds()
-        self.runtime.record_traffic(msg.data, received_at)
+
+        try:
+            signal = RouteTrafficSignal(msg.data)
+        except (TypeError, ValueError):
+            self._warn_throttled(
+                "malformed_traffic",
+                f"invalid traffic_detection value ignored: {msg.data}",
+                received_at,
+            )
+            return
+
+        # Preserve the existing WAIT_GREEN contract.
+        is_green = signal in (
+            RouteTrafficSignal.STRAIGHT,
+            RouteTrafficSignal.LEFT,
+        )
+        self.runtime.record_traffic(is_green, received_at)
+
+        # One lap encounter edge per visible traffic-light episode.
+        # RED_AMBER does not start an encounter. UNKNOWN rearms the edge.
+        encounter_started = False
+        if signal is RouteTrafficSignal.UNKNOWN:
+            self._traffic_encounter_active = False
+        elif signal in (
+            RouteTrafficSignal.STRAIGHT,
+            RouteTrafficSignal.LEFT,
+        ):
+            encounter_started = not self._traffic_encounter_active
+            self._traffic_encounter_active = True
+
+        result = self.runtime.record_route_traffic(
+            signal,
+            received_at,
+            encounter_started=encounter_started,
+        )
+        if not result.accepted:
+            self._warn_throttled(
+                "malformed_route_traffic",
+                result.warning or "invalid route traffic input ignored",
+                received_at,
+            )
 
     def scan_callback(self, _msg: LaserScan) -> None:
         self.runtime.record_scan(self._now_seconds())
 
     def lane_validity_callback(self, msg: Bool) -> None:
-        """Record only an explicit future lane-validity publisher edge."""
+        """Record one explicit lane-validity publisher sample."""
 
         received_at = self._now_seconds()
         if not self.runtime.record_lane_validity(msg.data, received_at):

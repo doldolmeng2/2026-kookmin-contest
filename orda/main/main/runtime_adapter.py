@@ -59,7 +59,7 @@ class ConeMessageEvent:
 
 @dataclass(frozen=True)
 class LaneValidityEvent:
-    """One future explicit lane-validity callback receipt edge."""
+    """One explicit lane-validity callback receipt sample."""
 
     valid: bool
     received_at: float
@@ -274,7 +274,7 @@ class RaceRuntimeAdapter:
         return True
 
     def record_lane_validity(self, valid: bool, received_at: float) -> bool:
-        """Queue one explicit validity edge for the future lane publisher."""
+        """Queue one explicit lane-validity sample."""
 
         if not isinstance(valid, bool) or not self._valid_timestamp(received_at):
             return False
@@ -592,7 +592,7 @@ class RaceRuntimeAdapter:
             traffic_message_received_at=(
                 traffic_event.received_at if traffic_event is not None else None
             ),
-            # There is no dedicated lane-validity input in the current graph.
+            # Consume only the explicit current-frame lane-validity sample.
             lane_valid=(
                 lane_validity_event.valid
                 if lane_validity_event is not None

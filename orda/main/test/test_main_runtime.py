@@ -14,7 +14,7 @@ from rclpy.qos import (
     qos_profile_sensor_data,
 )
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Empty, Float32MultiArray, Int32MultiArray
+from std_msgs.msg import Bool, Empty, Float32MultiArray, Int32, Int32MultiArray
 
 from main.main import (
     LANE_VALIDITY_REQUIRED_RATE_HZ,
@@ -31,7 +31,7 @@ from main.main import (
 from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import RaceRuntimeAdapter
-from main.mission_types import ObjectLane
+from main.mission_types import ObjectLane, RouteTrafficSignal
 
 
 class CallbackHarness:
@@ -42,6 +42,7 @@ class CallbackHarness:
             context=RaceContext(state_entered_at=0.5),
         )
         self.warnings = []
+        self._traffic_encounter_active = False
 
     def _now_seconds(self):
         return next(self._times)
@@ -276,6 +277,11 @@ def test_generated_ros_entities_have_exact_topic_type_and_qos():
         assert object_sub.msg_type is Float32MultiArray
         assert object_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
 
+        traffic_sub = node.traffic_sub
+        assert traffic_sub.topic_name == "/traffic_detection"
+        assert traffic_sub.msg_type is Int32
+        assert traffic_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
+
         mode_pub = node.mode_pub
         assert mode_pub.topic_name == "/mode_info"
         assert mode_pub.msg_type is Int32MultiArray
@@ -285,7 +291,7 @@ def test_generated_ros_entities_have_exact_topic_type_and_qos():
         rclpy.shutdown(context=context)
 
 
-def test_missing_lane_validity_publisher_contract_is_explicit():
+def test_lane_validity_publisher_contract_is_explicit():
     qos = lane_validity_qos()
 
     assert LANE_VALIDITY_TOPIC == "/lane_valid"
@@ -304,6 +310,63 @@ def test_lane_change_feedback_uses_existing_topic_without_new_mission_topics():
     assert "fixed_zone" not in source
     assert "overtake_complete" not in source
     assert "shortcut_complete" not in source
+
+
+def test_main_traffic_int32_maps_straight_to_green_and_route_signal():
+    harness = CallbackHarness([6.0], mode=Mode.WAIT_GREEN)
+
+    MainNode.traffic_callback(harness, SimpleNamespace(data=2))
+    cycle = harness.runtime.step(6.0)
+
+    assert cycle.observation.green_detected is True
+    assert cycle.observation.route_traffic_signal is RouteTrafficSignal.STRAIGHT
+    assert cycle.observation.traffic_encounter_started is True
+    assert harness.warnings == []
+
+
+def test_main_traffic_int32_red_sets_route_stop_override():
+    harness = CallbackHarness([6.0], mode=Mode.LANE_DRIVE)
+
+    MainNode.traffic_callback(harness, SimpleNamespace(data=1))
+    cycle = harness.runtime.step(6.0)
+
+    assert cycle.observation.green_detected is False
+    assert cycle.observation.route_traffic_signal is RouteTrafficSignal.RED_AMBER
+    assert harness.runtime.traffic_stop_override is True
+    assert harness.warnings == []
+
+
+def test_main_traffic_encounter_is_one_edge_until_unknown_rearms():
+    harness = CallbackHarness(
+        [7.0, 7.1, 7.2, 7.3],
+        mode=Mode.LANE_DRIVE,
+    )
+
+    MainNode.traffic_callback(harness, SimpleNamespace(data=2))
+    first = harness.runtime.step(7.0)
+
+    MainNode.traffic_callback(harness, SimpleNamespace(data=2))
+    repeated = harness.runtime.step(7.1)
+
+    MainNode.traffic_callback(harness, SimpleNamespace(data=0))
+    harness.runtime.step(7.2)
+
+    MainNode.traffic_callback(harness, SimpleNamespace(data=2))
+    second = harness.runtime.step(7.3)
+
+    assert first.observation.traffic_encounter_started is True
+    assert repeated.observation.traffic_encounter_started is False
+    assert second.observation.traffic_encounter_started is True
+    assert harness.runtime.context.completed_laps == 2
+
+
+def test_main_traffic_invalid_value_is_rejected():
+    harness = CallbackHarness([8.0], mode=Mode.LANE_DRIVE)
+
+    MainNode.traffic_callback(harness, SimpleNamespace(data=9))
+
+    assert "traffic_detection" not in harness.runtime.perception_received_at
+    assert harness.warnings[0][0] == "malformed_traffic"
 
 
 @pytest.mark.parametrize(
