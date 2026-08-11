@@ -29,6 +29,8 @@ READ_TOPICS = (
     "/xycar_motor",
     "/scan",
 )
+OPTIONAL_READ_TOPICS = ("/lane_valid",)
+REPLAY_TOPICS = frozenset((*READ_TOPICS, *OPTIONAL_READ_TOPICS))
 
 EXPECTED_TYPES = {
     "/traffic_detection": "std_msgs/msg/Bool",
@@ -37,10 +39,11 @@ EXPECTED_TYPES = {
     "/mode_info": "std_msgs/msg/Int32MultiArray",
     "/xycar_motor": "std_msgs/msg/Float32MultiArray",
     "/scan": "sensor_msgs/msg/LaserScan",
+    "/lane_valid": "std_msgs/msg/Bool",
 }
 
 _FSM_EVENT_TOPICS = frozenset(
-    {"/traffic_detection", "/rubbercone_info", "/scan"}
+    {"/traffic_detection", "/rubbercone_info", "/scan", "/lane_valid"}
 )
 _MOTION_MODES = frozenset(
     {
@@ -57,6 +60,14 @@ _ALLOWED_TRANSITIONS = frozenset(
         (Mode.INIT, Mode.WAIT_GREEN),
         (Mode.WAIT_GREEN, Mode.LANE_DRIVE),
         (Mode.LANE_DRIVE, Mode.CONE_DRIVE),
+        (Mode.CONE_DRIVE, Mode.REJOIN),
+        (Mode.REJOIN, Mode.LANE_DRIVE),
+        (Mode.LANE_DRIVE, Mode.FIXED_AVOID),
+        (Mode.FIXED_AVOID, Mode.OVERTAKE),
+        (Mode.OVERTAKE, Mode.LANE_DRIVE),
+        (Mode.LANE_DRIVE, Mode.SHORTCUT),
+        (Mode.SHORTCUT, Mode.LANE_DRIVE),
+        (Mode.LANE_DRIVE, Mode.FINISH),
         *((mode, Mode.STOP) for mode in Mode if mode not in (Mode.FINISH, Mode.STOP)),
     }
 )
@@ -144,7 +155,7 @@ class SequentialBagReader:
             records_read += 1
             type_name = self.topic_types.get(topic, "")
 
-            if topic not in READ_TOPICS:
+            if topic not in REPLAY_TOPICS:
                 yield BagEvent(topic, type_name, timestamp_ns)
                 continue
 
@@ -365,7 +376,7 @@ class OfflineBagReplay:
                 )
                 continue
 
-            if event.topic not in READ_TOPICS:
+            if event.topic not in REPLAY_TOPICS:
                 continue
 
             now = _seconds(event.timestamp_ns)
@@ -376,6 +387,7 @@ class OfflineBagReplay:
 
             parsed_traffic: Optional[bool] = None
             parsed_cone: Optional[Dict[str, Any]] = None
+            parsed_lane_valid: Optional[bool] = None
             mode_before_trace = fsm.state
 
             if event.topic == "/traffic_detection":
@@ -477,6 +489,14 @@ class OfflineBagReplay:
                 sensor_receipts["scan"] = now
                 scan_timestamps_ns.append(event.timestamp_ns)
 
+            elif event.topic == "/lane_valid":
+                perception_receipts["lane_validity"] = now
+                parsed_lane_valid, warning = parse_traffic_message(event.message)
+                if warning is not None:
+                    warnings.append(
+                        f"{warning} for lane_valid at {event.timestamp_ns} ns"
+                    )
+
             if event.topic in ("/lane_offset", "/mode_info", "/xycar_motor"):
                 if fsm.state is not mode_before_trace:
                     trace_changed_mode_violation = True
@@ -493,7 +513,19 @@ class OfflineBagReplay:
                     event.topic == "/traffic_detection"
                     and parsed_traffic is True
                 ),
-                lane_valid=False,
+                traffic_message_received_at=(
+                    now if event.topic == "/traffic_detection" else None
+                ),
+                lane_valid=(
+                    event.topic == "/lane_valid"
+                    and parsed_lane_valid is True
+                ),
+                lane_valid_received_at=(
+                    now
+                    if event.topic == "/lane_valid"
+                    and parsed_lane_valid is not None
+                    else None
+                ),
                 cone_detected=(
                     event.topic == "/rubbercone_info"
                     and parsed_cone is not None
@@ -868,6 +900,10 @@ class OfflineBagReplay:
             return False
         if mode is Mode.WAIT_GREEN:
             return topic == "/traffic_detection"
+        if mode is Mode.REJOIN:
+            return topic == "/lane_valid"
+        if topic == "/lane_valid":
+            return False
         return True
 
     @staticmethod
@@ -897,6 +933,15 @@ class OfflineBagReplay:
                 warnings.append(
                     f"unexpected type for {topic}: expected {expected}, got {actual}"
                 )
+        for topic in OPTIONAL_READ_TOPICS:
+            if topic not in topic_types:
+                continue
+            expected = EXPECTED_TYPES[topic]
+            actual = topic_types[topic]
+            if actual != expected:
+                warnings.append(
+                    f"unexpected type for {topic}: expected {expected}, got {actual}"
+                )
         return warnings
 
     @staticmethod
@@ -913,6 +958,14 @@ class OfflineBagReplay:
             scope.append(
                 "provisional LANE_DRIVE to CONE_DRIVE guard and transition timing"
             )
+        if "/rubbercone_info" in topic_types:
+            scope.append(
+                "CONE_DRIVE to REJOIN on a fresh recorded rubbercone 0-to-1 session"
+            )
+        if "/lane_valid" in topic_types:
+            scope.append(
+                "REJOIN to LANE_DRIVE on fresh recorded lane-validity edges"
+            )
         if "/scan" in topic_types:
             scope.append("recorded scan receipt gap statistics")
         return scope
@@ -920,13 +973,15 @@ class OfflineBagReplay:
     @staticmethod
     def _unverifiable_scope(topic_types: Mapping[str, str]) -> List[str]:
         scope = [
-            "CONE_DRIVE to REJOIN and REJOIN to LANE_DRIVE",
+            "fixed-obstacle entry from LANE_DRIVE",
             "fixed-vehicle avoidance and moving-vehicle overtake",
             "lap/Gate counting and FINISH entry",
             "left-turn recognition, shortcut readiness, and SHORTCUT entry",
             "lane validity or lane detector performance from lane_offset",
             "motor adapter behavior or live vehicle motion",
         ]
+        if "/lane_valid" not in topic_types:
+            scope.append("REJOIN to LANE_DRIVE lane-validity debounce")
         if "/traffic_detection" not in topic_types:
             scope.append("recorded start-green debounce")
         if "/rubbercone_info" not in topic_types:

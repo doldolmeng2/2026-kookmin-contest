@@ -73,8 +73,9 @@ git clone https://github.com/doldolmeng2/2026-kookmin-contest.git .
 
 | 항목 | 제한 | 처리 |
 |---|---|---|
-| 총 주행시간 | 3바퀴 4분 초과 | 실격 |
-| 라바콘 구간 | 1분 내 미통과 | 실격 |
+| 주행시간 시작 | 파란불로 바뀐 순간 | 2026-07-29 「제9회 경주 진행 방법」 p.17 |
+| 총 주행시간 | 3바퀴 4분 초과 | 실격, 같은 자료 p.37 |
+| 라바콘 구간 | 1분 내 미통과 | 실격, 같은 자료 p.25 |
 | 주행 정지 | 정지 후 1분 내 미재개 | 실격 |
 | 라바콘 충돌 | 개당 | 벌초 3초 |
 | 차량 터치 | 1회당 (한 바퀴 15회 초과 시 실격) | 벌초 5초 |
@@ -190,8 +191,8 @@ main/main/
          /traffic_detection, /imu, /joy, /xycar_ultrasonic
     pub: /xycar_motor                   (std_msgs/Float32MultiArray)      [유지]
          [angle, speed]
-         /mode_info                     (std_msgs/Int32MultiArray)        [변경]
-         [mode, lap, shortcut_used, lane_target]
+         /mode_info                     (std_msgs/Int32MultiArray)        [현재 호환]
+         [legacy_mode_code, lane]
 ```
 
 ### 인터페이스 변경 사유
@@ -200,7 +201,7 @@ main/main/
 |---|---|---|
 | `/traffic_detection` | `Bool` → `Int32` (4상태) | 4구 신호등의 좌회전 화살표를 구분해야 지름길 판단이 가능 |
 | `/object_info` | `is_moving` 필드 추가 | 고정장애물 회피와 방해차량 추월은 **규칙이 다른 별개 미션** (추월 중에는 차선 이탈이 허용됨) |
-| `/mode_info` | `[mode, lane]` → `[mode, lap, shortcut_used, lane_target]` | 1·2차선 구분이 폐지되어 `lane` 은 무의미해졌고, 3바퀴·지름길 1회 판단에 랩 수와 사용 여부가 필요 |
+| `/mode_info` | 현재 `[legacy_mode_code, lane]` 유지 | 실제 소비자인 `lane_detection.cpp`가 아직 3=차선주행, 5=차선변경 계약을 사용한다. 4필드 신규 계약은 소비자 변경 전까지 발행하지 않는다. |
 
 `car_lane` 과 `lane_target` 은 **같은 정수 규약(0=중앙, 1=왼쪽, 2=오른쪽)** 을 쓴다.
 방해차량이 있는 쪽의 반대편을 추월 방향으로 그대로 뒤집어 쓸 수 있게 하기 위함이다.
@@ -239,7 +240,8 @@ main/main/
 |---|---|---|---|
 | 신호등 → 라바콘 진입 | `LANE_DRIVE` | 0 (중앙) | 실선 이탈 위험 최소화 |
 | 라바콘 | `CONE_DRIVE` | — | 라이다 경로를 따름 |
-| 라바콘 종료 → 고정장애물 통과 | `FIXED_AVOID` | **2 (오른쪽 확정)** | 곡선 코너 안쪽에 방해 장애물이 설치되므로(규정 p.29) 바깥 차선이 유리 |
+| 라바콘 종료 → 차선 재합류 | `REJOIN` → `LANE_DRIVE` | 0 (중앙) | fresh 차선 유효성 확인 뒤 정상 차선 주행 복귀 |
+| 고정장애물 구간 | `FIXED_AVOID` | 미확정 | 별도의 고정장애물 진입 event 계약이 아직 없음 |
 | 고정장애물 통과 → 추월 완료 | `OVERTAKE` | **직전 차선 유지** | 불필요한 차선 변경을 줄임. 방해차량 차선은 어차피 랜덤 |
 | 추월 완료 → 결승선 (S커브 포함) | `LANE_DRIVE` | 0 (중앙) | S커브 코너링에 유리 |
 
@@ -259,29 +261,35 @@ main/main/
 
 ## 주행 상태 머신 (main_node)
 
-`race_fsm.Mode` 로 정의된다. `/mode_info[0]` 에 아래 정수값으로 발행한다.
+내부 상태는 문자열 값의 `race_fsm.Mode` 로 정의하며 외부 숫자와 직접 동일시하지
+않는다. 현재 `/mode_info`의 유일한 실제 subscriber인 `lane_detection.cpp`가 legacy
+숫자를 사용하므로 `main.mode_info`의 명시적 adapter를 거쳐 아래처럼 발행한다.
+미확정 상태는 새 숫자를 만들지 않고 외부 STOP 코드 0을 발행한다.
 
-| 모드 | 값 | 설명 | 전이 조건 |
-|---|---|---|---|
-| `INIT` | 0 | 입력 대기 | 필수 입력 수신 |
-| `WAIT_GREEN` | 1 | 신호등 앞 정지, 출발 대기 | `/traffic_detection` = 2 (디바운스) |
-| `LANE_DRIVE` | 2 | 차선 주행 (기본 중앙 주행) | 아래 분기 참조 |
-| `CONE_DRIVE` | 3 | 라바콘 구간 주행 | `end_flag` = 1 |
-| `REJOIN` | 4 | 라바콘 종료 후 차선 복귀 | 차선 인식 유효 |
-| `FIXED_AVOID` | 5 | **고정장애물 구간** (2차선 확정 주행) | 고정장애물 통과 |
-| `OVERTAKE` | 6 | **방해차량 구간** (직전 차선 유지) | 추월 완료 |
-| `SHORTCUT` | 7 | 지름길 좌회전 주행 | 목표 yaw 도달 |
-| `FINISH` | 8 | 3바퀴 완료 (종료 상태) | — |
-| `STOP` | 9 | 안전 정지 (종료 상태) | — |
+| 내부 모드 | 현재 외부 값 | 설명 | 전이 조건 |
+|---|---:|---|---|
+| `INIT` | 0 (STOP) | 입력 대기 | 필수 입력 수신 |
+| `WAIT_GREEN` | 0 (STOP) | 신호등 앞 정지, 출발 대기 | `/traffic_detection` Bool 디바운스 |
+| `LANE_DRIVE` | 3 | 차선 주행 (기본 중앙 주행) | 아래 분기 참조 |
+| `CONE_DRIVE` | 1 | 라바콘 구간 주행 | fresh `end_flag` 0→1 |
+| `REJOIN` | 2 | 라바콘 종료 후 차선 복귀 대기 | 명시적 차선 유효성 입력 |
+| `FIXED_AVOID` | 기본 0, action 중 5→3 | 고정장애물 구간 | typed zone-exit edge |
+| `OVERTAKE` | 기본 0, action 중 5→3 | 방해차량 구간 | typed overtake-complete edge |
+| `SHORTCUT` | 0 (STOP) | 지름길, production controller 없음 | typed shortcut-complete edge |
+| `FINISH` | 0 (STOP) | 3바퀴 완료 | — |
+| `STOP` | 0 (STOP) | 안전 정지 | — |
 
 ```
 INIT ──(입력 준비)──▶ WAIT_GREEN ──(신호 2 = 직진)──▶ LANE_DRIVE   [시간 측정 시작]
 
-[정규 경로 — 구간이 순서대로 이어진다]
+[확정된 라바콘 흐름]
 LANE_DRIVE ─(라바콘 진입 확정)─▶ CONE_DRIVE ─(end_flag)─▶ REJOIN
-REJOIN      ─(차선 인식 유효)──▶ FIXED_AVOID              [lane_target = 2]
-FIXED_AVOID ─(고정장애물 통과)─▶ OVERTAKE                 [lane_target = 직전 차선 유지]
-OVERTAKE    ─(추월 완료)───────▶ LANE_DRIVE               [lane_target = 0, S커브 중앙 주행]
+REJOIN      ─(fresh 차선 유효성)▶ LANE_DRIVE               [lane_target = 0]
+
+[외부 event 계약 미확정]
+LANE_DRIVE ─(별도 고정장애물 진입 event)─▶ FIXED_AVOID
+FIXED_AVOID ─(고정장애물 통과)───────────▶ OVERTAKE
+OVERTAKE    ─(추월 완료)────────────────▶ LANE_DRIVE
 
 [지름길 / 종료]
 LANE_DRIVE ─(신호 3 & lap∈{2,3} & !shortcut_used)─▶ SHORTCUT ─▶ LANE_DRIVE
@@ -291,8 +299,9 @@ LANE_DRIVE ─(3바퀴 완료)─▶ FINISH
 ```
 
 - `FIXED_AVOID` 와 `OVERTAKE` 는 **순간적인 회피 동작이 아니라 구간(zone)** 이다.
-  장애물을 검출해서 진입하는 게 아니라, **라바콘 종료 후 순서대로 통과한다.**
-  고정장애물이 항상 방해차량보다 먼저 배치되므로 이 순서는 보장된다.
+  다만 `REJOIN` 성공은 `LANE_DRIVE` 복귀만 의미하며 `FIXED_AVOID` 진입 증거가 아니다.
+  고정장애물 진입 publisher/topic/type 계약이 확정될 때까지 `FIXED_AVOID` 는 runtime에서
+  도달 불가능한 외부 blocker로 유지한다.
 - 구간 안에서 실제 회피/추월 동작을 할지는 `/object_info` 로 판단하며,
   `is_moving` 은 **회피 규칙을 고르는 데 쓴다** (추월 중에는 차선 이탈이 허용되지만
   고정장애물 회피는 그렇지 않다). 구간 진입 조건이 아니다.
@@ -341,6 +350,10 @@ ros2 launch main module_drive.py
 # bag 파일 테스트
 ros2 launch main module_drive_bag_test.py
 
+# 국민대 라바콘 FSM bag 통합 테스트 (scan-only, motor 출력 격리)
+./main/tools/run_rubbercone_bag_test.sh \
+  ~/bags/kmu_real_lidar/rubbercone_20260725_221245
+
 # 수동 주행 (Xbox 컨트롤러)
 ros2 launch manual_drive manual_drive.launch.py
 
@@ -372,10 +385,13 @@ python3 -m main.tools.replay_fsm_bag <bag_path>
 
 ### 미해결 항목
 
-- `race_fsm.py` 의 `REJOIN` · `FIXED_AVOID` · `OVERTAKE` · `SHORTCUT` · `FINISH` 전이 미구현
+- 10상태 순수 FSM 전이는 구현됨. fixed-zone, route traffic, overtake-complete,
+  shortcut-complete는 typed internal contract와 test injection만 있고 production publisher는 없음
 - `shortcut_turn.py` 미작성 (지름길 좌회전 궤적)
-- 랩 카운터 미구현 — `race_context.finish_gate_passes` 가 아직 증가하지 않음
-- 시간 제한 감시 미구현 (라바콘 1분 / 총 4분)
+- `completed_laps`/`shortcut_lap` 랩 정책은 구현됨. 실제 traffic encounter publisher는 없음
+- 시간 제한 감시는 현재 `SafetyMonitor` 기본값(라바콘 60초 / 전체 240초)으로 동작한다.
+  이는 2026-07-29 「제9회 경주 진행 방법」 p.25와 p.37의 공식 제한이다. 전체 주행시간은
+  p.17에 따라 파란불의 첫 fresh 관측 시각부터 계산하며, debounce 완료 시각으로 늦추지 않는다.
 - `STOP` 이 종료 상태로만 정의되어 있어, 복귀 가능한 감속 정책 필요
 - YOLO 모델이 고정장애물(고장난 차량)까지 검출하는지 미확인 —
   미검출 시 LiDAR 클러스터 보완 또는 재학습 필요

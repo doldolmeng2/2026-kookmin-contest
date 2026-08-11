@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping, Optional
 
+from .mission_types import ObjectLane, RouteTrafficSignal
+
 
 @dataclass(frozen=True)
 class MissionObservation:
@@ -22,20 +24,35 @@ class MissionObservation:
     perception_received_at: Mapping[str, float] = field(default_factory=dict)
 
     green_detected: bool = False
+    traffic_message_received_at: Optional[float] = None
     lane_valid: bool = False
+    lane_valid_received_at: Optional[float] = None
     cone_detected: bool = False
     cone_finished: bool = False
     cone_confidence: Optional[int] = None
     cone_end_flag: Optional[bool] = None
     cone_message_received_at: Optional[float] = None
     scan_received_at: Optional[float] = None
-    fixed_vehicle_detected: bool = False
-    fixed_avoid_complete: bool = False
-    interfering_vehicle_detected: bool = False
+    object_exists: bool = False
+    object_distance: Optional[float] = None
+    object_lane: ObjectLane = ObjectLane.UNKNOWN
+    object_received_at: Optional[float] = None
+    lane_change_changing: bool = False
+    lane_change_success: bool = False
+    lane_change_success_edge: bool = False
+    lane_change_received_at: Optional[float] = None
+    fixed_zone_entered: bool = False
+    fixed_zone_entry_received_at: Optional[float] = None
+    fixed_zone_exited: bool = False
+    fixed_zone_exit_received_at: Optional[float] = None
+    route_traffic_signal: RouteTrafficSignal = RouteTrafficSignal.UNKNOWN
+    route_traffic_received_at: Optional[float] = None
+    traffic_encounter_started: bool = False
+    traffic_encounter_received_at: Optional[float] = None
     overtake_complete: bool = False
-    left_turn_signal: bool = False
     shortcut_complete: bool = False
-    finish_gate_crossed: bool = False
+    overtake_complete_received_at: Optional[float] = None
+    shortcut_complete_received_at: Optional[float] = None
 
     def __post_init__(self) -> None:
         # Copy caller-owned dictionaries so this object remains a true snapshot.
