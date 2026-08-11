@@ -8,16 +8,21 @@ from typing import Optional
 class ObjectLane(Enum):
     """Lane label emitted by the existing ten-field ``/object_info`` topic."""
 
+    # object_detection 의 lane_label 과 같은 값이다 (0=중앙선 근처, 1=왼쪽, 2=오른쪽).
     UNKNOWN = 0
+    CENTER = 0   # README 표기용 별칭. 값은 UNKNOWN 과 같다.
     LEFT = 1
     RIGHT = 2
 
 
 class LaneTarget(Enum):
-    """Two-lane target contract consumed by the existing lane detector."""
+    """Lane target contract consumed by the existing lane detector."""
 
-    LANE_ONE = 0
-    LANE_TWO = 1
+    # car_lane 과 같은 정수 규약을 쓴다 (README): 0=중앙, 1=왼쪽, 2=오른쪽.
+    # 기본 주행은 중앙이고, 장애물을 피할 때만 좌/우 차선으로 확정해서 들어간다.
+    CENTER = 0
+    LANE_ONE = 1
+    LANE_TWO = 2
 
 
 class RouteTrafficSignal(IntEnum):

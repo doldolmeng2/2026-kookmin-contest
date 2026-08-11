@@ -508,20 +508,32 @@ def test_only_real_mode_changes_create_transition_logs():
     ] is True
 
 
-def test_terminal_mode_replay_cannot_leave_finish_or_stop():
-    events = [
+def _terminal_probe_events():
+    return [
         event("/traffic_detection", 1.0, True),
         event("/rubbercone_info", 2.0, [0, 1, 0]),
         event("/scan", 3.0),
     ]
 
-    for terminal in (Mode.FINISH, Mode.STOP):
-        report = replay(events, start_mode=terminal)
-        assert report["fsm"]["final_mode"] == terminal.value
-        assert report["fsm"]["transition_count"] == 0
-        assert report["validation"]["invariants"][
-            "terminal_modes_are_sticky"
-        ] is True
+
+def test_finish_is_sticky():
+    report = replay(_terminal_probe_events(), start_mode=Mode.FINISH)
+
+    assert report["fsm"]["final_mode"] == Mode.FINISH.value
+    assert report["fsm"]["transition_count"] == 0
+    assert report["validation"]["invariants"]["terminal_modes_are_sticky"] is True
+
+
+def test_stop_recovers_once_inputs_are_healthy_again():
+    """STOP은 종료 상태가 아니라 복귀 가능한 안전 정지다.
+
+    센서가 잠깐 끊겼다고 주행이 영영 끝나면 안 된다. 규정상 정지 후 1분 내
+    미재개는 실격이다.
+    """
+    report = replay(_terminal_probe_events(), start_mode=Mode.STOP)
+
+    assert report["fsm"]["final_mode"] != Mode.STOP.value
+    assert report["fsm"]["transition_count"] >= 1
 
 
 def test_timestamp_regression_is_rejected_and_reported():

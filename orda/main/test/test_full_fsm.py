@@ -223,7 +223,11 @@ def test_object_detection_alone_never_enters_fixed_avoid():
     assert fsm.state is Mode.LANE_DRIVE
 
 
-def test_explicit_zone_and_completion_edges_form_fixed_overtake_chain():
+def test_fixed_zone_edges_return_straight_to_lane_drive():
+    """고정장애물 구간은 OVERTAKE 를 거치지 않고 LANE_DRIVE 로 돌아온다.
+
+    OVERTAKE 는 움직이는 방해차량 상황용이라 이 경로에서는 쓰지 않는다.
+    """
     fsm = RaceFSM(initial_state=Mode.LANE_DRIVE)
     context = RaceContext(state_entered_at=1.0)
 
@@ -238,17 +242,11 @@ def test_explicit_zone_and_completion_edges_form_fixed_overtake_chain():
         context,
         SAFE,
     )
-    overtake = fsm.step(edge_observation(1.3, "fixed_exit"), context, SAFE)
-    lane = fsm.step(
-        edge_observation(1.4, "overtake_complete"),
-        context,
-        SAFE,
-    )
+    lane = fsm.step(edge_observation(1.3, "fixed_exit"), context, SAFE)
 
     assert fixed.target is Mode.FIXED_AVOID
     assert lane_success.changed is False
     assert lane_success.target is Mode.FIXED_AVOID
-    assert overtake.target is Mode.OVERTAKE
     assert lane.target is Mode.LANE_DRIVE
 
 

@@ -9,11 +9,10 @@
 //   /lane_fit      (std_msgs/Float32MultiArray [m,b]) - 차선 회귀 결과
 //
 // 발행:
-//   /object_info (std_msgs/Float32MultiArray, 12개 필드)
+//   /object_info (std_msgs/Float32MultiArray, 11개 필드)
 //   [exists, min_dist, angle, span, cluster_size,
-//    box_size, box_cx, box_cy, dx(cx-x_line), lane_label,
-//    side_left, side_right]
-//   side_left/right: 좌/우 측면 최소 거리(m). 추월 완료 판정용. 없으면 inf.
+//    box_size, box_cx, box_cy, dx(cx-x_line), lane_label, is_moving]
+//   is_moving: 0=고정장애물, 1=방해차량
 //
 // 디버그 창 (enable_gui=true 시):
 //   "OBJECT DEBUG" : exists / distance / cluster_size
@@ -67,14 +66,6 @@ public:
         // YOLO 모델(.onnx) 경로. 빈 문자열이면 share 디렉터리를 탐색한다.
         model_path_         = this->declare_parameter<std::string>("model_path",     "");
 
-        // ── 측면 감지 시야각 (추월 완료 판정용) ──────────────────────────
-        // LiDAR는 차 맨 앞에 달려 있고 차체가 뒤쪽을 가린다. 실측(bag의 각도별
-        // 프로파일)상 |각도| > 약 105도 구간은 자기 차체가 0.10~0.14 m로 잡히므로,
-        // 측면 섹터는 그 안쪽(60~100도)만 본다.
-        side_fov_min_deg_   = this->declare_parameter<double>("side_fov_min_deg",    60.0);
-        side_fov_max_deg_   = this->declare_parameter<double>("side_fov_max_deg",   100.0);
-        // 측면에서 이 거리보다 먼 것은 벽/빈 차선으로 보고 무시한다.
-        side_max_range_m_   = this->declare_parameter<double>("side_max_range_m",     1.5);
 
         // QoS 프로파일
         // - qos_fast: 수치 토픽용 Best Effort + Volatile
@@ -217,11 +208,6 @@ private:
             return;
         }
 
-        // 측면 최소 거리는 전방 클러스터링과 독립적으로 매 스캔 갱신한다.
-        // 아래 전방 처리에는 유효 포인트가 없으면 조기 반환하는 경로가 여럿
-        // 있는데, 측면 값까지 같이 끊기면 추월 완료 판정이 흔들린다.
-        updateSideRanges(*msg);
-
         const double fov_rad = front_fov_deg_ * M_PI / 180.0;
         const double ang_lo  = -fov_rad;
         const double ang_hi  = +fov_rad;
@@ -324,43 +310,6 @@ private:
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // 좌/우 측면 최소 거리 계산
-    //
-    // 추월 중 옆으로 지나가는 방해차량을 잡기 위한 값이다. 초음파가 담당하던
-    // 역할인데, 초음파는 차 중간에 달려 있어 "이미 절반쯤 지나간" 시점에
-    // 반응하는 반면 LiDAR는 차 맨 앞이라 훨씬 이르게 반응한다. 그 차이는
-    // main_node 쪽에서 시간 지연으로 보정한다.
-    // ─────────────────────────────────────────────────────────────────────
-    void updateSideRanges(const sensor_msgs::msg::LaserScan& msg) {
-        const int N = static_cast<int>(msg.ranges.size());
-        float left  = std::numeric_limits<float>::infinity();
-        float right = std::numeric_limits<float>::infinity();
-
-        for (int i = 0; i < N; ++i) {
-            const float r = msg.ranges[i];
-            if (!std::isfinite(r)) continue;
-            if (r < msg.range_min || r > msg.range_max) continue;
-            if (r > side_max_range_m_) continue;
-
-            // 각도를 -180~180도로 정규화 (0도 = 전방, + = 좌, - = 우)
-            double deg = (msg.angle_min + i * msg.angle_increment) * 180.0 / M_PI;
-            deg = std::fmod(deg + 180.0, 360.0);
-            if (deg < 0.0) deg += 360.0;
-            deg -= 180.0;
-
-            const double mag = std::fabs(deg);
-            if (mag < side_fov_min_deg_ || mag > side_fov_max_deg_) continue;
-
-            if (deg > 0.0) { if (r < left)  left  = r; }
-            else           { if (r < right) right = r; }
-        }
-
-        std::lock_guard<std::mutex> lk(mtx_state_);
-        st_side_left_  = left;
-        st_side_right_ = right;
-    }
-
     // LiDAR 상태 초기화
     void resetLidarState() {
         std::lock_guard<std::mutex> lk(mtx_state_);
@@ -397,7 +346,6 @@ private:
         float cx, cy, dx;
         int   lane_label;
 
-        float side_l, side_r;
         {
             std::lock_guard<std::mutex> lk(mtx_state_);
             lidar_ok = lidar_valid_;
@@ -405,8 +353,6 @@ private:
             ang      = st_min_r_ang_;
             spn      = st_span_;
             cnt      = st_count_;
-            side_l   = st_side_left_;
-            side_r   = st_side_right_;
         }
         {
             std::lock_guard<std::mutex> lk(mtx_box_);
@@ -421,13 +367,16 @@ private:
 
         // /object_info 필드:
         // [exists, min_dist, angle, span, cluster_size,
-        //  box_size, box_cx, box_cy, dx, lane_label,
-        //  side_left, side_right]
-        // side_left/right: 좌/우 측면 최소 거리(m). 없으면 inf.
+        //  box_size, box_cx, box_cy, dx, lane_label, is_moving]
+        //
+        // is_moving 은 지금 학습된 YOLO 모델이 고정장애물만 구분하므로 항상
+        // 0(고정장애물)이다. 이동체를 구분하는 모델이 들어오면 여기서 그
+        // 분류 결과를 넣는다.
+        constexpr float kIsMovingFixedObstacle = 0.0f;
         std_msgs::msg::Float32MultiArray out;
         out.data = { exists, minr, ang, spn, static_cast<float>(cnt),
                      box_area, cx, cy, dx, static_cast<float>(lane_label),
-                     side_l, side_r };
+                     kIsMovingFixedObstacle };
         pub_obj_->publish(out);
 
         // 디버그 패널 갱신
@@ -687,7 +636,6 @@ private:
     bool   enable_gui_;
     double lane_split_margin_px_;
     bool   lane_fit_is_frame_;
-    double side_fov_min_deg_, side_fov_max_deg_, side_max_range_m_;
     std::string model_path_;
 
     // ── ROS 통신 객체 ───────────────────────────────────────────────────
@@ -737,8 +685,6 @@ private:
     float st_min_r_ang_ = 0.0f;
     float st_span_      = 0.0f;
     int   st_count_     = 0;
-    float st_side_left_  = std::numeric_limits<float>::infinity();
-    float st_side_right_ = std::numeric_limits<float>::infinity();
 };
 
 

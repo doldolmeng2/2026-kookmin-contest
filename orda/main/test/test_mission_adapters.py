@@ -29,7 +29,7 @@ def no_cluster_message():
     return [0.0, math.inf, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
-def adapter(mode, *, lane_target=LaneTarget.LANE_ONE):
+def adapter(mode, *, lane_target=LaneTarget.CENTER):
     return RaceRuntimeAdapter(
         fsm=RaceFSM(initial_state=mode),
         context=RaceContext(state_entered_at=1.0, lane_target=lane_target),
@@ -41,8 +41,10 @@ def test_object_lane_and_lane_target_domains_are_explicitly_separate():
     assert opposite_lane_target(ObjectLane.RIGHT) is LaneTarget.LANE_ONE
     assert opposite_lane_target(ObjectLane.UNKNOWN) is None
     assert ObjectLane.LEFT.value == 1
-    assert LaneTarget.LANE_TWO.value == 1
-    assert ObjectLane.LEFT != LaneTarget.LANE_TWO
+    # car_lane 과 lane_target 은 이제 같은 정수 규약(0=중앙,1=왼쪽,2=오른쪽)을 쓴다.
+    assert LaneTarget.CENTER.value == ObjectLane.UNKNOWN.value == 0
+    assert LaneTarget.LANE_ONE.value == ObjectLane.LEFT.value == 1
+    assert LaneTarget.LANE_TWO.value == ObjectLane.RIGHT.value == 2
 
 
 @pytest.mark.parametrize(
@@ -201,7 +203,7 @@ def test_left_object_starts_lane_two_action_and_success_does_not_exit_fixed():
         runtime.context.lane_target.value,
         mission_lane_control_enabled=runtime.lane_action.safe_to_drive,
         lane_change_active=runtime.lane_action.pending,
-    ) == [5, 1]
+    ) == [5, 2]
 
     runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.2)
     runtime.record_lane_change_state([1, 1], 1.21)
@@ -216,7 +218,7 @@ def test_left_object_starts_lane_two_action_and_success_does_not_exit_fixed():
         runtime.context.lane_target.value,
         mission_lane_control_enabled=runtime.lane_action.safe_to_drive,
         lane_change_active=runtime.lane_action.pending,
-    ) == [3, 1]
+    ) == [3, 2]
 
 
 def test_right_object_maps_to_lane_one():
@@ -317,7 +319,7 @@ def test_internal_zone_and_complete_seams_drive_only_the_declared_chain():
     lane = runtime.step(1.3, lane=candidate(1.3))
 
     assert fixed.transition.target is Mode.FIXED_AVOID
-    assert overtake.transition.target is Mode.OVERTAKE
+    assert overtake.transition.target is Mode.LANE_DRIVE
     assert lane.transition.target is Mode.LANE_DRIVE
 
 
@@ -378,3 +380,63 @@ def test_object_info_accepts_extra_side_lidar_fields():
 
     assert result.accepted is True
     assert runtime.latest_object_snapshot is not None
+
+
+def test_avoidance_stays_in_the_lane_it_moved_to():
+    """회피 후 되돌아오지 않는다.
+
+    README: "고정장애물이 2차선에 있으면 1차선으로 회피하고, 그대로 1차선에서
+    방해차량 구간을 시작한다. 회피 후 2차선으로 되돌아오지 않는다."
+    """
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.CENTER)
+
+    # 오른쪽(Lane2) 고정장애물 → 1차선으로 회피
+    runtime.record_object_info(object_message(lane=ObjectLane.RIGHT.value), 1.1)
+    runtime.step(1.1, lane=candidate(1.1))
+    assert runtime.context.lane_target is LaneTarget.LANE_ONE
+
+    runtime.record_lane_change_state([1, 1], 1.2)
+    runtime.step(1.2, lane=candidate(1.2))
+
+    # 장애물이 사라져도 1차선에 그대로 머문다
+    runtime.record_object_info(no_cluster_message(), 1.3)
+    runtime.step(1.3, lane=candidate(1.3))
+    assert runtime.context.lane_target is LaneTarget.LANE_ONE
+
+
+def test_center_is_the_default_before_any_avoidance():
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.CENTER)
+
+    runtime.record_object_info(no_cluster_message(), 1.1)
+    runtime.step(1.1, lane=candidate(1.1))
+
+    assert runtime.context.lane_target is LaneTarget.CENTER
+    assert runtime.lane_action.pending is False
+
+
+def test_lane_change_completes_when_measured_lane_reaches_the_target():
+    """완료 판정은 /lane_position 실측 차선으로 한다.
+
+    /lane_change_state 의 스파이크·안정 조건은 실측 오프셋 거동과 맞지 않아
+    완료가 잡히지 않았다 (bag 실측: 스파이크 미달 또는 안정 1프레임).
+    """
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.CENTER)
+
+    # 오른쪽(Lane2) 장애물 → 1차선으로 회피 명령
+    runtime.record_object_info(object_message(lane=ObjectLane.RIGHT.value), 1.1)
+    runtime.step(1.1, lane=candidate(1.1))
+    assert runtime.context.lane_target is LaneTarget.LANE_ONE
+    assert runtime.lane_action.pending is True
+
+    # 아직 옮겨가지 못한 동안에는 완료가 아니다
+    runtime.measured_lane = 0
+    runtime.record_object_info(object_message(lane=ObjectLane.RIGHT.value), 1.2)
+    runtime.step(1.2, lane=candidate(1.2))
+    assert runtime.lane_action.completed is False
+
+    # 실측 차선이 목표에 도달하면 완료
+    runtime.measured_lane = LaneTarget.LANE_ONE.value
+    runtime.record_object_info(object_message(lane=ObjectLane.RIGHT.value), 1.3)
+    runtime.step(1.3, lane=candidate(1.3))
+    assert runtime.lane_action.pending is False
+    assert runtime.lane_action.completed is True

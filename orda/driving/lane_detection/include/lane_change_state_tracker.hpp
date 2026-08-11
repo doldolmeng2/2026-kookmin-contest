@@ -29,7 +29,8 @@ public:
 
   void handleCommand(int mode, int lane_target)
   {
-    const bool valid_target = lane_target == 0 || lane_target == 1;
+    // 0=중앙, 1=왼쪽, 2=오른쪽 (README 규약)
+    const bool valid_target = lane_target >= 0 && lane_target <= 2;
     const bool valid_change_command = mode == 5 && valid_target;
 
     if (!valid_change_command) {

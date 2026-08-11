@@ -203,7 +203,8 @@ main/main/
 | `/object_info` | `is_moving` 필드 추가 | 고정장애물 회피와 방해차량 추월은 **규칙이 다른 별개 미션** (추월 중에는 차선 이탈이 허용됨) |
 | `/mode_info` | 현재 `[legacy_mode_code, lane]` 유지 | 실제 소비자인 `lane_detection.cpp`가 아직 3=차선주행, 5=차선변경 계약을 사용한다. 4필드 신규 계약은 소비자 변경 전까지 발행하지 않는다. |
 
-`car_lane` 과 `lane_target` 은 **같은 정수 규약(0=중앙, 1=왼쪽, 2=오른쪽)** 을 쓴다.
+`car_lane` · `lane_target` · `/lane_position` 은 **같은 정수 규약(0=중앙, 1=왼쪽, 2=오른쪽)** 을
+쓴다. `/lane_position` 만 미확정을 뜻하는 `-1` 을 추가로 쓴다.
 방해차량이 있는 쪽의 반대편을 추월 방향으로 그대로 뒤집어 쓸 수 있게 하기 위함이다.
 
 > `Int32MultiArray` 의 인덱스 의미는 이 문서뿐 아니라 **코드 내 상수로도 정의한다.**
@@ -241,12 +242,13 @@ main/main/
 | 신호등 → 라바콘 진입 | `LANE_DRIVE` | 0 (중앙) | 실선 이탈 위험 최소화 |
 | 라바콘 | `CONE_DRIVE` | — | 라이다 경로를 따름 |
 | 라바콘 종료 → 차선 재합류 | `REJOIN` → `LANE_DRIVE` | 0 (중앙) | fresh 차선 유효성 확인 뒤 정상 차선 주행 복귀 |
-| 고정장애물 구간 | `FIXED_AVOID` | 미확정 | 별도의 고정장애물 진입 event 계약이 아직 없음 |
-| 고정장애물 통과 → 추월 완료 | `OVERTAKE` | **직전 차선 유지** | 불필요한 차선 변경을 줄임. 방해차량 차선은 어차피 랜덤 |
-| 추월 완료 → 결승선 (S커브 포함) | `LANE_DRIVE` | 0 (중앙) | S커브 코너링에 유리 |
+| 고정장애물 구간 | `FIXED_AVOID` | 장애물 **반대 차선** | 통과 후에도 그 차선을 유지한다 (되돌아오지 않음) |
+| 고정장애물 통과 → 결승선 | `LANE_DRIVE` | 회피한 차선 유지 | `OVERTAKE` 를 거치지 않는다 (아래 참조) |
+| 방해차량 구간 | `OVERTAKE` | **미구현** | 움직이는 방해차량용. 이후 구현 |
+| (방해차량 구현 후) 추월 완료 → 결승선 | `LANE_DRIVE` | 0 (중앙) | S커브 코너링에 유리 |
 
-- 고정장애물이 2차선에 있으면 1차선으로 회피하고, **그대로 1차선에서 방해차량 구간을 시작한다.**
-  회피 후 2차선으로 되돌아오지 않는다.
+- 고정장애물이 2차선에 있으면 1차선으로 회피하고, **그대로 1차선을 유지한다.**
+  회피 후 2차선으로 되돌아오지 않는다. (방해차량 구간이 구현되면 그 차선에서 이어간다.)
 - 추월 방향은 시작 차선과 무관하게 **방해차량이 있는 차선의 반대편**으로 결정한다
   (같은 쪽으로 추월하면 차선 이탈로 간주됨, 규정 p.33).
 
@@ -273,8 +275,8 @@ main/main/
 | `LANE_DRIVE` | 3 | 차선 주행 (기본 중앙 주행) | 아래 분기 참조 |
 | `CONE_DRIVE` | 1 | 라바콘 구간 주행 | fresh `end_flag` 0→1 |
 | `REJOIN` | 2 | 라바콘 종료 후 차선 복귀 대기 | 명시적 차선 유효성 입력 |
-| `FIXED_AVOID` | 기본 0, action 중 5→3 | 고정장애물 구간 | typed zone-exit edge |
-| `OVERTAKE` | 기본 0, action 중 5→3 | 방해차량 구간 | typed overtake-complete edge |
+| `FIXED_AVOID` | 기본 0, action 중 5→3 | 고정장애물 구간 | typed zone-exit edge → `LANE_DRIVE` |
+| `OVERTAKE` | 기본 0, action 중 5→3 | 방해차량 구간 | **미구현** — 진입 경로 없음 (이후 구현) |
 | `SHORTCUT` | 0 (STOP) | 지름길, production controller 없음 | typed shortcut-complete edge |
 | `FINISH` | 0 (STOP) | 3바퀴 완료 | — |
 | `STOP` | 0 (STOP) | 안전 정지 | — |
@@ -286,10 +288,12 @@ INIT ──(입력 준비)──▶ WAIT_GREEN ──(신호 2 = 직진)──�
 LANE_DRIVE ─(라바콘 진입 확정)─▶ CONE_DRIVE ─(end_flag)─▶ REJOIN
 REJOIN      ─(fresh 차선 유효성)▶ LANE_DRIVE               [lane_target = 0]
 
-[외부 event 계약 미확정]
-LANE_DRIVE ─(별도 고정장애물 진입 event)─▶ FIXED_AVOID
-FIXED_AVOID ─(고정장애물 통과)───────────▶ OVERTAKE
-OVERTAKE    ─(추월 완료)────────────────▶ LANE_DRIVE
+[고정장애물 — 구현됨]
+LANE_DRIVE ─(YOLO 박스 ≥ 1900px²)──────▶ FIXED_AVOID
+FIXED_AVOID ─(측면 LiDAR 추월 확인)─────▶ LANE_DRIVE
+
+[방해차량 — 이후 구현]
+? ─────────────────────────────────────▶ OVERTAKE ─(추월 완료)─▶ LANE_DRIVE
 
 [지름길 / 종료]
 LANE_DRIVE ─(신호 3 & lap∈{2,3} & !shortcut_used)─▶ SHORTCUT ─▶ LANE_DRIVE
@@ -300,8 +304,15 @@ LANE_DRIVE ─(3바퀴 완료)─▶ FINISH
 
 - `FIXED_AVOID` 와 `OVERTAKE` 는 **순간적인 회피 동작이 아니라 구간(zone)** 이다.
   다만 `REJOIN` 성공은 `LANE_DRIVE` 복귀만 의미하며 `FIXED_AVOID` 진입 증거가 아니다.
-  고정장애물 진입 publisher/topic/type 계약이 확정될 때까지 `FIXED_AVOID` 는 runtime에서
-  도달 불가능한 외부 blocker로 유지한다.
+- **`FIXED_AVOID` → `OVERTAKE` 전이는 이후에 구현한다.** `OVERTAKE` 는 움직이는
+  방해차량 상황용이고 지금 다루는 것은 고정장애물뿐이라, 고정장애물 구간이 끝나면
+  `OVERTAKE` 를 거치지 않고 곧바로 `LANE_DRIVE` 로 돌아온다.
+  `Mode.OVERTAKE` 와 `record_overtake_complete()` 는 그대로 두었으므로, 방해차량
+  진입 경로만 연결하면 바로 쓸 수 있다.
+- **`FIXED_AVOID` 진입은 임시로 YOLO 검출을 쓴다.** 고정장애물 진입
+  publisher/topic/type 계약이 확정되면 그 구독 콜백에서
+  `record_fixed_zone_entry()` 를 부르고, `main.py` 의 임시 진입 블록을 지운다.
+  구간 종료는 측면 LiDAR 추월 확인(`is_pass_comp`)이 담당한다.
 - 구간 안에서 실제 회피/추월 동작을 할지는 `/object_info` 로 판단하며,
   `is_moving` 은 **회피 규칙을 고르는 데 쓴다** (추월 중에는 차선 이탈이 허용되지만
   고정장애물 회피는 그렇지 않다). 구간 진입 조건이 아니다.

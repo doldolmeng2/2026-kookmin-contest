@@ -5,7 +5,9 @@
 // LANE_ONE: 1차선 주행 기준, LANE_TWO: 2차선 주행 기준
 enum class LaneMode {
     LANE_ONE,
-    LANE_TWO
+    LANE_TWO,
+    // 기본 주행 모드. 두 차선 기준값의 중간을 기준선으로 쓴다.
+    CENTER
 };
 
 // JSON 파라미터 파일에서 로드하는 전체 설정 구조체

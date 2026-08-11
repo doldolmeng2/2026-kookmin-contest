@@ -242,6 +242,8 @@ class RaceRuntimeAdapter:
         self._lane_change_success_active = False
         self.traffic_stop_override = False
         self.lane_action = LaneActionStatus()
+        # /lane_position 실측 차선 (-1=미확정). main_node 가 콜백에서 갱신한다.
+        self.measured_lane: int = -1
 
     @property
     def pending_cone_event_count(self) -> int:
@@ -792,6 +794,10 @@ class RaceRuntimeAdapter:
         if not object_fresh:
             action.safe_to_drive = False
         elif not observation.object_exists:
+            # 회피한 차선에 그대로 머문다. README: "고정장애물이 2차선에 있으면
+            # 1차선으로 회피하고, 그대로 1차선에서 방해차량 구간을 시작한다.
+            # 회피 후 2차선으로 되돌아오지 않는다."
+            # 중앙 주행은 회피 전 기본값일 뿐, 회피 뒤 복귀 목표가 아니다.
             action.safe_to_drive = True
         else:
             target = opposite_lane_target(observation.object_lane)
@@ -807,6 +813,24 @@ class RaceRuntimeAdapter:
                 action.pending = True
                 action.started_at = observation.now
 
+        # 차선 변경 완료 판정 ①: 실측 차선(/lane_position)이 목표와 일치.
+        #
+        # /lane_change_state 의 성공 엣지만 쓰면 완료가 안 잡혔다. 그 판정은
+        # "오프셋이 400px 이상 튄 뒤 50px 이내로 8프레임 연속"인데, bag 실측상
+        # 스파이크 자체가 안 나거나(최대 217~313px) 스파이크 뒤 안정이 1프레임밖에
+        # 이어지지 않아 조건을 못 채웠다. 실측 차선은 5프레임 디바운스를 이미
+        # 거친 값이라 오프셋 거동에 의존하지 않는다.
+        if (
+            action.pending
+            and action.target is not None
+            and self.measured_lane == action.target.value
+        ):
+            action.pending = False
+            action.completed = True
+            action.completed_at = observation.now
+            return
+
+        # 완료 판정 ②: /lane_change_state 성공 엣지 (기존 경로 유지)
         success_at = observation.lane_change_received_at
         if (
             action.pending
