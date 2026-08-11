@@ -159,6 +159,7 @@ def generate_launch_description():
         executable='object_node',
         name='object_node',
         output='screen',
+        parameters=[{'enable_gui': False}],
     )
 
     return LaunchDescription([
