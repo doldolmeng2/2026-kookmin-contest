@@ -7,9 +7,18 @@
 #   TRAFFIC_WAIT(0) → 초록불 감지 → RUBBERCONE_DRIVE(1)
 #   RUBBERCONE_DRIVE  → end_flag=1 → RUBBERCONE_END(2)
 #   RUBBERCONE_END    → 1.4초 경과 → BEFORE(4)
-#   BEFORE            → 추월 조건 충족 → LANE_DRIVE(3)
-#   LANE_DRIVE        → 객체 박스 ≥ 1900px² → CHANGE_LANE(5)
+#   BEFORE            → 추월 완료 → LANE_DRIVE(3), 원래 차선으로 복귀
+#   LANE_DRIVE        → 같은 차선 객체 박스 ≥ 1900px² → CHANGE_LANE(5)
 #   CHANGE_LANE       → 차선 변경 완료 → BEFORE(4)
+#
+# BEFORE는 순간 동작이 아니라 장애물 구간(zone)이다. 구간을 벗어나는 조건은
+# "추월 완료"이며, 구간이 끝나지 않을 때를 대비해 시간 상한을 함께 둔다.
+#
+# 방해차량 회피/추월 한 사이클:
+#   1) 전방 인식은 YOLO(box_size ≥ 1900px²) - 기존 방식 유지
+#   2) 방해차량 차선의 반대편으로 차선 변경, 직전 차선을 기억
+#   3) 측면 LiDAR로 방해차량이 옆으로 지나가는 것을 확인
+#   4) 그 시점부터 2초 뒤 원래 주행하던 차선으로 복귀
 #
 # 구독:
 #   rubbercone_info   (std_msgs/Int32MultiArray)  - [오프셋, end_flag, 신뢰도]
@@ -38,6 +47,7 @@ import numpy as np
 import threading
 
 from main.control import Controller
+from main.overtake import OvertakeGuard
 
 # ── 주행 모드 상수 ───────────────────────────────────────────────────────────
 TRAFFIC_WAIT     = 0  # 신호 대기: 완전 정지
@@ -54,6 +64,8 @@ RUBBERCONE_DECEL_STEP = 0.20  # 급조향 때는 가속보다 빠르게 감속
 # LiDAR 경로는 약 10 Hz로 갱신된다. 한 스캔의 경계 선택이 바뀌어도 실제
 # 조향 명령이 즉시 반대 끝까지 가지 않도록, 50 Hz 제어 주기마다 변화량을 제한한다.
 RUBBERCONE_STEERING_STEP = 3.0  # 20 ms마다 조향각 최대 변화량 (deg)
+
+# 방해차량 회피/추월 임계값은 main.overtake.OvertakeConfig가 갖는다.
 
 
 class MainNode(Node):
@@ -109,9 +121,8 @@ class MainNode(Node):
         self.now_angle = 0.0  # 실제 발행 조향각 (라바콘에서 변화율 제한 적용)
         self.last_debug_time = None
 
-        # ── 추월 완료 판정용 카운터 ─────────────────────────────────────────
-        # 차선 변경 후 반대쪽 초음파가 25cm 이하를 10회 이상 감지하면 추월 완료
-        self.avoid_cnt = 0
+        # ── 방해차량 회피/추월 판단 (순수 로직 모듈) ────────────────────────
+        self.overtake = OvertakeGuard()
 
         # ── 컨트롤러 초기화 ──────────────────────────────────────────────────
         self.controller = Controller(self)
@@ -169,6 +180,8 @@ class MainNode(Node):
         self.box_cy      = float('nan') # 박스 중심 y (px)
         self.box_dx      = float('nan') # 박스 중심 x 편차 (px, 차선 중심 기준)
         self.car_lane    = -1           # 장애물이 위치한 차선: -1=미정, 0=중앙, 1=L1, 2=L2
+        self.side_left   = float('inf') # 좌측면 최소 거리 (m, LiDAR)
+        self.side_right  = float('inf') # 우측면 최소 거리 (m, LiDAR)
 
         # ── YOLO 박스 축소 속도 계산용 상태 ──────────────────────────────────
         # box_size(px²)의 제곱근을 박스 한 변 길이(px)로 근사해 선형 축소 속도를
@@ -255,9 +268,11 @@ class MainNode(Node):
 
     def object_info_callback(self, msg: Float32MultiArray):
         """
-        장애물 검출 노드에서 발행한 10개 필드의 장애물 정보를 파싱한다.
+        장애물 검출 노드에서 발행한 장애물 정보를 파싱한다.
         필드 순서: [exists, min_dist, angle, span, cluster_size,
-                    box_size, box_cx, box_cy, dx, car_lane]
+                    box_size, box_cx, box_cy, dx, car_lane,
+                    side_left, side_right]
+        측면 2필드는 뒤에 추가된 것이라, 없는 구 버전 메시지도 받아들인다.
         """
         d = msg.data
         self.obj_exists  = float(d[0])  # 장애물 존재 여부 (0/1)
@@ -270,6 +285,9 @@ class MainNode(Node):
         self.box_cy      = float(d[7])  # 박스 중심 y (px)
         self.box_dx      = float(d[8])  # 박스 중심 x 편차 (px)
         self.car_lane    = int(d[9])    # 장애물 차선: 1=L1, 2=L2, 0=중앙, -1=미정
+        # 측면 최소 거리 (m). 구 버전 메시지면 감지 없음(inf)으로 둔다.
+        self.side_left   = float(d[10]) if len(d) > 10 else float('inf')
+        self.side_right  = float(d[11]) if len(d) > 11 else float('inf')
 
     def traffic_callback(self, msg: Bool):
         """신호등 검출 노드에서 초록불 감지 여부를 수신한다."""
@@ -278,7 +296,9 @@ class MainNode(Node):
     def ultrasonic_callback(self, msg: Int32MultiArray):
         """
         초음파 센서 배열에서 왼쪽(인덱스 0)과 오른쪽(인덱스 4) 거리를 수신한다.
-        단위: cm. 추월 완료 판단(is_pass_comp)에 사용된다.
+        단위: cm. 현재는 상태 확인용으로만 보관한다. 추월 완료 판단에서는
+        빼냈다 — bag(rosbag2_object1)에서 오른쪽 센서가 전 구간 4cm에
+        고착되어 오판을 일으켰다 (is_pass_comp 참조).
         """
         data = msg.data
         if len(data) > 5:
@@ -299,6 +319,8 @@ class MainNode(Node):
           7) 디버그 상태 창 갱신
         """
         now = self.get_clock().now()
+        # 순수 로직 모듈(main.overtake)은 rclpy를 모르므로 초 단위 float로 넘긴다.
+        now_s = now.nanoseconds / 1e9
 
         # ── bag 재생 루프 감지 ───────────────────────────────────────────────
         # 시각이 이전 프레임보다 "큰 폭으로" 뒤로 가면(=bag이 처음부터 다시
@@ -312,7 +334,7 @@ class MainNode(Node):
             self.get_logger().info("bag 루프 감지 -> 상태머신 리셋")
             self.mode                = self.initial_mode
             self.lane                = 1
-            self.avoid_cnt           = 0
+            self.overtake.reset()
             self.rubbercone_end_time = None
             self.end_flag            = 0
             self.lane_drive_started  = False
@@ -357,30 +379,53 @@ class MainNode(Node):
                 self.get_logger().info("라바콘 종료 차선 진입")
 
             elif self.mode == RUBBERCONE_END and elapsed > self.into_lane_timer:
-                # 차선 진입 대기 시간 초과 → 장애물 접근 대기 모드
+                # 차선 진입 대기 시간 초과 → 장애물 구간 진입
                 self.mode = BEFORE
+                self.overtake.enter_zone(now_s)
 
             elif self.mode == BEFORE:
-                if self.is_pass_comp():
-                    # 추월 조건 충족 → 차선 주행 모드
+                decision = self.overtake.update_zone(
+                    now=now_s,
+                    lane_target=self.lane,
+                    side_left=self.side_left,
+                    side_right=self.side_right,
+                )
+                if decision.side_just_seen:
+                    self.get_logger().info(
+                        f"측면 방해차량 인식 ({decision.side_distance:.2f}m), "
+                        f"{self.overtake.config.pass_delay_s:.1f}초 후 추월 완료")
+                if decision.complete:
+                    # 추월 완료 → 원래 주행하던 차선으로 복귀 후 차선 주행 모드
                     self.mode = LANE_DRIVE
-                    self.get_logger().info("추월 전 상태")
+                    if decision.timed_out:
+                        self.get_logger().info("장애물 구간 시간 상한 초과, 다음 구간으로 진행")
+                    restore_lane = self.overtake.take_restore_lane()
+                    if restore_lane is not None:
+                        self.lane = restore_lane
+                        self.lane_change_display_frames = self.lane_change_display_duration
+                        self.get_logger().info(
+                            f"추월 완료, 원래 차선(Lane {self.lane + 1})으로 복귀")
+                    else:
+                        self.get_logger().info("추월 완료, 차선 주행 복귀")
 
             elif self.mode == LANE_DRIVE:
-                if self.box_size > 1900:
-                    if self.is_obstacle_in_ego_lane():
-                        # 장애물이 같은 차선에 있으면 차선 변경 시작
-                        self.mode = CHANGE_LANE
-                        self.lane = 1 - self.lane  # 차선 토글: Lane1 ↔ Lane2
-                        self.lane_change_display_frames = self.lane_change_display_duration
-                        self.get_logger().info("동일 차선 장애물 감지, 차선 변경 모드 전환")
-                    else:
-                        # 반대 차선 장애물이면 차선을 바꿀 필요가 없으므로 그대로 주행
-                        self.get_logger().info("반대 차선 장애물, 현재 차선 유지 주행")
+                target_lane = self.overtake.begin_avoidance(
+                    box_size=self.box_size,
+                    car_lane=self.car_lane,
+                    lane_target=self.lane,
+                    detected_lane=self.detected_lane,
+                )
+                if target_lane is not None:
+                    # 방해차량 차선의 반대편으로 한 번만 이동한다.
+                    self.mode = CHANGE_LANE
+                    self.lane = target_lane
+                    self.lane_change_display_frames = self.lane_change_display_duration
+                    self.get_logger().info("동일 차선 장애물 감지, 차선 변경 모드 전환")
 
             elif self.mode == CHANGE_LANE and self.is_change_end():
-                # 차선 변경 완료 → 장애물 접근 대기 모드로 복귀
+                # 차선 변경 완료 → 장애물 구간으로 복귀
                 self.mode = BEFORE
+                self.overtake.enter_zone(now_s)
                 self.get_logger().info("차선 변경 완료")
 
         # ── 오프셋 선택 ──────────────────────────────────────────────────────
@@ -493,6 +538,7 @@ class MainNode(Node):
             f"{'Rubber End' if self.end_flag == 1 else 'Rubber Not End'}",
             f"Object dist: {self.object_dist:.2f} m",
             f"Box: {self.box_size:.0f}px^2  car_lane={self.car_lane}",
+            f"Side L/R: {self.side_left:.2f} / {self.side_right:.2f} m",
             f"Box shrink rate: {self.box_shrink_rate:+.1f} px/s",
         ]
         for i, text in enumerate(lines):
@@ -505,55 +551,12 @@ class MainNode(Node):
 
     # ── 모드 전환 조건 판정 ───────────────────────────────────────────────────
 
-    def is_obstacle_in_ego_lane(self) -> bool:
-        """
-        검출된 장애물이 현재 우리 차량과 같은 차선에 있는지 판정한다.
-        같은 차선이 아니면(반대 차선) 차선을 변경할 필요가 없으므로,
-        불필요한 차선 변경(=불필요한 차선 이탈 위험)을 막기 위해 사용한다.
-
-        car_lane 인코딩(object_detection): 1=L1, 2=L2, 0=중앙, -1=미정
-        self.lane / self.detected_lane 인코딩: 0=Lane1, 1=Lane2
-
-        car_lane이 미정(-1)이거나 중앙(0)이면 어느 차선인지 확정할 수 없으므로
-        안전 쪽으로(같은 차선으로 간주하여) True를 반환한다.
-        기준 차선은 실측값(detected_lane)이 있으면 그것을, 없으면 제어 목표
-        (self.lane)를 사용한다.
-        """
-        if self.car_lane not in (1, 2):
-            return True
-
-        obstacle_lane = 0 if self.car_lane == 1 else 1
-        ego_lane = self.detected_lane if self.detected_lane in (0, 1) else self.lane
-        return obstacle_lane == ego_lane
-
     def is_change_end(self) -> bool:
         """
         차선 변경 완료 여부를 반환한다.
         현재는 항상 True를 반환하므로 CHANGE_LANE → BEFORE 전환이 즉시 이루어진다.
         """
         return True
-
-    def is_pass_comp(self) -> bool:
-        """
-        추월 완료 여부를 판정한다.
-        현재 차선과 반대쪽 초음파 센서가 25cm 이내를 10회 이상 감지하면
-        장애물을 추월한 것으로 판단하고 True를 반환한다.
-
-        로직:
-          - Lane1(lane=0) 주행 중: 오른쪽(right) 초음파 < 25cm 감지
-          - Lane2(lane=1) 주행 중: 왼쪽(left) 초음파 < 25cm 감지
-        """
-        if self.lane == 0 and self.right < 25:
-            self.avoid_cnt += 1
-            print("왼쪽 감지  카운트 :", self.avoid_cnt)
-        elif self.lane == 1 and self.left < 25:
-            self.avoid_cnt += 1
-            print("오른쪽 감지  카운트 :", self.avoid_cnt)
-
-        if self.avoid_cnt > 10:
-            self.avoid_cnt = 0
-            return True
-        return False
 
 
 def main(args=None):

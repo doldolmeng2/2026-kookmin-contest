@@ -18,6 +18,12 @@ LaneMode lane_mode_from_string(const std::string& mode_str) {
 // JSON 파일을 파싱하여 Config 구조체를 완성하고 반환한다.
 Config load_config(const std::string& path) {
     std::ifstream file(path);
+    // 파일이 없어도 ifstream은 조용히 실패하고, 그 스트림을 그대로 파싱하면
+    // "unexpected end of input" 같은 엉뚱한 parse_error가 난다. 원인이 경로
+    // 문제라는 걸 바로 알 수 있도록 여기서 먼저 걸러낸다.
+    if (!file.is_open())
+        throw std::runtime_error("파라미터 파일을 열 수 없습니다: " + path);
+
     json j;
     file >> j;
 
