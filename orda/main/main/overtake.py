@@ -186,19 +186,27 @@ class OvertakeGuard:
         lane_target: int,
         side_left: float,
         side_right: float,
+        ego_lane: int = -1,
     ) -> PassDecision:
         """측면 LiDAR로 추월 완료를 판정한다.
 
         회피로 차선을 옮겼으므로 방해차량은 현재 주행 차선의 반대편에 있다.
-          - Lane1(lane_target=0) 주행 중 → 오른쪽(side_right)
-          - Lane2(lane_target=1) 주행 중 → 왼쪽(side_left)
+          - Lane1 주행 중 → 오른쪽(side_right)
+          - Lane2 주행 중 → 왼쪽(side_left)
+
+        어느 쪽을 볼지는 **실측 차선**(ego_lane, /lane_position)을 우선 쓰고,
+        미확정(-1)이면 제어 목표(lane_target)로 폴백한다. lane_target은 명령이라
+        차선 변경이 아직 진행 중이거나 실패했을 때 실제 위치와 어긋나는데, 그
+        상태로 반대편을 감시하면 옆으로 지나가는 차를 놓치고 완료 판정이 구간
+        시간 상한으로 밀린다.
 
         초음파를 쓰지 않는 이유: bag(rosbag2_object1)에서 오른쪽 초음파가 전
         구간 4cm에 고착되어(전체 샘플의 98%) 차선을 바꾸자마자 "추월 완료"가
         나버렸고, 그 오판이 회피를 원위치로 되돌려 충돌로 이어졌다.
         """
 
-        side_distance = side_right if lane_target == 0 else side_left
+        current_lane = ego_lane if ego_lane in (0, 1) else lane_target
+        side_distance = side_right if current_lane == 0 else side_left
         just_seen = False
 
         if self.side_seen_at is None and side_distance < self.config.side_detect_m:

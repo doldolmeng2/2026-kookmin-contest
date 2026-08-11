@@ -141,6 +141,7 @@ class MainNode(Node):
         self.box_cy = float("nan")
         self.box_dx = float("nan")
         self.car_lane = -1
+        self.detected_lane = -1         # 실측 현재 차선 (-1=미확정, 0=Lane1, 1=Lane2)
         self.side_left = float("inf")   # 좌측면 최소 거리 (m, LiDAR)
         self.side_right = float("inf")  # 우측면 최소 거리 (m, LiDAR)
         self.left = float("inf")
@@ -223,6 +224,12 @@ class MainNode(Node):
             self.lane_change_state_callback,
             sensor_event_qos(depth=10),
         )
+        self.lane_position_sub = self.create_subscription(
+            Int16,
+            "lane_position",
+            self.lane_position_callback,
+            qos_fast,
+        )
         self.ultrasonic_sub = self.create_subscription(
             Int32MultiArray,
             "xycar_ultrasonic",
@@ -270,6 +277,12 @@ class MainNode(Node):
                 "invalid lane-validity message ignored",
                 received_at,
             )
+
+    def lane_position_callback(self, msg: Int16) -> None:
+        """lane_detection이 노란 중앙선 실제 위치로 역산한 실측 현재 차선."""
+
+        value = int(msg.data)
+        self.detected_lane = value if value in (0, 1) else -1
 
     def object_info_callback(self, msg: Float32MultiArray) -> None:
         received_at = self._now_seconds()
@@ -429,6 +442,7 @@ class MainNode(Node):
                 lane_target=self.runtime.context.lane_target.value,
                 side_left=self.side_left,
                 side_right=self.side_right,
+                ego_lane=self.detected_lane,
             )
             if decision.side_just_seen:
                 self.get_logger().info(

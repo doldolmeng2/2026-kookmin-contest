@@ -192,3 +192,36 @@ def test_reset_clears_everything():
     assert g.lane_before_avoid is None
     assert g.side_seen_at is None
     assert g.zone_entered_at is None
+
+
+def test_measured_lane_wins_over_lane_target_for_side_choice():
+    """실측 차선(/lane_position)이 있으면 그쪽을 보고, 없으면 목표 차선으로 폴백한다.
+
+    lane_target은 명령이라 차선 변경 중에는 실제 위치와 어긋난다. 그 상태로
+    반대편을 감시하면 옆으로 지나가는 차를 놓친다.
+    """
+    # 명령은 Lane2(1)지만 실측은 아직 Lane1(0) → 오른쪽을 봐야 한다
+    g = guard()
+    g.enter_zone(now=0.0)
+    seen = g.update_zone(
+        now=0.1, lane_target=1, side_left=INF, side_right=0.4, ego_lane=0
+    )
+    assert seen.side_just_seen is True
+
+    # 실측이 미확정(-1)이면 목표 차선(Lane2=1)을 따라 왼쪽을 본다
+    g2 = guard()
+    g2.enter_zone(now=0.0)
+    assert g2.update_zone(
+        now=0.1, lane_target=1, side_left=INF, side_right=0.4, ego_lane=-1
+    ).side_just_seen is False
+    assert g2.update_zone(
+        now=0.2, lane_target=1, side_left=0.4, side_right=INF, ego_lane=-1
+    ).side_just_seen is True
+
+
+def test_ego_lane_defaults_to_lane_target_when_omitted():
+    g = guard()
+    g.enter_zone(now=0.0)
+    assert g.update_zone(
+        now=0.1, lane_target=0, side_left=INF, side_right=0.4
+    ).side_just_seen is True

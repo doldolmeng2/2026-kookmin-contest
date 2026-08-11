@@ -113,6 +113,12 @@ public:
         lane_change_state_pub_ = this->create_publisher<std_msgs::msg::Int32MultiArray>(
             "/lane_change_state", qos_fast);
 
+        // 실측 현재 차선 발행: /lane_position (-1=미확정, 0=Lane1, 1=Lane2)
+        // /lane_change_state 가 "변경이 끝났다"는 이벤트라면, 이쪽은 매 프레임
+        // "지금 어느 차선인가"를 알려주는 연속값이다. 둘은 성격이 달라 공존한다.
+        lane_position_pub_ = this->create_publisher<std_msgs::msg::Int16>(
+            "/lane_position", qos_fast);
+
         // BEV 호모그래피 행렬 계산 (ROI 사다리꼴 → 직사각형)
         buildHomography();
 
@@ -948,6 +954,14 @@ private:
     rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr              offset_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr  fit_pub_;
     rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr    lane_change_state_pub_;
+    rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr              lane_position_pub_;
+
+    // ── 실측 현재 차선 판정 상태 (인지 기반, 제어 목표와 무관) ──────────
+    int detected_lane_  = -1;  // 확정된 실측 차선 (-1=미확정)
+    int pending_lane_   = -1;  // 디바운스 중인 후보 차선
+    int pending_streak_ = 0;   // 후보 차선 연속 프레임 수
+    static constexpr int   LANE_DETECT_STREAK_NEED_ = 5;           // 확정에 필요한 연속 프레임 수
+    static constexpr float LANE_CLASSIFY_DEADZONE_RATIO_ = 0.05f;  // 애매한 경계 임계값
 
     // ── 조향/속도 명령 시각화 (정성적 근사, 실측 휠베이스/조향각 보정값 아님) ──
     float last_steer_cmd_  = 0.f;  // /xycar_motor에서 수신한 마지막 조향 명령
@@ -1107,6 +1121,53 @@ private:
         // the prior offset for lane control, but it must reset completion
         // progress rather than treating stale geometry as fresh evidence.
         updateLaneChangeState(valid, center_fit, offset);
+
+        // 실측 현재 차선 판정 및 /lane_position 발행 (제어 목표와 무관한 인지값)
+        const LineFit& effective_fit = valid ? center_fit : prev_center_fit_;
+        updateAndPublishDetectedLane(effective_fit, valid || has_prev_center_fit_);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // 노란 중앙선의 BEV 가로 위치 비율로 현재 차선을 분류한다.
+    //
+    // 두 기준값(1차선/2차선 ref)의 정중앙 부근은 노이즈만으로도 쉽게 뒤집히는
+    // 애매한 영역이라, 그 구간에서는 -1(판정 보류)을 반환해 디바운스 카운터에
+    // 아예 반영되지 않게 한다. 애매한 프레임이 우연히 5번 연속 한쪽에 쏠려도
+    // 잘못 확정되지 않도록 하기 위함이다.
+    //
+    // 반환값: 0=Lane1, 1=Lane2, -1=판정 보류
+    // ─────────────────────────────────────────────────────────────────────
+    int classifyLaneFromRatio(float x_ratio) const {
+        const float d1 = std::fabs(x_ratio - center_reference_lane_one_);
+        const float d2 = std::fabs(x_ratio - center_reference_lane_two_);
+        if (std::fabs(d1 - d2) < LANE_CLASSIFY_DEADZONE_RATIO_) return -1;
+        return (d1 <= d2) ? 0 : 1;
+    }
+
+    // 디바운스(5프레임 연속) 후 detected_lane_ 갱신 및 /lane_position 발행
+    void updateAndPublishDetectedLane(const LineFit& fit_bev, bool fit_ok) {
+        if (fit_ok && bev_size_.width > 0 && bev_size_.height > 0) {
+            const float x_near =
+                fit_bev.m * static_cast<float>(bev_size_.height - 1) + fit_bev.b;
+            const float ratio = x_near / static_cast<float>(bev_size_.width);
+            const int   cls   = classifyLaneFromRatio(ratio);
+
+            if (cls == -1) {
+                // 애매한 프레임: 디바운스 상태를 건드리지 않고 이전 상태 유지
+            } else if (cls == pending_lane_) {
+                ++pending_streak_;
+            } else {
+                pending_lane_   = cls;
+                pending_streak_ = 1;
+            }
+            if (pending_streak_ >= LANE_DETECT_STREAK_NEED_) {
+                detected_lane_ = pending_lane_;
+            }
+        }
+
+        std_msgs::msg::Int16 msg;
+        msg.data = static_cast<int16_t>(detected_lane_);
+        lane_position_pub_->publish(msg);
     }
 
     // ─────────────────────────────────────────────────────────────────────
