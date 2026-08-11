@@ -23,7 +23,9 @@ from main.control_selector import (
     ControlSource,
     DriveCommand,
 )
+from main.mission_types import LaneTarget
 from main.mode_info import mode_info_data
+from main.overtake import OvertakeGuard
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
     RaceRuntimeAdapter,
@@ -47,6 +49,11 @@ CONE_EVENT_WARNING_PERIOD_S = 5.0
 RUBBERCONE_ACCEL_STEP = 0.25
 RUBBERCONE_DECEL_STEP = 0.35
 RUBBERCONE_STEERING_STEP = 3.0
+
+# 고정장애물 구간을 통과했다고 보는 시간 상한. 고정/이동을 구분할 입력
+# (/object_info의 is_moving)이 아직 없어서 시간으로 넘긴다. is_moving이
+# 생기면 그 값으로 교체할 자리다.
+FIXED_ZONE_MAX_SEC = 6.0
 
 # Keep the launch file's existing integer ``mode`` parameter usable for the
 # states that have a defined 2026 counterpart. Unsupported legacy mission
@@ -134,8 +141,16 @@ class MainNode(Node):
         self.box_cy = float("nan")
         self.box_dx = float("nan")
         self.car_lane = -1
+        self.side_left = float("inf")   # 좌측면 최소 거리 (m, LiDAR)
+        self.side_right = float("inf")  # 우측면 최소 거리 (m, LiDAR)
         self.left = float("inf")
         self.right = float("inf")
+
+        # 구간(FIXED_AVOID / OVERTAKE) 종료 판정. 순수 로직은 main.overtake가 갖는다.
+        self.overtake = OvertakeGuard()
+        self._zone_state: Optional[Mode] = None   # 직전 사이클의 FSM 상태
+        self._zone_chain_armed = False            # 이번 바퀴에 구간 체인을 아직 안 탔는지
+        self._zone_exit_sent = False              # 현재 구간의 종료 엣지를 이미 냈는지
 
         self.now_speed = 0.0
         self.now_angle = 0.0
@@ -277,6 +292,9 @@ class MainNode(Node):
         self.box_cy = float(data[7])
         self.box_dx = float(data[8])
         self.car_lane = int(data[9])
+        # 측면 최소 거리 2필드는 뒤에 추가된 것이라 구 버전 메시지도 받아들인다.
+        self.side_left = float(data[10]) if len(data) > 10 else float("inf")
+        self.side_right = float(data[11]) if len(data) > 11 else float("inf")
 
     def lane_change_state_callback(self, msg: Int32MultiArray) -> None:
         received_at = self._now_seconds()
@@ -296,6 +314,7 @@ class MainNode(Node):
 
     def control_cycle(self) -> None:
         now = self._now_seconds()
+        self._drive_mission_zones(now)
         lane_candidate, cone_candidate = self._command_candidates()
 
         cycle = self.runtime.step(
@@ -341,6 +360,95 @@ class MainNode(Node):
         self.mode_pub.publish(mode_msg)
 
         self._update_debug_window(now, angle, speed)
+
+    def _drive_mission_zones(self, now: float) -> None:
+        """구간 체인(LANE_DRIVE → FIXED_AVOID → OVERTAKE → LANE_DRIVE)을 굴린다.
+
+        race_fsm은 세 이벤트(fixed_zone_entry / fixed_zone_exit /
+        overtake_complete)로 구간을 넘기도록 이미 만들어져 있는데, 그 이벤트를
+        만들어 주는 쪽이 비어 있어서 체인 전체가 잠들어 있었다. 여기서 채운다.
+
+        판정 근거:
+          - 진입  : 라바콘을 통과한 바퀴에서 차선 주행으로 복귀하면 곧 고정장애물
+                    구간이다. README대로 "장애물을 검출해서 진입하는 게 아니라
+                    라바콘 종료 후 순서대로 통과한다".
+          - 고정장애물 통과 : 이동/고정을 구분할 입력(is_moving)이 아직 없어
+                    시간 상한으로 넘긴다. README의 "구간 시간 상한" 규칙.
+          - 추월 완료 : 측면 LiDAR로 방해차량이 옆으로 지나간 것을 확인하고
+                    PASS_DELAY_SEC 뒤에 확정한다 (main.overtake).
+
+        회피 방향과 차선 변경 자체는 runtime_adapter._update_lane_action이
+        이미 담당하므로 여기서 중복하지 않는다. 이 메서드는 구간 경계만 만든다.
+        """
+
+        state = self.runtime.fsm.state
+        entered = state is not self._zone_state
+        self._zone_state = state
+
+        # 라바콘을 통과하면 이번 바퀴의 구간 체인을 무장한다.
+        if state is Mode.CONE_DRIVE:
+            self._zone_chain_armed = True
+
+        if state is Mode.LANE_DRIVE:
+            if self._zone_chain_armed:
+                self._zone_chain_armed = False
+                self.runtime.record_fixed_zone_entry(now)
+                self.get_logger().info("라바콘 통과 -> 고정장애물 구간 진입")
+            return
+
+        if state is Mode.FIXED_AVOID:
+            if entered:
+                self.overtake.enter_zone(now)
+                self._zone_exit_sent = False
+            elapsed = self.overtake.zone_elapsed(now)
+            if (
+                not self._zone_exit_sent
+                and elapsed is not None
+                and elapsed >= FIXED_ZONE_MAX_SEC
+            ):
+                # 한 번만 내보낸다. 전이가 한 사이클 늦어져도 같은 엣지를
+                # 매 주기 반복 발행하면 큐와 로그가 오염된다.
+                self._zone_exit_sent = True
+                self.runtime.record_fixed_zone_exit(now)
+                self.get_logger().info(
+                    f"고정장애물 구간 {elapsed:.1f}초 경과 -> 방해차량 구간으로 진행")
+            return
+
+        if state is Mode.OVERTAKE:
+            if entered:
+                # 진입 시점의 차선을 복귀 대상으로 기억한다. 회피로 차선을 옮긴
+                # 뒤 추월이 끝나면 여기로 돌아온다.
+                self.overtake.enter_zone(
+                    now, current_lane=self.runtime.context.lane_target.value)
+                self._zone_exit_sent = False
+            if self._zone_exit_sent:
+                return
+
+            decision = self.overtake.update_zone(
+                now=now,
+                lane_target=self.runtime.context.lane_target.value,
+                side_left=self.side_left,
+                side_right=self.side_right,
+            )
+            if decision.side_just_seen:
+                self.get_logger().info(
+                    f"측면 방해차량 인식 ({decision.side_distance:.2f}m), "
+                    f"{self.overtake.config.pass_delay_s:.1f}초 후 추월 완료")
+            if decision.complete:
+                if decision.timed_out:
+                    self.get_logger().info("방해차량 구간 시간 상한 초과 -> 차선 주행 복귀")
+                self._zone_exit_sent = True
+                self.runtime.record_overtake_complete(now)
+                restore_lane = self.overtake.take_restore_lane()
+                if restore_lane is not None:
+                    self.runtime.context.lane_target = LaneTarget(restore_lane)
+                    self.get_logger().info(
+                        f"추월 완료, 원래 차선(Lane {restore_lane + 1})으로 복귀")
+            return
+
+        # 그 밖의 상태(INIT/WAIT_GREEN/REJOIN/SHORTCUT 등)에서는 구간 판정을 쉰다.
+        if entered:
+            self.overtake.reset()
 
     def _command_candidates(self):
         lane_candidate = None

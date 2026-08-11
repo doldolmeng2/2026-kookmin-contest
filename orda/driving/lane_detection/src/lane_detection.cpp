@@ -30,6 +30,8 @@
 #include <string>
 #include <iostream>
 #include <vector>
+#include <fstream>
+#include <stdexcept>
 #include <functional>
 #include <algorithm>
 #include <chrono>
@@ -1163,13 +1165,65 @@ private:
 };
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 파라미터 JSON 경로 결정
+//
+// 1) `--config <경로>` 명령행 인수가 있으면 그 경로를 사용
+// 2) 없으면 아래 후보 경로를 순서대로 확인한다
+//
+// 소스 트리를 직접 가리키므로 JSON을 고치면 재빌드 없이 바로 반영된다.
+// 예전에는 실차 경로 하나만 하드코딩되어 있었는데, 개발 PC에는 그 파일이
+// 없어서 lane_node가 시작하자마자 parse_error로 죽었다.
+//
+// ★ 새 PC에서 쓰려면 CONFIG_PATH_CANDIDATES에 그 PC의 경로를 추가해야 한다.
+//   임시로는 --config <경로> 로 넘겨도 된다.
+// ─────────────────────────────────────────────────────────────────────────────
+static std::string resolve_config_path(int argc, char** argv) {
+    static const std::vector<std::string> CONFIG_PATH_CANDIDATES = {
+        // 개발 PC
+        "/home/dxer1/2026-kookmin-contest/orda/driving/lane_detection/lane_detection_parameter.json",
+        // 실차 (Xycar)
+        "/home/xytron/xycar_ws/src/orda/driving/lane_detection/lane_detection_parameter.json",
+    };
+
+    auto readable = [](const std::string& p) {
+        if (p.empty()) return false;
+        std::ifstream f(p);
+        return f.is_open();
+    };
+
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == "--config") {
+            const std::string p = argv[i + 1];
+            if (readable(p)) return p;
+            throw std::runtime_error("--config로 지정된 파일을 열 수 없습니다: " + p);
+        }
+    }
+
+    for (const auto& candidate : CONFIG_PATH_CANDIDATES)
+        if (readable(candidate)) return candidate;
+
+    std::string msg = "lane_detection_parameter.json을 찾지 못했습니다. 확인한 경로:";
+    for (const auto& candidate : CONFIG_PATH_CANDIDATES) msg += "\n  - " + candidate;
+    msg += "\n--config <경로> 로 직접 지정할 수 있습니다.";
+    throw std::runtime_error(msg);
+}
+
+
 int main(int argc, char** argv) {
     std::cout << "OpenCV 버전: " << CV_VERSION << std::endl;
     rclcpp::init(argc, argv);
 
-    Config config = load_config(
-        "/home/xytron/xycar_ws/src/orda/driving/lane_detection/lane_detection_parameter.json"
-    );
+    Config config;
+    try {
+        const std::string config_path = resolve_config_path(argc, argv);
+        std::cout << "[lane_detection] 파라미터 파일: " << config_path << std::endl;
+        config = load_config(config_path);
+    } catch (const std::exception& e) {
+        std::cerr << "[lane_detection] 설정 로드 실패: " << e.what() << std::endl;
+        rclcpp::shutdown();
+        return 1;
+    }
 
     // 로드된 설정값 확인용 로그 (config 수정이 실제로 반영됐는지 디버깅용)
     std::cout << "===== [lane_detection] 로드된 Config 값 =====" << std::endl;

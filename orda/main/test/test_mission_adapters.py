@@ -49,7 +49,8 @@ def test_object_lane_and_lane_target_domains_are_explicitly_separate():
     "payload",
     [
         object_message()[:-1],
-        object_message() + [0.0],
+        # 길이 초과는 더 이상 오류가 아니다. object_detection이 측면 LiDAR
+        # 거리를 11·12번째 필드로 덧붙였고, 어댑터는 앞 10필드만 쓴다.
         object_message(distance=math.nan),
         object_message(distance=math.inf),
         object_message(lane=1.5),
@@ -363,3 +364,17 @@ def test_route_encounter_seam_is_one_shot_and_updates_lap_context():
     assert first.observation.traffic_encounter_started is True
     assert repeated_timer.observation.traffic_encounter_started is False
     assert runtime.context.completed_laps == 1
+
+
+def test_object_info_accepts_extra_side_lidar_fields():
+    """object_detection이 붙인 측면 LiDAR 2필드(11·12번째)를 받아들여야 한다.
+
+    이 두 필드가 거부되면 /object_info 전체가 버려져 회피 판단 입력이 끊긴다.
+    """
+
+    runtime = adapter(Mode.FIXED_AVOID)
+
+    result = runtime.record_object_info(object_message() + [0.42, 1.30], 1.1)
+
+    assert result.accepted is True
+    assert runtime.latest_object_snapshot is not None

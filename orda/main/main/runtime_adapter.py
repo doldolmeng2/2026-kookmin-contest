@@ -291,16 +291,27 @@ class RaceRuntimeAdapter:
         data: Sequence[Any],
         received_at: float,
     ) -> InputRecordResult:
-        """Validate the existing ten-field payload and retain its typed subset."""
+        """Validate the object_info payload and retain its typed subset.
+
+        앞 10필드는 고정 계약이고, 그 뒤는 추가 필드다. object_detection이
+        측면 LiDAR 거리(side_left, side_right)를 11·12번째로 붙였으므로
+        길이를 '정확히 10'이 아니라 '10 이상'으로 본다. 이 어댑터가 쓰는 것은
+        앞 10필드뿐이고, 추가 필드는 main_node가 직접 읽는다.
+        """
 
         try:
             values = list(data)
         except TypeError:
             values = []
-        if len(values) != 10:
-            return InputRecordResult(False, "object_info requires exactly 10 fields")
+        if len(values) < 10:
+            return InputRecordResult(False, "object_info requires at least 10 fields")
         if not self._valid_timestamp(received_at):
             return InputRecordResult(False, "invalid object_info receipt timestamp")
+
+        # 검증은 계약된 앞 10필드에만 적용한다. 뒤에 붙는 측면 LiDAR 거리는
+        # 옆에 아무것도 없으면 정당하게 inf라, 여기서 함께 검사하면 정상
+        # 메시지가 통째로 거부된다.
+        values = values[:10]
         if any(
             not isinstance(value, (int, float)) or isinstance(value, bool)
             for value in values

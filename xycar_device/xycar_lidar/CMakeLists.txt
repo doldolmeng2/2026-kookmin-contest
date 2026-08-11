@@ -78,7 +78,10 @@ install(TARGETS
     ${PROJECT_NAME}_node ${PROJECT_NAME}_client
     DESTINATION lib/${PROJECT_NAME})
 
-install(DIRECTORY launch params startup config
+# config 디렉터리는 이 패키지에 존재하지 않아 install 단계에서 빌드가 깨졌다.
+# launch/xycar_lidar.launch.py는 params/ydlidar.yaml을 쓰고, rviz 설정도
+# rviz/ 아래에 있어 config를 참조하는 곳이 없으므로 목록에서 제거한다.
+install(DIRECTORY launch params startup
     DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)

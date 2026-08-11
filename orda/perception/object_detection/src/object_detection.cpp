@@ -9,9 +9,11 @@
 //   /lane_fit      (std_msgs/Float32MultiArray [m,b]) - 차선 회귀 결과
 //
 // 발행:
-//   /object_info (std_msgs/Float32MultiArray, 10개 필드)
+//   /object_info (std_msgs/Float32MultiArray, 12개 필드)
 //   [exists, min_dist, angle, span, cluster_size,
-//    box_size, box_cx, box_cy, dx(cx-x_line), lane_label]
+//    box_size, box_cx, box_cy, dx(cx-x_line), lane_label,
+//    side_left, side_right]
+//   side_left/right: 좌/우 측면 최소 거리(m). 추월 완료 판정용. 없으면 inf.
 //
 // 디버그 창 (enable_gui=true 시):
 //   "OBJECT DEBUG" : exists / distance / cluster_size
@@ -25,6 +27,8 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
 #include <cv_bridge/cv_bridge.h>
+#include <fstream>
+#include <string>
 #include <mutex>
 #include <limits>
 #include <cmath>
@@ -46,16 +50,31 @@ public:
         range_max_m_        = this->declare_parameter<double>("range_max_m",          2.0);
         // DBSCAN 클러스터링 epsilon (m): 연속 포인트 간 최대 거리 차
         cluster_epsilon_m_  = this->declare_parameter<double>("cluster_epsilon_m",    0.20);
-        // 클러스터로 인정할 최소 포인트 수
-        min_cluster_points_ = this->declare_parameter<int>("min_cluster_points",      5);
+        // 클러스터로 인정할 최소 포인트 수.
+        // 5는 너무 빡빡했다. 1.5~2 m 앞의 차는 ±10도 창에 4~7점밖에 안 맺혀서
+        // 반사가 한두 개만 빠져도 클러스터가 통째로 탈락했다. bag 실측(전방에
+        // 차가 있는 구간)에서 검출률 32.4% → 89.7%, 최장 끊김 74스캔 → 18스캔.
+        // 앞차가 없는 주행 bag의 오검출은 8~11% → 11~20%로 소폭만 늘었다.
+        min_cluster_points_ = this->declare_parameter<int>("min_cluster_points",      3);
         // 장애물 존재로 판단할 최대 거리 (m)
         detect_threshold_m_ = this->declare_parameter<double>("detect_threshold_m",   6.0);
         // OpenCV imshow 디버그 창 활성화 여부
         enable_gui_         = this->declare_parameter<bool>("enable_gui",             true);
         // 박스 중심이 중앙선에서 ±lane_split_margin_px_ 이상 벗어나면 차선 레이블 부여
-        lane_split_margin_px_ = this->declare_parameter<double>("lane_split_margin_px", 6.0);
+        lane_split_margin_px_ = this->declare_parameter<double>("lane_split_margin_px", 10.0);
         // lane_fit이 프레임 좌표계면 true (BEV 좌표계면 false)
         lane_fit_is_frame_  = this->declare_parameter<bool>("lane_fit_is_frame",     true);
+        // YOLO 모델(.onnx) 경로. 빈 문자열이면 share 디렉터리를 탐색한다.
+        model_path_         = this->declare_parameter<std::string>("model_path",     "");
+
+        // ── 측면 감지 시야각 (추월 완료 판정용) ──────────────────────────
+        // LiDAR는 차 맨 앞에 달려 있고 차체가 뒤쪽을 가린다. 실측(bag의 각도별
+        // 프로파일)상 |각도| > 약 105도 구간은 자기 차체가 0.10~0.14 m로 잡히므로,
+        // 측면 섹터는 그 안쪽(60~100도)만 본다.
+        side_fov_min_deg_   = this->declare_parameter<double>("side_fov_min_deg",    60.0);
+        side_fov_max_deg_   = this->declare_parameter<double>("side_fov_max_deg",   100.0);
+        // 측면에서 이 거리보다 먼 것은 벽/빈 차선으로 보고 무시한다.
+        side_max_range_m_   = this->declare_parameter<double>("side_max_range_m",     1.5);
 
         // QoS 프로파일
         // - qos_fast: 수치 토픽용 Best Effort + Volatile
@@ -80,15 +99,27 @@ public:
         pub_obj_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/object_info", qos_fast);
 
         // ── YOLO 모델 초기화 ────────────────────────────────────────────
-        try {
-            net_ = cv::dnn::readNet(
-                "/home/xytron/xycar_ws/src/orda/perception/object_detection/best.onnx");
-            net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-            net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
-            yolo_ok_ = true;
-        } catch (const cv::Exception& e) {
-            RCLCPP_ERROR(this->get_logger(), "YOLO 로드 실패: %s", e.what());
+        // 모델 경로는 개발 PC / 실차 두 곳을 순서대로 확인한다 (resolveModelPath).
+        // 예전에는 실차 경로 하나만 박혀 있어서, 개발 PC에서 재생할 때 모델
+        // 로드가 조용히 실패하고 CAMERA VIEW에 박스가 전혀 안 그려졌다.
+        // 에러가 터미널이 아니라 노드 로그에만 남아 원인 파악이 어려웠다.
+        const std::string resolved = resolveModelPath();
+        if (resolved.empty()) {
+            RCLCPP_ERROR(this->get_logger(),
+                         "YOLO 모델(.onnx)을 찾지 못했습니다. "
+                         "model_path 파라미터로 경로를 직접 지정하세요.");
             yolo_ok_ = false;
+        } else {
+            try {
+                net_ = cv::dnn::readNet(resolved);
+                net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+                net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+                yolo_ok_ = true;
+                RCLCPP_INFO(this->get_logger(), "YOLO 로드 완료: %s", resolved.c_str());
+            } catch (const cv::Exception& e) {
+                RCLCPP_ERROR(this->get_logger(), "YOLO 로드 실패: %s", e.what());
+                yolo_ok_ = false;
+            }
         }
         conf_threshold_ = 0.83f;  // 신뢰도 임계값
         nms_threshold_  = 0.40f;  // NMS IoU 임계값
@@ -120,6 +151,48 @@ public:
 
 private:
     // ─────────────────────────────────────────────────────────────────────
+    // YOLO 모델 경로 결정
+    //
+    // 1) model_path 파라미터가 지정되면 그대로 사용
+    // 2) 없으면 아래 후보 경로를 순서대로 확인한다
+    // 읽을 수 있는 파일이 없으면 빈 문자열을 반환한다.
+    //
+    // ★ 새 PC에서 쓰려면 MODEL_PATH_CANDIDATES에 그 PC의 경로를 추가해야 한다.
+    //   임시로는 model_path 파라미터로 넘겨도 된다:
+    //   ros2 run object_detection object_node --ros-args -p model_path:=<경로>
+    // ─────────────────────────────────────────────────────────────────────
+    std::string resolveModelPath() {
+        // 소스 트리를 직접 가리키므로 모델을 교체하면 재빌드 없이 반영된다.
+        static const std::vector<std::string> MODEL_PATH_CANDIDATES = {
+            // 개발 PC
+            "/home/dxer1/2026-kookmin-contest/orda/perception/object_detection/best.onnx",
+            // 실차 (Xycar)
+            "/home/xytron/xycar_ws/src/orda/perception/object_detection/best.onnx",
+        };
+
+        auto readable = [](const std::string& p) {
+            if (p.empty()) return false;
+            std::ifstream f(p, std::ios::binary);
+            return f.good();
+        };
+
+        if (!model_path_.empty()) {
+            if (readable(model_path_)) return model_path_;
+            RCLCPP_ERROR(this->get_logger(),
+                         "model_path로 지정된 파일을 열 수 없습니다: %s",
+                         model_path_.c_str());
+            return "";
+        }
+
+        for (const auto& candidate : MODEL_PATH_CANDIDATES)
+            if (readable(candidate)) return candidate;
+
+        for (const auto& candidate : MODEL_PATH_CANDIDATES)
+            RCLCPP_ERROR(this->get_logger(), "  후보 경로 없음: %s", candidate.c_str());
+        return "";
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // 차선 회귀 파라미터 수신 콜백
     // /lane_fit [m, b] 를 수신하여 뮤텍스로 보호된 멤버에 저장한다.
     // ─────────────────────────────────────────────────────────────────────
@@ -143,6 +216,11 @@ private:
             publishEmpty();
             return;
         }
+
+        // 측면 최소 거리는 전방 클러스터링과 독립적으로 매 스캔 갱신한다.
+        // 아래 전방 처리에는 유효 포인트가 없으면 조기 반환하는 경로가 여럿
+        // 있는데, 측면 값까지 같이 끊기면 추월 완료 판정이 흔들린다.
+        updateSideRanges(*msg);
 
         const double fov_rad = front_fov_deg_ * M_PI / 180.0;
         const double ang_lo  = -fov_rad;
@@ -246,6 +324,43 @@ private:
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // 좌/우 측면 최소 거리 계산
+    //
+    // 추월 중 옆으로 지나가는 방해차량을 잡기 위한 값이다. 초음파가 담당하던
+    // 역할인데, 초음파는 차 중간에 달려 있어 "이미 절반쯤 지나간" 시점에
+    // 반응하는 반면 LiDAR는 차 맨 앞이라 훨씬 이르게 반응한다. 그 차이는
+    // main_node 쪽에서 시간 지연으로 보정한다.
+    // ─────────────────────────────────────────────────────────────────────
+    void updateSideRanges(const sensor_msgs::msg::LaserScan& msg) {
+        const int N = static_cast<int>(msg.ranges.size());
+        float left  = std::numeric_limits<float>::infinity();
+        float right = std::numeric_limits<float>::infinity();
+
+        for (int i = 0; i < N; ++i) {
+            const float r = msg.ranges[i];
+            if (!std::isfinite(r)) continue;
+            if (r < msg.range_min || r > msg.range_max) continue;
+            if (r > side_max_range_m_) continue;
+
+            // 각도를 -180~180도로 정규화 (0도 = 전방, + = 좌, - = 우)
+            double deg = (msg.angle_min + i * msg.angle_increment) * 180.0 / M_PI;
+            deg = std::fmod(deg + 180.0, 360.0);
+            if (deg < 0.0) deg += 360.0;
+            deg -= 180.0;
+
+            const double mag = std::fabs(deg);
+            if (mag < side_fov_min_deg_ || mag > side_fov_max_deg_) continue;
+
+            if (deg > 0.0) { if (r < left)  left  = r; }
+            else           { if (r < right) right = r; }
+        }
+
+        std::lock_guard<std::mutex> lk(mtx_state_);
+        st_side_left_  = left;
+        st_side_right_ = right;
+    }
+
     // LiDAR 상태 초기화
     void resetLidarState() {
         std::lock_guard<std::mutex> lk(mtx_state_);
@@ -282,6 +397,7 @@ private:
         float cx, cy, dx;
         int   lane_label;
 
+        float side_l, side_r;
         {
             std::lock_guard<std::mutex> lk(mtx_state_);
             lidar_ok = lidar_valid_;
@@ -289,6 +405,8 @@ private:
             ang      = st_min_r_ang_;
             spn      = st_span_;
             cnt      = st_count_;
+            side_l   = st_side_left_;
+            side_r   = st_side_right_;
         }
         {
             std::lock_guard<std::mutex> lk(mtx_box_);
@@ -303,10 +421,13 @@ private:
 
         // /object_info 필드:
         // [exists, min_dist, angle, span, cluster_size,
-        //  box_size, box_cx, box_cy, dx, lane_label]
+        //  box_size, box_cx, box_cy, dx, lane_label,
+        //  side_left, side_right]
+        // side_left/right: 좌/우 측면 최소 거리(m). 없으면 inf.
         std_msgs::msg::Float32MultiArray out;
         out.data = { exists, minr, ang, spn, static_cast<float>(cnt),
-                     box_area, cx, cy, dx, static_cast<float>(lane_label) };
+                     box_area, cx, cy, dx, static_cast<float>(lane_label),
+                     side_l, side_r };
         pub_obj_->publish(out);
 
         // 디버그 패널 갱신
@@ -414,10 +535,23 @@ private:
                     cv::dnn::NMSBoxes(boxes, confs, conf_threshold_, nms_threshold_, keep);
 
                     if (!keep.empty()) {
-                        // 신뢰도 가장 높은 박스 선택
+                        // 가장 '가까운'(=박스 면적이 가장 큰) 장애물을 선택한다.
+                        //
+                        // 예전에는 신뢰도가 가장 높은 박스를 골랐는데, 차선마다
+                        // 방해차량이 있어 두 대가 동시에 잡히면 신뢰도가 엎치락뒤치락
+                        // 하면서 프레임마다 다른 차가 선택되고, 그 결과 lane_label
+                        // (=car_lane)이 L1/L2 사이를 계속 뒤집혔다. 게다가 정작
+                        // 충돌 위험이 있는 건 '가장 가까운' 차인데 멀리 있는 차의
+                        // 차선을 판정해 버리는 문제도 있었다.
+                        // box_area 는 이미 접근도 지표로 쓰이므로(box_size > 1900
+                        // 트리거) 면적 기준 선택이 나머지 로직과도 일관된다.
+                        auto area_of = [&](int i) {
+                            return static_cast<long>(boxes[i].width) *
+                                   static_cast<long>(boxes[i].height);
+                        };
                         int best = keep[0];
                         for (int idx : keep)
-                            if (confs[idx] > confs[best]) best = idx;
+                            if (area_of(idx) > area_of(best)) best = idx;
 
                         best_box = boxes[best];
                         box_area = static_cast<float>(best_box.width) *
@@ -553,6 +687,8 @@ private:
     bool   enable_gui_;
     double lane_split_margin_px_;
     bool   lane_fit_is_frame_;
+    double side_fov_min_deg_, side_fov_max_deg_, side_max_range_m_;
+    std::string model_path_;
 
     // ── ROS 통신 객체 ───────────────────────────────────────────────────
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr       sub_scan_;
@@ -601,6 +737,8 @@ private:
     float st_min_r_ang_ = 0.0f;
     float st_span_      = 0.0f;
     int   st_count_     = 0;
+    float st_side_left_  = std::numeric_limits<float>::infinity();
+    float st_side_right_ = std::numeric_limits<float>::infinity();
 };
 
 
