@@ -287,21 +287,21 @@ class RaceFSM:
             self._cone_entry.deactivate()
             self._lane_validity.deactivate()
             if (
-                observation.fixed_zone_exited is True
+                observation.fixed_avoid_complete is True
                 and self._accept_mission_edge(
-                    "fixed_zone_exit",
-                    observation.fixed_zone_exit_received_at,
+                    "fixed_avoid_complete",
+                    observation.fixed_avoid_completed_at,
                     observation,
                     context,
                 )
             ):
                 return self._change(
                     Mode.OVERTAKE,
-                    "fresh fixed-zone exit",
+                    "fresh fixed avoid complete",
                     context,
                     observation.now,
                 )
-            return self._stay("waiting for fresh fixed-zone exit")
+            return self._stay("waiting for fresh fixed avoid complete")
 
         if self.state is Mode.OVERTAKE:
             self._cone_entry.deactivate()

@@ -206,7 +206,7 @@ def test_second_normal_cone_session_dispatches_one_new_reset():
     assert first_rejoin.transition.target is Mode.FIXED_AVOID
     assert first_rejoin.control.source is ControlSource.STOP
 
-    adapter.record_fixed_zone_exit(1.6)
+    adapter.record_fixed_avoid_complete(1.6)
     assert adapter.step(1.6).transition.target is Mode.OVERTAKE
     adapter.record_overtake_complete(1.7)
     assert adapter.step(1.7).transition.target is Mode.LANE_DRIVE

@@ -307,7 +307,7 @@ def test_lane_change_feedback_uses_existing_topic_without_new_mission_topics():
     source = inspect.getsource(MainNode.__init__)
 
     assert "LANE_CHANGE_STATE_TOPIC" in source
-    assert "fixed_zone" not in source
+    assert "fixed_avoid_complete" not in source
     assert "overtake_complete" not in source
     assert "shortcut_complete" not in source
 

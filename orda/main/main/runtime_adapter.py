@@ -223,8 +223,7 @@ class RaceRuntimeAdapter:
         self._lane_change_events: Deque[LaneChangeStateEvent] = deque()
         self._route_traffic_events: Deque[RouteTrafficEvent] = deque()
         self._mission_events: dict[str, Deque[MissionEdgeEvent]] = {
-            "fixed_zone_entry": deque(),
-            "fixed_zone_exit": deque(),
+            "fixed_avoid_complete": deque(),
             "overtake_complete": deque(),
             "shortcut_complete": deque(),
         }
@@ -441,11 +440,11 @@ class RaceRuntimeAdapter:
         )
         return InputRecordResult(True)
 
-    def record_fixed_zone_entry(self, received_at: float) -> InputRecordResult:
-        return self._record_mission_edge("fixed_zone_entry", received_at)
-
-    def record_fixed_zone_exit(self, received_at: float) -> InputRecordResult:
-        return self._record_mission_edge("fixed_zone_exit", received_at)
+    def record_fixed_avoid_complete(
+        self,
+        received_at: float,
+    ) -> InputRecordResult:
+        return self._record_mission_edge("fixed_avoid_complete", received_at)
 
     def record_overtake_complete(self, received_at: float) -> InputRecordResult:
         return self._record_mission_edge("overtake_complete", received_at)
@@ -458,6 +457,8 @@ class RaceRuntimeAdapter:
         name: str,
         received_at: float,
     ) -> InputRecordResult:
+        """Record a one-shot completion event, never a sticky boolean level."""
+
         if not self._valid_timestamp(received_at):
             return InputRecordResult(False, f"invalid {name} timestamp")
         previous = self._last_internal_event_at.get(name)
@@ -655,16 +656,12 @@ class RaceRuntimeAdapter:
                 if lane_change_event is not None
                 else None
             ),
-            fixed_zone_entered=mission_events["fixed_zone_entry"] is not None,
-            fixed_zone_entry_received_at=(
-                mission_events["fixed_zone_entry"].received_at
-                if mission_events["fixed_zone_entry"] is not None
-                else None
+            fixed_avoid_complete=(
+                mission_events["fixed_avoid_complete"] is not None
             ),
-            fixed_zone_exited=mission_events["fixed_zone_exit"] is not None,
-            fixed_zone_exit_received_at=(
-                mission_events["fixed_zone_exit"].received_at
-                if mission_events["fixed_zone_exit"] is not None
+            fixed_avoid_completed_at=(
+                mission_events["fixed_avoid_complete"].received_at
+                if mission_events["fixed_avoid_complete"] is not None
                 else None
             ),
             overtake_complete=mission_events["overtake_complete"] is not None,

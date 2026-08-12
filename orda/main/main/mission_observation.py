@@ -41,10 +41,8 @@ class MissionObservation:
     lane_change_success: bool = False
     lane_change_success_edge: bool = False
     lane_change_received_at: Optional[float] = None
-    fixed_zone_entered: bool = False
-    fixed_zone_entry_received_at: Optional[float] = None
-    fixed_zone_exited: bool = False
-    fixed_zone_exit_received_at: Optional[float] = None
+    fixed_avoid_complete: bool = False
+    fixed_avoid_completed_at: Optional[float] = None
     route_traffic_signal: RouteTrafficSignal = RouteTrafficSignal.UNKNOWN
     route_traffic_received_at: Optional[float] = None
     traffic_encounter_started: bool = False

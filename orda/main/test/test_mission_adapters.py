@@ -305,26 +305,42 @@ def test_stale_lane_command_is_zero_even_when_fixed_action_is_authorized():
     assert cycle.control.source is ControlSource.STOP
 
 
-def test_retained_fixed_zone_entry_seam_no_longer_changes_lane_drive():
-    runtime = adapter(Mode.LANE_DRIVE)
-
-    runtime.record_fixed_zone_entry(1.1)
-    ignored = runtime.step(1.1, lane=candidate(1.1))
-
-    assert ignored.transition.changed is False
-    assert runtime.fsm.state is Mode.LANE_DRIVE
-
-
 def test_internal_completion_seams_drive_only_the_declared_chain():
     runtime = adapter(Mode.FIXED_AVOID)
 
-    runtime.record_fixed_zone_exit(1.2)
+    runtime.record_fixed_avoid_complete(1.2)
     overtake = runtime.step(1.2, lane=candidate(1.2))
     runtime.record_overtake_complete(1.3)
     lane = runtime.step(1.3, lane=candidate(1.3))
 
     assert overtake.transition.target is Mode.OVERTAKE
     assert lane.transition.target is Mode.LANE_DRIVE
+
+
+@pytest.mark.parametrize(
+    ("record_method", "mission_state"),
+    [
+        ("record_fixed_avoid_complete", Mode.FIXED_AVOID),
+        ("record_overtake_complete", Mode.OVERTAKE),
+        ("record_shortcut_complete", Mode.SHORTCUT),
+    ],
+)
+def test_wrong_state_completion_is_discarded_before_next_session(
+    record_method,
+    mission_state,
+):
+    runtime = adapter(Mode.LANE_DRIVE)
+
+    getattr(runtime, record_method)(1.1)
+    ignored = runtime.step(1.1, lane=candidate(1.1))
+    assert ignored.transition.changed is False
+
+    runtime.fsm.state = mission_state
+    runtime.context.state_entered_at = 1.2
+    next_session = runtime.step(1.3, lane=candidate(1.3))
+
+    assert next_session.transition.changed is False
+    assert runtime.fsm.state is mission_state
 
 
 def test_bool_start_traffic_is_never_reinterpreted_as_route_or_lap_event():
