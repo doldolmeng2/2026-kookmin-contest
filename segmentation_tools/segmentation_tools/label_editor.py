@@ -13,6 +13,7 @@ WINDOW = 'Segmentation label editor'
 class LabelEditor:
     def __init__(self, dataset, split='train', config=None):
         self.root = Path(dataset).expanduser().resolve()
+        self.split = split
         list_path = self.root / 'lists' / f'{split}.lst'
         if not list_path.exists():
             raise FileNotFoundError(f'목록 파일 없음: {list_path}')
@@ -48,10 +49,15 @@ class LabelEditor:
         self.undo_stack.clear()
 
     def save(self):
-        label_path = self.items[self.index][1]
+        image_path, label_path = self.items[self.index]
         label_path.parent.mkdir(parents=True, exist_ok=True)
         if not cv2.imwrite(str(label_path), self.label):
             raise OSError(f'저장 실패: {label_path}')
+        preview_path = self.root / 'previews' / self.split / f'{image_path.stem}.jpg'
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        preview = overlay(self.image, self.label, self.config, 0.5)
+        if not cv2.imwrite(str(preview_path), preview):
+            raise OSError(f'미리보기 저장 실패: {preview_path}')
 
     def navigate(self, delta, save=True):
         if save:
@@ -63,6 +69,10 @@ class LabelEditor:
         self.undo_stack.append(self.label.copy())
         if len(self.undo_stack) > 20:
             self.undo_stack.pop(0)
+
+    def undo(self):
+        if self.undo_stack:
+            self.label = self.undo_stack.pop()
 
     def apply_component(self, x, y):
         old_class = int(self.label[y, x])
@@ -130,8 +140,8 @@ class LabelEditor:
                 self.class_id = key - ord('0')
             elif key == ord('e'):
                 self.class_id = 0
-            elif key == ord('z') and self.undo_stack:
-                self.label = self.undo_stack.pop()
+            elif key in (ord('z'), ord('Z')):
+                self.undo()
             elif key == ord('x'):
                 self.show_overlay = not self.show_overlay
             elif key == ord('-'):
