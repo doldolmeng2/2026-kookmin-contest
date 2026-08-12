@@ -21,13 +21,22 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    # ── 런치 인수: main_node 초기 모드 ──────────────────────────────────────
+    # ── 런치 인수: main_node 초기 모드 / mission test entry ────────────────
     mode_arg = DeclareLaunchArgument(
         'mode',
         default_value='0',
         description='main_node 초기 주행 모드 (0=TRAFFIC_WAIT)'
     )
     mode = LaunchConfiguration('mode')
+    test_profile_arg = DeclareLaunchArgument(
+        'test_profile',
+        default_value='race',
+        description=(
+            '격리된 bag-test 시작 구간 '
+            '(race|lane|cone|rejoin|fixed|overtake|shortcut)'
+        )
+    )
+    test_profile = LaunchConfiguration('test_profile')
     show_debug_arg = DeclareLaunchArgument(
         'show_debug',
         default_value='false',
@@ -113,7 +122,11 @@ def generate_launch_description():
         executable='main_node',
         name='main_node',
         output='screen',
-        parameters=[{'mode': mode, 'show_debug': show_debug}],
+        parameters=[{
+            'mode': mode,
+            'test_profile': test_profile,
+            'show_debug': show_debug,
+        }],
         remappings=[('xycar_motor', '/bag_test/xycar_motor')],
     )
     traffic_node = Node(
@@ -164,6 +177,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         mode_arg,
+        test_profile_arg,
         show_debug_arg,
         rubbercone_offset_filter_alpha_arg,
         rubbercone_end_missing_frames_arg,

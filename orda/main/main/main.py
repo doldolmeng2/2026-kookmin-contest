@@ -28,8 +28,10 @@ from main.mission_types import RouteTrafficSignal
 from main.mode_info import mode_info_data
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
+    MissionTestProfile,
     RaceRuntimeAdapter,
     dispatch_cone_reset,
+    parse_test_profile,
     runtime_safety_monitor,
 )
 
@@ -114,7 +116,11 @@ class MainNode(Node):
         super().__init__("main_node", context=context)
 
         self.declare_parameter("mode", 0)
+        self.declare_parameter("test_profile", MissionTestProfile.RACE.value)
         self.declare_parameter("show_debug", False)
+        test_profile = parse_test_profile(
+            self.get_parameter("test_profile").value
+        )
         initial_mode = parse_initial_mode(self.get_parameter("mode").value)
         self.show_debug = bool(self.get_parameter("show_debug").value)
 
@@ -122,6 +128,11 @@ class MainNode(Node):
             fsm=RaceFSM(initial_state=initial_mode),
             safety_monitor=runtime_safety_monitor(),
         )
+        if test_profile is not MissionTestProfile.RACE:
+            self.runtime.bootstrap_test_profile(
+                test_profile,
+                self._now_seconds(),
+            )
         self.lane_controller = Controller()
         self.cone_controller = Controller()
 

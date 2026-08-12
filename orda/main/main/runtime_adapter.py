@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 import math
 from typing import Any, Callable, Deque, Optional, Sequence
 
@@ -45,6 +46,41 @@ _MOTION_MODES = frozenset(
         Mode.SHORTCUT,
     }
 )
+
+
+class MissionTestProfile(str, Enum):
+    """Named bag-test entry points backed by existing production Modes."""
+
+    RACE = "race"
+    LANE = "lane"
+    CONE = "cone"
+    REJOIN = "rejoin"
+    FIXED = "fixed"
+    OVERTAKE = "overtake"
+    SHORTCUT = "shortcut"
+
+
+_TEST_PROFILE_MODES = {
+    MissionTestProfile.LANE: Mode.LANE_DRIVE,
+    MissionTestProfile.CONE: Mode.CONE_DRIVE,
+    MissionTestProfile.REJOIN: Mode.REJOIN,
+    MissionTestProfile.FIXED: Mode.FIXED_AVOID,
+    MissionTestProfile.OVERTAKE: Mode.OVERTAKE,
+    MissionTestProfile.SHORTCUT: Mode.SHORTCUT,
+}
+
+
+def parse_test_profile(value: Any) -> MissionTestProfile:
+    """Parse a named test profile without accepting integer Mode aliases."""
+
+    if isinstance(value, MissionTestProfile):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"invalid mission test profile: {value!r}")
+    try:
+        return MissionTestProfile(value.strip().lower())
+    except ValueError as exc:
+        raise ValueError(f"unknown mission test profile: {value}") from exc
 
 
 @dataclass(frozen=True)
@@ -238,6 +274,63 @@ class RaceRuntimeAdapter:
         self.latest_cone_event: Optional[ConeMessageEvent] = None
         self.latest_object_snapshot: Optional[ObjectSnapshot] = None
         self._last_lane_change_received_at: Optional[float] = None
+        self._lane_change_success_active = False
+        self.traffic_stop_override = False
+        self.lane_action = LaneActionStatus()
+
+    def bootstrap_test_profile(
+        self,
+        profile: MissionTestProfile | str,
+        started_at: float,
+    ) -> None:
+        """Start one bag-test session without changing RaceFSM transitions.
+
+        ``race`` is deliberately a no-op so the production initialization
+        path remains identical. Other profiles replace the FSM and context as
+        one fresh session and discard every pending or cached input edge.
+        """
+
+        typed_profile = parse_test_profile(profile)
+        if typed_profile is MissionTestProfile.RACE:
+            return
+        if not self._valid_timestamp(started_at):
+            raise ValueError("test profile start timestamp must be finite")
+
+        initial_mode = _TEST_PROFILE_MODES[typed_profile]
+        self.fsm = RaceFSM(
+            initial_state=initial_mode,
+            mission_event_max_age_s=self.fsm.mission_event_max_age_s,
+            cone_entry_config=self.fsm.cone_entry_config,
+            lane_validity_config=self.fsm.lane_validity_guard.config,
+        )
+        context_kwargs = {}
+        if typed_profile is MissionTestProfile.CONE:
+            context_kwargs["cone_entered_at"] = float(started_at)
+        elif typed_profile is MissionTestProfile.SHORTCUT:
+            context_kwargs.update(completed_laps=1, shortcut_lap=2)
+        self.context = RaceContext(
+            state_entered_at=float(started_at),
+            **context_kwargs,
+        )
+
+        self._cone_events.clear()
+        self._lane_validity_events.clear()
+        self._traffic_events.clear()
+        self._lane_change_events.clear()
+        self._route_traffic_events.clear()
+        for queue in self._mission_events.values():
+            queue.clear()
+        self._last_internal_event_at.clear()
+        self.cone_queue_overflow_count = 0
+
+        self.sensor_received_at.clear()
+        self.perception_received_at.clear()
+        self.green_detected = False
+        self.latest_lane_offset = None
+        self.latest_lane_received_at = None
+        self.latest_cone_event = None
+        self.latest_object_snapshot = None
+        self._last_lane_change_received_at = None
         self._lane_change_success_active = False
         self.traffic_stop_override = False
         self.lane_action = LaneActionStatus()
