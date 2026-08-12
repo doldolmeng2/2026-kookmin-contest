@@ -210,6 +210,23 @@ main/main/
 > `Int32MultiArray` 의 인덱스 의미는 이 문서뿐 아니라 **코드 내 상수로도 정의한다.**
 > 문서에만 존재하는 인덱스 규약은 배선 실수의 주된 원인이 된다.
 
+#### 고정장애물 YOLO 모델 (`best.onnx`)
+
+고정장애물(빨간 차량)을 검출하도록 재학습했다. 학습 데이터는 `rosbag2_fixed_obstacles_*`
+6개에서 뽑은 658장(박스 463개 + 차량이 없는 프레임 200장)이다. 차량이 없는 프레임의
+빈 라벨은 배경 오검출을 줄이는 negative 샘플이므로 반드시 포함한다.
+
+- 단일 클래스 `obstacle_car`, 입력 640 고정 → 출력 `(1, 5, 8400)`
+  **C++ 후처리가 이 형태를 하드코딩하므로 클래스를 늘리면 같이 고쳐야 한다.**
+- 검증 성능 mAP50 0.995 / precision 0.999 / recall 1.000
+- 전처리는 **레터박스**(비율 유지 + 회색 114 패딩)를 쓴다. 640×360 원본을 640×640으로
+  늘리면 세로가 1.78배 왜곡되는데 YOLOv8 은 레터박스로 학습되므로 어긋난다.
+  검증용 bag 기준 conf ≥ 0.5 검출률이 82.3% → 98.1% 로 올랐다.
+- `conf_threshold_ = 0.50`. 검출 가능한 프레임의 99%를 잡고, 차량이 없는 프레임의
+  오검출은 conf 0.05 에서도 0이었다.
+
+재학습 절차와 도구는 `object_detection/tools/TRAINING.md` 에 있다.
+
 #### 정지 신호(`1`) 오검출 주의
 
 `/traffic_detection == 1` 은 **주행 중에도 즉시 정지**를 유발하므로 오검출 비용이 가장 크다.
@@ -255,6 +272,38 @@ main/main/
 `main_node` 가 `/mode_info` 의 `lane_target` 으로 목표를 지시하고,
 `lane_node` 가 `/lane_change_state` 로 이동 진행·완료를 보고한다.
 
+#### 센서 역할 분담 (고정장애물 구간)
+
+| 판단 | 사용 센서 | 근거 |
+|---|---|---|
+| 구간 진입 | 카메라 (`box_size` > 1900px²) | — |
+| 회피 방향 | 카메라 (`car_lane`) | 아래 참조 |
+| 추월 완료 | 측면 LiDAR (`side_left`/`side_right`) | 옆을 지나간 사실은 카메라로 볼 수 없다 |
+
+회피 방향은 예전에 LiDAR 기반 `exists` 를 먼저 요구했다. 구간 진입은 카메라로 하면서
+방향 결정만 LiDAR에 걸어둔 비대칭이라, 카메라가 방해차량을 또렷이 보는데도 회피가
+시작되지 않았다. `rosbag2_fixed_obstacles_overtake_1` 실측에서 방해차량이 대부분 2 m
+밖이라 `range_max_m`(2.0)에 걸려 전방 클러스터가 103 스캔 중 1번만 형성됐고,
+`exists` 가 1810 샘플 내내 0이었다. 같은 구간에서 카메라는 박스 최대 10,549 px²,
+`car_lane=1` 을 안정적으로 냈다. 지금은 카메라 산출물(`box_size`, `car_lane`)만으로
+방향을 정한다.
+
+박스는 있는데 좌/우가 미확정(`car_lane=0`)이면 방향을 정할 수 없으므로 인가하지 않는다
+(정지). 박스가 없으면 회피해 들어간 차선을 그대로 유지한다.
+
+**추월 완료 판정** (`main/overtake.py`)
+
+- 회피로 옮겨간 차선의 **반대편**만 감시한다 (1차선 주행 → 오른쪽, 2차선 주행 → 왼쪽).
+  기준은 실측 차선(`/lane_position`) 우선, 미확정이면 `lane_target` 으로 폴백.
+- 측면 60~100° 섹터의 최소 거리가 `side_detect_m`(0.40 m) 미만이면 "옆을 지나갔다"로
+  보고, 그 시점부터 `pass_delay_s`(2.0초) 뒤에 완료로 확정한다. LiDAR가 차 맨 앞에
+  있어 인식 시점엔 앞범퍼만 나란한 상태이기 때문이다.
+- 방해차량을 못 만난 바퀴를 위해 `zone_timeout_s`(12초) 상한을 둔다.
+
+`side_detect_m` 은 고정장애물 bag 6개 실측으로 정했다. 통과 순간 감시 측면의 최소거리가
+**0.26~0.34 m**, 벽·빈 차선은 **0.60 m 이상**이다. 0.60 이었을 때는 구간 진입 1초 만에
+0.59 m로 걸려 회피 차선 변경이 끝나기 전에 완료 카운트다운이 시작됐다.
+
 > ⚠️ 방해차량은 **1차선과 2차선을 오가며 주행한다**(규정 p.32). `car_lane` 은 한 번 읽고
 > 마는 값이 아니라 추월 직전까지 계속 갱신해야 하며, 접근 중에 방해차량이 차선을 바꾸면
 > 추월 방향도 다시 결정해야 한다.
@@ -291,6 +340,7 @@ REJOIN      ─(fresh 차선 유효성)▶ LANE_DRIVE               [lane_target
 [고정장애물 — 구현됨]
 LANE_DRIVE ─(YOLO 박스 ≥ 1900px²)──────▶ FIXED_AVOID
 FIXED_AVOID ─(측면 LiDAR 추월 확인)─────▶ LANE_DRIVE
+   진입·회피 방향 = 카메라(YOLO) / 추월 완료 확인 = 측면 LiDAR
 
 [방해차량 — 이후 구현]
 ? ─────────────────────────────────────▶ OVERTAKE ─(추월 완료)─▶ LANE_DRIVE
@@ -372,11 +422,49 @@ ros2 launch manual_drive manual_drive.launch.py
 ros2 launch manual_drive ordabag.launch.py
 ```
 
+### 고정장애물 회피만 단독으로 검증 (실차 벤치)
+
+`rubbercone_node` 오검출로 `CONE_DRIVE` 에 새는 것을 피하려면 필요한 노드만 띄운다.
+대회 실행 명령은 위의 `ros2 launch` 형태를 쓰고, 아래는 **개발 검증용**이다.
+터미널마다 `source install/setup.bash` 를 먼저 실행한다.
+
+```bash
+ros2 launch xycar_cam xycar_cam.launch.py        # /image_raw
+ros2 launch xycar_lidar xycar_lidar.launch.py    # /scan
+ros2 run image_resize resize_node                # /resized_image
+ros2 run lane_detection lane_node                # /lane_offset, /lane_fit, /lane_position
+ros2 run object_detection object_node            # /object_info
+ros2 run main main_node --ros-args -p mode:=3 -p show_debug:=true
+```
+
+`traffic_node` 는 `mode:=3`(`LANE_DRIVE` 시작)에서 요구 입력이 아니므로 뺀다.
+`mode:=0` 으로 시작하면 `/traffic_detection` 이 없어 즉시 STOP 이 된다.
+`joy_node` 는 `main_node` 가 `/joy` 를 구독하지 않아 불필요하다.
+
+`object_node` 기동 직후 `YOLO 로드 완료: ...` 로그가 뜨는지 확인한다. 안 뜨면 모델
+경로를 못 찾은 것이고, 박스가 안 나와 회피가 시작되지 않는다.
+그럴 때는 `-p model_path:=<경로>` 로 직접 지정한다.
+
+`show_debug:=true` 의 Status 창에는 전방 거리(`Object dist`) 아래에 측면 LiDAR
+거리(`Side L/R`)가 표시된다. 추월 완료 판정이 이 값으로 이뤄지므로, 회피 중 감시
+측면 값이 `side_detect_m`(0.40 m) 아래로 내려가는 시점을 눈으로 확인할 수 있다.
+해당 섹터에 유효 반사가 없으면 `N/A` 로 표시된다.
+
 ### 단위 테스트 / 오프라인 검증
 
 ```bash
 colcon test --packages-select main
 python3 -m main.tools.replay_fsm_bag <bag_path>
+```
+
+`object_detection/tools/` 에 YOLO 재학습 파이프라인이 있다. 절차는
+`object_detection/tools/TRAINING.md` 참조.
+
+```bash
+# 노드와 동일한 전처리로 모델의 프레임별 신뢰도 분포를 측정
+g++ -O2 -std=c++17 measure_conf.cpp -o /tmp/measure_conf \
+    -I/usr/local/include/opencv4 -L/usr/local/lib -Wl,-rpath,/usr/local/lib \
+    -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_dnn
 ```
 
 ---
@@ -388,7 +476,7 @@ python3 -m main.tools.replay_fsm_bag <bag_path>
 | `image_resize` | 유지 | 카메라 동일, 변경 없음 |
 | `lane_detection` | 유지 | 코스 동일. `lane_detection_parameter.json` 그대로 사용 |
 | `rubbercone` | 수정중 | 라바콘 시작 지점 다름 |
-| `object_detection` | 수정 | YOLO 모델(`best.onnx`) 유지, `is_moving` 분류 추가 |
+| `object_detection` | 수정 | 고정장애물(빨간 차량) YOLO 모델 **재학습**, 레터박스 전처리, `is_moving` 분류 추가 |
 | `traffic_light` | 재작성 | 초록 Bool → 4구 신호등 4상태 |
 | `main/main.py` | 재작성 | 옛 정수 FSM 폐기, 순수 모듈 계층 배선으로 교체 |
 | `main` 로직 모듈 | 진행 중 | FSM 전이 일부 미구현 (아래 참조) |
@@ -404,7 +492,11 @@ python3 -m main.tools.replay_fsm_bag <bag_path>
   이는 2026-07-29 「제9회 경주 진행 방법」 p.25와 p.37의 공식 제한이다. 전체 주행시간은
   p.17에 따라 파란불의 첫 fresh 관측 시각부터 계산하며, debounce 완료 시각으로 늦추지 않는다.
 - `STOP` 이 종료 상태로만 정의되어 있어, 복귀 가능한 감속 정책 필요
-- YOLO 모델이 고정장애물(고장난 차량)까지 검출하는지 미확인 —
-  미검출 시 LiDAR 클러스터 보완 또는 재학습 필요
+- **`rubbercone_node` 가 라바콘이 없는 구간에서 벽·장비를 콘으로 오인한다.**
+  고정장애물 bag 실측에서 `confidence ≥ 75` 가 7회, 그중 5회 연속으로 나와
+  진입 조건(75 이상 3회 연속, 0.2초)을 통과했고 FSM 이 `LANE_DRIVE → CONE_DRIVE`
+  로 새버렸다. `cone_entry.py` 주석대로 네거티브 bag 으로 임계값 재검증이 필요하다.
+  고정장애물 bag 6개가 그 네거티브 데이터가 된다. 그때까지 고정장애물 시나리오를
+  검증할 때는 `rubbercone_node` 를 띄우지 않는다 (아래 실행 방법 참조).
 
 ---

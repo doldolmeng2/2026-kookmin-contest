@@ -19,8 +19,10 @@ def candidate(received_at, angle=2.0, speed=6.0):
     return CommandCandidate(DriveCommand(angle, speed), received_at)
 
 
-def object_message(*, exists=1.0, distance=1.2, lane=1.0):
-    return [exists, distance, 0.1, 0.2, 5.0, 100.0, 20.0, 30.0, 4.0, lane]
+def object_message(*, exists=1.0, distance=1.2, lane=1.0, box=100.0):
+    # box(=index 5)는 YOLO 박스 면적이다. exists/distance 는 LiDAR 산출물이고,
+    # 회피 방향 판단은 box 와 lane 만 본다.
+    return [exists, distance, 0.1, 0.2, 5.0, box, 20.0, 30.0, 4.0, lane]
 
 
 def no_cluster_message():
@@ -297,8 +299,10 @@ def test_pre_action_success_is_consumed_and_cannot_complete_later_action():
 
 def test_stale_lane_command_is_zero_even_when_fixed_action_is_authorized():
     runtime = adapter(Mode.FIXED_AVOID)
+    # 카메라가 방해차량을 못 보는 프레임(box=0). 회피한 차선을 그대로 유지하므로
+    # 구간 자체는 인가된 상태다.
     runtime.record_object_info(
-        object_message(exists=0.0, lane=ObjectLane.UNKNOWN.value),
+        object_message(exists=0.0, lane=ObjectLane.UNKNOWN.value, box=0.0),
         1.1,
     )
 
@@ -306,6 +310,54 @@ def test_stale_lane_command_is_zero_even_when_fixed_action_is_authorized():
 
     assert runtime.lane_action.safe_to_drive is True
     assert cycle.control.source is ControlSource.STOP
+
+
+def test_camera_alone_decides_avoid_direction_without_lidar():
+    """LiDAR가 전방 클러스터를 못 만들어도 YOLO 차선만으로 회피 방향을 정한다.
+
+    rosbag2_fixed_obstacles_overtake_1 에서 방해차량이 대부분 2 m 밖이라
+    exists 가 끝까지 0이었는데, 그때 lane_target 이 CENTER 에서 움직이지 않아
+    차선 변경 명령이 나가지 않았다.
+    """
+
+    runtime = adapter(Mode.FIXED_AVOID)
+    runtime.record_object_info(
+        object_message(
+            exists=0.0,
+            distance=math.inf,
+            lane=ObjectLane.LEFT.value,
+            box=10549.0,
+        ),
+        1.1,
+    )
+
+    runtime.step(1.1, lane=candidate(1.1))
+
+    assert runtime.context.lane_target is LaneTarget.LANE_TWO
+    assert runtime.lane_action.target is LaneTarget.LANE_TWO
+    assert runtime.lane_action.pending is True
+    assert runtime.lane_action.safe_to_drive is True
+
+
+def test_camera_box_without_lane_label_does_not_authorize_action():
+    """박스는 있는데 좌/우가 미확정이면 방향을 못 정하므로 인가하지 않는다."""
+
+    runtime = adapter(Mode.FIXED_AVOID)
+    runtime.record_object_info(
+        object_message(
+            exists=0.0,
+            distance=math.inf,
+            lane=ObjectLane.UNKNOWN.value,
+            box=2000.0,
+        ),
+        1.1,
+    )
+
+    runtime.step(1.1, lane=candidate(1.1))
+
+    assert runtime.context.lane_target is LaneTarget.CENTER
+    assert runtime.lane_action.pending is False
+    assert runtime.lane_action.safe_to_drive is False
 
 
 def test_internal_zone_and_complete_seams_drive_only_the_declared_chain():

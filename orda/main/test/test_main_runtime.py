@@ -413,7 +413,8 @@ def test_is_pass_comp_delegates_to_the_pure_guard():
         node.runtime.fsm.state = Mode.OVERTAKE
         node._enter_zone(0.0)
         node.detected_lane = 1            # 1차선(왼쪽) 주행 → 오른쪽을 본다
-        node.side_right = 0.42
+        # bag 실측 통과 거리(0.26~0.34 m) 안쪽 값. side_detect_m 미만이어야 한다.
+        node.side_right = 0.30
 
         delay = node.overtake.config.pass_delay_s
         assert node.is_pass_comp(1.0) is False

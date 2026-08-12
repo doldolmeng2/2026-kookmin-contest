@@ -481,6 +481,17 @@ class MainNode(Node):
         # 규약: 0=중앙, 1=왼쪽(1차선), 2=오른쪽(2차선)
         return {0: "Center", 1: "Lane 1", 2: "Lane 2"}.get(lane, "Unknown")
 
+    @staticmethod
+    def _fmt_side(distance: float) -> str:
+        """측면 LiDAR 거리를 디버그 창용으로 만든다.
+
+        side_clearance()는 섹터에 유효 반사가 없으면 inf를 준다. 'inf'를 그대로
+        찍으면 값이 있을 때와 폭이 달라져 눈으로 훑기 나쁘므로 N/A로 통일한다.
+        """
+        if not np.isfinite(distance):
+            return "N/A"
+        return f"{distance:.2f} m"
+
     def _lane_command_text(self) -> str:
         """실제로 나가 있는 차선 명령을 표시한다.
 
@@ -735,6 +746,8 @@ class MainNode(Node):
             f"Rubber confidence: {cone_confidence}%",
             f"Rubber end: {cone_end if cone_end is not None else 'N/A'}",
             f"Object dist: {self.object_dist:.2f} m",
+            f"Side L/R: {self._fmt_side(self.side_left)}"
+            f" / {self._fmt_side(self.side_right)}",
             f"Box: {self.box_size:.0f}px^2  car_lane={self.car_lane}",
             f"Current lane: {self._lane_label(self.detected_lane)}",
             f"Lane cmd: {self._lane_command_text()}",

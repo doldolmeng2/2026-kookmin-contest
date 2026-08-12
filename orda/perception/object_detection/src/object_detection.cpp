@@ -112,7 +112,10 @@ public:
                 yolo_ok_ = false;
             }
         }
-        conf_threshold_ = 0.83f;  // 신뢰도 임계값
+        // 재학습 모델(빨간 고정 방해차량) 기준. 검증용 bag에서 이 값이 검출
+        // 가능한 프레임의 99%를 잡고, 차가 없는 프레임의 오검출은 0이었다.
+        // 이전 0.83은 옛 모델 최고 conf가 0.82라 사실상 전부 버리고 있었다.
+        conf_threshold_ = 0.50f;  // 신뢰도 임계값
         nms_threshold_  = 0.40f;  // NMS IoU 임계값
         min_w_pix_      = 12;     // 유효 박스 최소 너비 (px)
         min_h_pix_      = 12;     // 유효 박스 최소 높이 (px)
@@ -428,9 +431,21 @@ private:
         if (yolo_ok_) {
             const int W = img.cols, H = img.rows;
 
-            // 640×640으로 리사이즈 후 blob 변환
-            cv::Mat resized;
-            cv::resize(img, resized, cv::Size(640, 640));
+            // 레터박스로 640×640 변환 (비율 유지 + 회색 114 패딩).
+            // 그냥 640×640으로 늘리면 640×360 원본의 세로가 1.78배 왜곡되는데,
+            // YOLOv8은 레터박스로 학습되므로 전처리가 어긋나 검출률이 떨어진다.
+            // 검증용 bag 기준 conf>=0.5 검출률 82.3% → 98.1% (stop_2, 260프레임).
+            const float scale = std::min(640.f / W, 640.f / H);
+            const int   nw = static_cast<int>(std::round(W * scale));
+            const int   nh = static_cast<int>(std::round(H * scale));
+            const float pad_x = (640 - nw) * 0.5f;
+            const float pad_y = (640 - nh) * 0.5f;
+
+            cv::Mat fitted;
+            cv::resize(img, fitted, cv::Size(nw, nh));
+            cv::Mat resized(640, 640, img.type(), cv::Scalar(114, 114, 114));
+            fitted.copyTo(resized(cv::Rect(static_cast<int>(pad_x),
+                                           static_cast<int>(pad_y), nw, nh)));
             cv::Mat blob;
             cv::dnn::blobFromImage(resized, blob, 1.0/255.0,
                                    cv::Size(), cv::Scalar(), true, false);
@@ -458,10 +473,10 @@ private:
                     if (conf < conf_threshold_) continue;
 
                     // 640→원본 스케일 복원
-                    float x  = (cx_ - w_/2.f) * (static_cast<float>(W) / 640.f);
-                    float y  = (cy_ - h_/2.f) * (static_cast<float>(H) / 640.f);
-                    float ww = w_ * (static_cast<float>(W) / 640.f);
-                    float hh = h_ * (static_cast<float>(H) / 640.f);
+                    float x  = ((cx_ - w_/2.f) - pad_x) / scale;
+                    float y  = ((cy_ - h_/2.f) - pad_y) / scale;
+                    float ww = w_ / scale;
+                    float hh = h_ / scale;
 
                     int left = static_cast<int>(std::round(x));
                     int top  = static_cast<int>(std::round(y));

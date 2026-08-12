@@ -335,6 +335,14 @@ class RaceRuntimeAdapter:
         except ValueError:
             return InputRecordResult(False, "object_info lane label must be 0, 1, or 2")
 
+        # YOLO 박스 면적. 음수는 검출기가 낼 수 없는 값이므로 거른다.
+        box_px = numeric_values[5]
+        if not math.isfinite(box_px) or box_px < 0.0:
+            return InputRecordResult(
+                False,
+                "object_info box size must be a non-negative number",
+            )
+
         distance = numeric_values[1]
         if exists_value == 1.0:
             if any(not math.isfinite(value) for value in numeric_values):
@@ -364,11 +372,17 @@ class RaceRuntimeAdapter:
                     "absent object_info metadata must be finite numbers",
                 )
             snapshot_distance = None
-            snapshot_lane = ObjectLane.UNKNOWN
+            # 차선 라벨은 카메라 산출물이므로 LiDAR 미검출과 무관하게 유지한다.
+            # 예전에는 여기서 UNKNOWN 으로 지웠는데, 그러면 LiDAR 사거리 밖에
+            # 있는 방해차량은 YOLO가 또렷이 보고 있어도 회피 방향을 정할 수
+            # 없었다. 박스가 없을 때 검출기가 lane_label 0(=UNKNOWN)을 내므로
+            # 그대로 두어도 없는 정보를 지어내지 않는다.
+            snapshot_lane = lane
 
         self.latest_object_snapshot = ObjectSnapshot(
             exists=bool(exists_value),
             distance=snapshot_distance,
+            box_px=box_px,
             lane=snapshot_lane,
             received_at=received_at,
         )
@@ -645,6 +659,9 @@ class RaceRuntimeAdapter:
                 if object_snapshot is not None
                 else ObjectLane.UNKNOWN
             ),
+            object_box_px=(
+                object_snapshot.box_px if object_snapshot is not None else 0.0
+            ),
             object_received_at=(
                 object_snapshot.received_at if object_snapshot is not None else None
             ),
@@ -793,13 +810,25 @@ class RaceRuntimeAdapter:
         )
         if not object_fresh:
             action.safe_to_drive = False
-        elif not observation.object_exists:
-            # 회피한 차선에 그대로 머문다. README: "고정장애물이 2차선에 있으면
-            # 1차선으로 회피하고, 그대로 1차선에서 방해차량 구간을 시작한다.
-            # 회피 후 2차선으로 되돌아오지 않는다."
-            # 중앙 주행은 회피 전 기본값일 뿐, 회피 뒤 복귀 목표가 아니다.
+        elif observation.object_box_px <= 0.0:
+            # 카메라가 방해차량을 못 보는 프레임. 회피한 차선에 그대로 머문다.
+            # README: "고정장애물이 2차선에 있으면 1차선으로 회피하고, 그대로
+            # 1차선에서 방해차량 구간을 시작한다. 회피 후 2차선으로 되돌아오지
+            # 않는다." 중앙 주행은 회피 전 기본값일 뿐 복귀 목표가 아니다.
             action.safe_to_drive = True
         else:
+            # 회피 방향은 YOLO만으로 정한다. object_box_px 와 object_lane 은
+            # 카메라 단독 산출물이고, LiDAR는 추월 완료 확인(main.overtake)에만
+            # 쓴다.
+            #
+            # 예전에는 LiDAR 기반 object_exists 를 요구했다. 구간 진입은
+            # YOLO(box_size > FIXED_ENTRY_BOX_PX)로 하면서 방향 결정만 LiDAR에
+            # 걸어둔 비대칭이라, 카메라가 방해차량을 또렷이 보는데도 회피를
+            # 시작하지 못했다. rosbag2_fixed_obstacles_overtake_1 실측:
+            # 방해차량이 대부분 2 m 밖이라 range_max_m(2.0)에 걸려 전방 클러스터가
+            # 103 스캔 중 1번만 형성됐고(±10도 최소거리 중앙값 5.08 m),
+            # object_exists 가 1810 샘플 내내 0이었다. 같은 구간에서 YOLO는
+            # 박스 최대 10549 px^2, car_lane=1을 안정적으로 냈다.
             target = opposite_lane_target(observation.object_lane)
             action.safe_to_drive = target is not None
             if (

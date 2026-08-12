@@ -52,6 +52,9 @@ class ObjectSnapshot:
     distance: Optional[float]
     lane: ObjectLane
     received_at: float
+    # YOLO 바운딩 박스 면적(px^2). exists/distance 는 LiDAR 산출물이지만 이 값과
+    # lane 은 카메라 단독으로 나온다. 회피 방향은 이 둘만 보고 정한다.
+    box_px: float = 0.0
 
 
 @dataclass(frozen=True)
