@@ -26,6 +26,10 @@ PD_PARAMS = {
     # 작은 경계 변화도 최대 조향으로 키우므로 라바콘에서는 완만하게 쓴다.
     Mode.CONE_DRIVE: (1.0, 0.0, 0.0),
     Mode.LANE_DRIVE: (0.145, 0.3, 0.0),
+    # 고정장애물 회피: 차선을 옮기는 동안 오프셋이 크게 벌어진다. 차선 주행과
+    # 같은 이득이면 조향이 과해지므로 kp를 낮추고 kd(감쇠)를 키운다.
+    # ★ 실차 튜닝 지점: 회피가 굼뜨면 kp를 올리고, 흔들리면 kd를 올린다.
+    Mode.FIXED_AVOID: (0.12, 0.35, 0.0),
 }
 
 # 속도 제어 파라미터: mode → (max_speed, min_speed, scale_factor)
@@ -34,6 +38,10 @@ PD_PARAMS = {
 #   scale_factor : |조향각| × scale_factor 만큼 최대 속도에서 감속
 SPEED_PARAMS = {
     Mode.LANE_DRIVE: (43.0, 16.0, 0.5),
+    # 회피 중에는 낮은 속도로 안정적으로 옮겨간다. 빠르면 차선 변경이 끝나기
+    # 전에 장애물에 도달한다.
+    # ★ 실차 튜닝 지점: 회피가 늦으면 max_speed를 낮추고, 굼뜨면 올린다.
+    Mode.FIXED_AVOID: (30.0, 14.0, 0.6),
 }
 
 # 라바콘 속도 제어 파라미터.
@@ -104,7 +112,7 @@ class Controller:
             self.speed = self._compute_rubbercone_speed(
                 self.angle, rubbercone_confidence)
 
-        elif mode is Mode.LANE_DRIVE:
+        elif mode in (Mode.LANE_DRIVE, Mode.FIXED_AVOID):
             # PD 조향 + 조향각 기반 속도 감속
             self.angle = self._compute_steering_pd(mode, offset)
             params     = self.speed_params.get(mode)

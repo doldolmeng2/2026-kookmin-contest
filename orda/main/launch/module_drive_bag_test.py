@@ -113,7 +113,13 @@ def generate_launch_description():
         executable='main_node',
         name='main_node',
         output='screen',
-        parameters=[{'mode': mode, 'show_debug': show_debug}],
+        # use_sim_time=True: main_node의 시간 기준을 bag 재생 시각(/clock)에 맞춘다.
+        # bag을 --loop --clock 으로 재생하면 루프 시작 시 시각이 뒤로 튀는데,
+        # main_node는 이를 감지해 "bag이 처음부터 다시 재생됨"으로 판단하고
+        # 상태머신을 리셋한다.
+        # ★ --clock 없이 재생하면 ROS 시계가 0에 멈춰 20ms 타이머가 한 번도
+        #   발동하지 않으므로, 반드시 `ros2 bag play ... --clock` 과 함께 쓸 것.
+        parameters=[{'mode': mode, 'show_debug': show_debug, 'use_sim_time': True}],
         remappings=[('xycar_motor', '/bag_test/xycar_motor')],
     )
     traffic_node = Node(

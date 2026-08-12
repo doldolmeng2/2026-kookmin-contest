@@ -28,6 +28,7 @@ from main.main import (
     rubbercone_reset_qos,
     sensor_event_qos,
 )
+from main.overtake import OvertakeGuard
 from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import RaceRuntimeAdapter
@@ -42,6 +43,10 @@ class CallbackHarness:
             context=RaceContext(state_entered_at=0.5),
         )
         self.warnings = []
+        # scan_callback 이 측면 거리를 계산하므로 실제 노드와 같은 필드를 갖춘다.
+        self.overtake = OvertakeGuard()
+        self.side_left = float("inf")
+        self.side_right = float("inf")
 
     def _now_seconds(self):
         return next(self._times)
@@ -77,7 +82,7 @@ def test_main_malformed_cone_callback_warns_without_queuing_event():
 def test_main_scan_and_cone_callbacks_use_the_same_clock_helper():
     harness = CallbackHarness([3.0, 3.01])
 
-    MainNode.scan_callback(harness, SimpleNamespace())
+    MainNode.scan_callback(harness, LaserScan())
     MainNode.rubbercone_callback(
         harness,
         SimpleNamespace(data=[0, 0, 80]),
@@ -325,3 +330,108 @@ def test_initial_mode_parser_supports_defined_runtime_states(value, expected):
 def test_initial_mode_parser_rejects_undefined_legacy_state_guesses(value):
     with pytest.raises(ValueError):
         parse_initial_mode(value)
+
+
+def test_bag_loop_backjump_resets_the_state_machine():
+    """bag이 처음부터 재생되면 상태머신을 시작 모드로 되돌린다.
+
+    시각이 뒤로 튀면 이전 루프의 수신 시각이 전부 '미래'가 되어 신선도 검사가
+    음수로 나온다. 끊긴 입력이 신선한 것처럼 보이므로 상태를 버려야 한다.
+    """
+    import rclpy
+    from main.main import MainNode, BAG_LOOP_BACKJUMP_S
+    from main.race_fsm import Mode
+
+    rclpy.init(args=['--ros-args', '-p', 'mode:=1'])
+    try:
+        node = MainNode()
+        assert node._initial_mode is Mode.CONE_DRIVE
+
+        node.runtime.fsm.state = Mode.OVERTAKE
+        node.box_size = 5000.0
+        node.side_right = 0.3
+        before = node.runtime
+
+        node._now_seconds = lambda: 100.0
+        node.control_cycle()
+        # 시각이 크게 역행 → 리셋
+        node._now_seconds = lambda: 100.0 - (BAG_LOOP_BACKJUMP_S + 1.0)
+        node.control_cycle()
+
+        assert node.runtime is not before          # 어댑터를 새로 만들었다
+        assert node.runtime.fsm.state is Mode.CONE_DRIVE
+        assert node.box_size == 0.0
+        assert node.side_right == float("inf")
+        assert node._zone_exit_sent is False
+    finally:
+        rclpy.shutdown()
+
+
+def test_small_backward_jitter_does_not_reset():
+    """실차 wall clock의 미세 역행(NTP 보정)은 리셋 트리거가 아니다."""
+    import rclpy
+    from main.main import MainNode
+    from main.race_fsm import Mode
+
+    rclpy.init(args=['--ros-args', '-p', 'mode:=3'])
+    try:
+        node = MainNode()
+        node.runtime.fsm.state = Mode.OVERTAKE
+        before = node.runtime
+
+        node._now_seconds = lambda: 100.0
+        node.control_cycle()
+        node._now_seconds = lambda: 99.9      # 0.1초 역행
+        node.control_cycle()
+
+        assert node.runtime is before
+    finally:
+        rclpy.shutdown()
+
+
+def _node_in_overtake(**overrides):
+    import rclpy
+    from main.main import MainNode
+    from main.race_fsm import Mode
+    node = MainNode()
+    node.runtime.fsm.state = Mode.OVERTAKE
+    node._enter_zone(0.0)
+    for k, v in overrides.items():
+        setattr(node, k, v)
+    return node
+
+
+def test_is_pass_comp_delegates_to_the_pure_guard():
+    """판정 로직은 main.overtake가 갖고, 노드는 배선만 한다."""
+    import rclpy
+    from main.main import MainNode
+    from main.race_fsm import Mode
+
+    rclpy.init(args=['--ros-args', '-p', 'mode:=3'])
+    try:
+        node = MainNode()
+        node.runtime.fsm.state = Mode.OVERTAKE
+        node._enter_zone(0.0)
+        node.detected_lane = 1            # 1차선(왼쪽) 주행 → 오른쪽을 본다
+        # bag 실측 통과 거리(0.26~0.34 m) 안쪽 값. side_detect_m 미만이어야 한다.
+        node.side_right = 0.30
+
+        delay = node.overtake.config.pass_delay_s
+        assert node.is_pass_comp(1.0) is False
+        assert node.overtake.side_seen_at == 1.0
+        assert node.is_pass_comp(1.0 + delay) is True
+    finally:
+        rclpy.shutdown()
+
+
+def test_is_change_end_follows_lane_change_state_feedback():
+    import rclpy
+
+    rclpy.init(args=['--ros-args', '-p', 'mode:=3'])
+    try:
+        node = _node_in_overtake()
+        assert node.is_change_end() is False
+        node.runtime.lane_action.completed = True
+        assert node.is_change_end() is True
+    finally:
+        rclpy.shutdown()

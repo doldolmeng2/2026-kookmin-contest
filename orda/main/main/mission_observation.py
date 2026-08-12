@@ -37,6 +37,8 @@ class MissionObservation:
     object_distance: Optional[float] = None
     object_lane: ObjectLane = ObjectLane.UNKNOWN
     object_received_at: Optional[float] = None
+    # YOLO 박스 면적(px^2). 0이면 카메라가 방해차량을 못 본 것이다.
+    object_box_px: float = 0.0
     lane_change_changing: bool = False
     lane_change_success: bool = False
     lane_change_success_edge: bool = False

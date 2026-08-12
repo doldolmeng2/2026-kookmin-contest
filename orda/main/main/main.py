@@ -1,5 +1,6 @@
 """ROS runtime wiring for the authoritative 2026 finals race FSM."""
 
+import threading
 from typing import Optional
 
 import cv2
@@ -24,6 +25,7 @@ from main.control_selector import (
     DriveCommand,
 )
 from main.mode_info import mode_info_data
+from main.overtake import OvertakeGuard, side_clearance
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
     RaceRuntimeAdapter,
@@ -47,6 +49,17 @@ CONE_EVENT_WARNING_PERIOD_S = 5.0
 RUBBERCONE_ACCEL_STEP = 0.25
 RUBBERCONE_DECEL_STEP = 0.35
 RUBBERCONE_STEERING_STEP = 3.0
+
+# 이보다 크게 시각이 역행하면 "bag이 처음부터 다시 재생됨"으로 본다.
+# 실차 wall clock도 NTP 보정으로 아주 드물게 살짝 뒤로 갈 수 있어, 그런 미세
+# 역행까지 리셋으로 잡지 않도록 넉넉한 임계값을 둔다.
+BAG_LOOP_BACKJUMP_S = 2.0
+
+# 이 면적을 넘는 박스를 고정장애물로 보고 FIXED_AVOID 구간에 진입한다.
+# is_moving 필드가 아직 없어 검출된 장애물은 전부 고정장애물로 간주한다.
+FIXED_ENTRY_BOX_PX = 1900.0
+
+# 추월 완료 판정 임계값은 main.overtake.OvertakeConfig가 갖는다.
 
 # Keep the launch file's existing integer ``mode`` parameter usable for the
 # states that have a defined 2026 counterpart. Unsupported legacy mission
@@ -113,11 +126,17 @@ class MainNode(Node):
 
         self.declare_parameter("mode", 0)
         self.declare_parameter("show_debug", False)
-        initial_mode = parse_initial_mode(self.get_parameter("mode").value)
+        self._initial_mode = parse_initial_mode(self.get_parameter("mode").value)
         self.show_debug = bool(self.get_parameter("show_debug").value)
 
+        # bag --loop 재생 감지용. use_sim_time=True 로 띄우고 bag을 --clock 과
+        # 함께 재생하면, 루프가 돌 때 /clock 시각이 뒤로 튄다. 그 역행을 잡아
+        # 상태머신을 시작 모드로 되돌린다.
+        # 실차(wall clock)에서는 시간이 뒤로 가지 않으므로 발동하지 않는다.
+        self._last_now: Optional[float] = None
+
         self.runtime = RaceRuntimeAdapter(
-            fsm=RaceFSM(initial_state=initial_mode),
+            fsm=RaceFSM(initial_state=self._initial_mode),
             safety_monitor=runtime_safety_monitor(),
         )
         self.lane_controller = Controller()
@@ -134,8 +153,17 @@ class MainNode(Node):
         self.box_cy = float("nan")
         self.box_dx = float("nan")
         self.car_lane = -1
+        self.detected_lane = -1         # 실측 현재 차선 (-1=미확정, 0=중앙, 1=왼쪽, 2=오른쪽)
+        self.side_left = float("inf")   # 좌측면 최소 거리 (m, /scan 에서 계산)
+        self.side_right = float("inf")  # 우측면 최소 거리 (m, /scan 에서 계산)
         self.left = float("inf")
         self.right = float("inf")
+
+        # 구간(FIXED_AVOID / OVERTAKE) 종료 판정. 순수 로직은 main.overtake가 갖는다.
+        self.overtake = OvertakeGuard()
+        self._zone_state: Optional[Mode] = None   # 직전 사이클의 FSM 상태
+        self._zone_exit_sent = False              # 현재 구간의 종료 엣지를 이미 냈는지
+        self._fixed_entry_sent = False            # 이번 LANE_DRIVE 세션에서 진입 엣지를 냈는지
 
         self.now_speed = 0.0
         self.now_angle = 0.0
@@ -208,6 +236,12 @@ class MainNode(Node):
             self.lane_change_state_callback,
             sensor_event_qos(depth=10),
         )
+        self.lane_position_sub = self.create_subscription(
+            Int16,
+            "lane_position",
+            self.lane_position_callback,
+            qos_fast,
+        )
         self.ultrasonic_sub = self.create_subscription(
             Int32MultiArray,
             "xycar_ultrasonic",
@@ -215,7 +249,30 @@ class MainNode(Node):
             10,
         )
 
+        # ── 상태 창 표시 전용 스레드 ─────────────────────────────────────
+        # cv2.imshow/waitKey를 rclpy 타이머 콜백 안에서 직접 부르면 GTK/Wayland
+        # 이벤트 루프와 충돌해 창이 아예 안 뜨는 환경이 있다(WSLg 등).
+        # control_cycle은 최신 프레임만 공유 변수에 넘기고, 실제 표시는 이
+        # 독립 스레드가 전담한다.
+        self._status_img_lock = threading.Lock()
+        self._status_img = None
+
         self.create_timer(0.02, self.control_cycle)
+
+    def run_display_loop(self) -> None:
+        """최신 상태 이미지를 표시한다. **메인 스레드에서** 호출해야 한다.
+
+        control_cycle은 이미지를 공유 변수에 넣기만 하고, 실제 imshow/waitKey는
+        여기서 부른다. rclpy 콜백 안에서 직접 부르면 인지 주기를 늘어뜨리고,
+        보조 스레드에서 부르면 GTK 백엔드가 창을 화면에 띄우지 못한다.
+        """
+
+        while rclpy.ok():
+            with self._status_img_lock:
+                image = self._status_img
+            if image is not None:
+                cv2.imshow("Status", image)
+            cv2.waitKey(30)
 
     def _now_seconds(self) -> float:
         """Read the node ROS clock used by both callbacks and FSM steps."""
@@ -242,8 +299,18 @@ class MainNode(Node):
         received_at = self._now_seconds()
         self.runtime.record_traffic(msg.data, received_at)
 
-    def scan_callback(self, _msg: LaserScan) -> None:
+    def scan_callback(self, msg: LaserScan) -> None:
         self.runtime.record_scan(self._now_seconds())
+        # 측면 거리는 /object_info 에 담지 않고 여기서 직접 뽑는다.
+        # premerge 가 초음파를 그대로 읽던 구조와 같다 (README 11필드 계약 유지).
+        self.side_left, self.side_right = side_clearance(
+            msg.ranges,
+            msg.angle_min,
+            msg.angle_increment,
+            msg.range_min,
+            msg.range_max,
+            self.overtake.config,
+        )
 
     def lane_validity_callback(self, msg: Bool) -> None:
         """Record only an explicit future lane-validity publisher edge."""
@@ -255,6 +322,17 @@ class MainNode(Node):
                 "invalid lane-validity message ignored",
                 received_at,
             )
+
+    def lane_position_callback(self, msg: Int16) -> None:
+        """lane_detection이 노란 중앙선 실제 위치로 역산한 실측 현재 차선.
+
+        -1=미확정, 0=중앙, 1=왼쪽(1차선), 2=오른쪽(2차선)
+        """
+
+        value = int(msg.data)
+        self.detected_lane = value if value in (0, 1, 2) else -1
+        # 차선 변경 완료 판정에 쓰인다 (runtime_adapter._update_lane_action).
+        self.runtime.measured_lane = self.detected_lane
 
     def object_info_callback(self, msg: Float32MultiArray) -> None:
         received_at = self._now_seconds()
@@ -296,6 +374,20 @@ class MainNode(Node):
 
     def control_cycle(self) -> None:
         now = self._now_seconds()
+
+        if self._last_now is not None and self._last_now - now > BAG_LOOP_BACKJUMP_S:
+            self.get_logger().info(
+                f"bag 루프 감지 ({self._last_now - now:.1f}초 역행) -> 상태머신 리셋"
+            )
+            self._reset_for_bag_loop()
+        self._last_now = now
+
+        # 전이 없이 시작한 모드(mode:= 로 지정)는 state_entered_at 이 비어 있다.
+        # 미션 엣지는 이 값을 기준으로 유효성을 따지므로 첫 주기에 채워준다.
+        if self.runtime.context.state_entered_at is None:
+            self.runtime.context.state_entered_at = now
+
+        self._drive_mission_zones(now)
         lane_candidate, cone_candidate = self._command_candidates()
 
         cycle = self.runtime.step(
@@ -329,26 +421,211 @@ class MainNode(Node):
 
         self.lane = self.runtime.context.lane_target.value
         mode_msg = Int32MultiArray()
+        # 차선 변경 명령은 일단 나가면 래치한다.
+        #
+        # lane_detection 의 추적기는 mode!=5 를 보는 순간 진행도를 버린다
+        # (handleCommand → resetProgress). 그런데 safe_to_drive 는 /object_info
+        # 신선도(0.25s)를 따라 매 주기 뒤집히고, YOLO 검출은 간헐적으로 끊긴다.
+        # 그 결과 코드가 5↔3↔0 으로 요동쳐 추적기가 완료(8프레임 안정)를
+        # 모으지 못했다. 실측: 변경 시작 279회 / 성공 0회.
+        #
+        # 이미 시작한 회피는 끝내는 편이 중간에 포기하는 것보다 안전하므로,
+        # pending 인 동안에는 인지가 잠깐 끊겨도 명령을 유지한다.
+        action = self.runtime.lane_action
         mode_msg.data = mode_info_data(
             self.runtime.fsm.state,
             self.lane,
-            mission_lane_control_enabled=self.runtime.lane_action.safe_to_drive,
-            lane_change_active=(
-                self.runtime.lane_action.pending
-                and self.runtime.lane_action.safe_to_drive
-            ),
+            mission_lane_control_enabled=action.safe_to_drive or action.pending,
+            lane_change_active=action.pending,
         )
         self.mode_pub.publish(mode_msg)
 
         self._update_debug_window(now, angle, speed)
+
+    def _enter_zone(self, now: float) -> None:
+        """구간 진입 시 종료 판정 상태를 초기화한다."""
+
+        self.overtake.enter_zone(now)
+        self._zone_exit_sent = False
+
+    def is_change_end(self) -> bool:
+        """차선 변경이 끝났는지.
+
+        /lane_change_state 의 성공 엣지를 runtime_adapter 가 추적하므로 그
+        결과를 그대로 쓴다.
+        """
+
+        return self.runtime.lane_action.completed
+
+    def is_pass_comp(self, now: float) -> bool:
+        """추월 완료 여부. 판정은 main.overtake.OvertakeGuard가 한다."""
+
+        decision = self.overtake.update_zone(
+            now=now,
+            lane_target=self.runtime.context.lane_target.value,
+            side_left=self.side_left,
+            side_right=self.side_right,
+            ego_lane=self.detected_lane,
+        )
+        if decision.side_just_seen:
+            self.get_logger().info(
+                f"측면 방해차량 인식 ({decision.side_distance:.2f}m), "
+                f"{self.overtake.config.pass_delay_s:.1f}초 후 추월 완료")
+        if decision.timed_out:
+            self.get_logger().info("방해차량 구간 시간 상한 초과 -> 차선 주행 복귀")
+        return decision.complete
+
+    @staticmethod
+    def _lane_label(lane: int) -> str:
+        # cv2.putText는 한글을 못 그리므로 ASCII로 표기한다.
+        # 규약: 0=중앙, 1=왼쪽(1차선), 2=오른쪽(2차선)
+        return {0: "Center", 1: "Lane 1", 2: "Lane 2"}.get(lane, "Unknown")
+
+    @staticmethod
+    def _fmt_side(distance: float) -> str:
+        """측면 LiDAR 거리를 디버그 창용으로 만든다.
+
+        side_clearance()는 섹터에 유효 반사가 없으면 inf를 준다. 'inf'를 그대로
+        찍으면 값이 있을 때와 폭이 달라져 눈으로 훑기 나쁘므로 N/A로 통일한다.
+        """
+        if not np.isfinite(distance):
+            return "N/A"
+        return f"{distance:.2f} m"
+
+    def _lane_command_text(self) -> str:
+        """실제로 나가 있는 차선 명령을 표시한다.
+
+        회피와 복귀 모두 runtime_adapter._update_lane_action() 이 단독으로
+        내므로, 그 결과(lane_target / lane_action)를 그대로 읽는다.
+
+        구간 밖인지 여부는 바로 위 Mode 줄에 이미 나오므로 여기서 되풀이하지
+        않는다. 변경 중일 때만 화살표로 구분한다.
+        """
+        if self.runtime.lane_action.pending:
+            target = self._lane_label(self.runtime.context.lane_target.value)
+            return f"-> {target} (changing)"
+        # 유지 중일 때는 차선 이름을 붙이지 않는다. "Center" 라고 쓰면 중앙으로
+        # 옮기라는 명령처럼 읽히는데, 실제로는 지금 차선을 그대로 두는 상태다.
+        # 현재 차선은 바로 위 Current lane 줄에 실측값으로 나온다.
+        return "Holding"
+
+    def _reset_for_bag_loop(self) -> None:
+        """bag이 처음부터 다시 재생될 때 내부 상태를 시작 시점으로 되돌린다.
+
+        런타임 어댑터를 통째로 새로 만드는 이유는 수신 시각 때문이다. 시각이
+        뒤로 튀면 이전 루프에서 기록한 receipt 시각이 전부 '미래'가 되어,
+        신선도 검사(now - received_at)가 음수로 나온다. 그러면 끊긴 입력이
+        신선한 것처럼 보이고 미션 엣지 판정도 어긋난다. 시각 기록을 남겨두는
+        것보다 버리는 편이 안전하다.
+        """
+
+        self.runtime = RaceRuntimeAdapter(
+            fsm=RaceFSM(initial_state=self._initial_mode),
+            safety_monitor=runtime_safety_monitor(),
+        )
+        self.lane_controller = Controller()
+        self.cone_controller = Controller()
+
+        self.overtake.reset()
+        self._zone_state = None
+        self._zone_exit_sent = False
+
+        # 인지 캐시도 비운다. 이전 루프의 마지막 프레임이 새 루프 첫 판단에
+        # 섞이지 않게 한다.
+        self.object_dist = float("inf")
+        self.obj_exists = 0.0
+        self.box_size = 0.0
+        self.car_lane = -1
+        self.detected_lane = -1
+        self.side_left = float("inf")
+        self.side_right = float("inf")
+        self.now_speed = 0.0
+        self.now_angle = 0.0
+
+    def _drive_mission_zones(self, now: float) -> None:
+        """구간 체인(LANE_DRIVE → FIXED_AVOID → OVERTAKE → LANE_DRIVE)을 굴린다.
+
+        race_fsm은 세 이벤트(fixed_zone_entry / fixed_zone_exit /
+        overtake_complete)로 구간을 넘기도록 이미 만들어져 있는데, 그 이벤트를
+        만들어 주는 쪽이 비어 있어서 체인 전체가 잠들어 있었다. 여기서 채운다.
+
+        진입(fixed_zone_entry)은 **여기서 만들지 않는다.** README:
+          - "REJOIN 성공은 LANE_DRIVE 복귀만 의미하며 FIXED_AVOID 진입 증거가
+             아니다."
+          - "고정장애물 진입 publisher/topic/type 계약이 확정될 때까지
+             FIXED_AVOID 는 runtime에서 도달 불가능한 외부 blocker로 유지한다."
+          - "구간 안에서 실제 회피/추월 동작을 할지는 /object_info 로 판단하며
+             … 구간 진입 조건이 아니다."
+        라바콘 통과나 객체 검출로 진입을 합성하면 세 규칙을 모두 어긴다.
+        진입 계약이 정해지면 그 구독 콜백에서 record_fixed_zone_entry() 를
+        부르면 된다 (API는 이미 있다).
+
+        진입(fixed_zone_entry)은 지금 단계에서 **고정장애물 검출**로 만든다.
+        is_moving 이 없어 방해차량과 구분할 수 없으므로, 검출된 장애물을 전부
+        고정장애물로 간주한다. 진입 publisher/topic 계약이 확정되면 이 블록을
+        지우고 그 구독 콜백에서 record_fixed_zone_entry() 를 부르면 된다.
+
+        구간 종료 엣지도 여기서 만든다:
+          - 고정장애물 통과 : 이동/고정을 구분할 입력(is_moving)이 아직 없어
+                    시간 상한으로 넘긴다. README의 "구간 시간 상한" 규칙.
+          - 고정장애물 추월 : 측면 LiDAR로 옆으로 지나간 것을 확인하고
+                    pass_delay_s 뒤에 확정한다 (main.overtake).
+        OVERTAKE 는 움직이는 방해차량용이라 이 경로에서는 쓰지 않는다.
+
+        회피 방향과 차선 변경 자체는 runtime_adapter._update_lane_action이
+        이미 담당하므로 여기서 중복하지 않는다. 이 메서드는 구간 경계만 만든다.
+        """
+
+        state = self.runtime.fsm.state
+        entered = state is not self._zone_state
+        self._zone_state = state
+
+        if state is Mode.LANE_DRIVE:
+            if entered:
+                self._fixed_entry_sent = False
+            entered_at = self.runtime.context.state_entered_at
+            # 엣지는 state_entered_at 보다 "뒤"여야 수락되고 한 번만 소비된다.
+            if (
+                not self._fixed_entry_sent
+                and self.box_size > FIXED_ENTRY_BOX_PX
+                and entered_at is not None
+                and now > entered_at
+            ):
+                self._fixed_entry_sent = True
+                self.runtime.record_fixed_zone_entry(now)
+                self.get_logger().info(
+                    f"고정장애물 검출 ({self.box_size:.0f}px^2) -> 고정장애물 구간 진입")
+            return
+
+        if state is Mode.FIXED_AVOID:
+            if entered:
+                self._enter_zone(now)
+            # 고정장애물을 추월할 때까지 이 구간에 머문다. 시간으로 먼저
+            # 빠져나가면 회피가 끝나기 전에 모드가 바뀌어 차선 변경 명령이
+            # 취소되고, /mode_info 코드가 5↔3↔0 으로 요동친다.
+            if not self._zone_exit_sent and self.is_pass_comp(now):
+                self._zone_exit_sent = True
+                self.runtime.record_fixed_zone_exit(now)
+                self.get_logger().info("고정장애물 추월 확인 -> 차선 주행 복귀")
+            return
+
+        # 그 밖의 상태(INIT/WAIT_GREEN/REJOIN/SHORTCUT 등)에서는 구간 판정을 쉰다.
+        if entered:
+            self._enter_zone(now)
 
     def _command_candidates(self):
         lane_candidate = None
         lane_received_at = self.runtime.latest_lane_received_at
         lane_offset = self.runtime.latest_lane_offset
         if lane_received_at is not None and lane_offset is not None:
+            # FIXED_AVOID 구간에서는 회피 전용 PD/속도 프로필을 쓴다.
+            control_mode = (
+                Mode.FIXED_AVOID
+                if self.runtime.fsm.state is Mode.FIXED_AVOID
+                else Mode.LANE_DRIVE
+            )
             self.lane_controller.update(
-                Mode.LANE_DRIVE,
+                control_mode,
                 lane_offset,
                 self.object_dist,
                 100,
@@ -469,9 +746,15 @@ class MainNode(Node):
             f"Rubber confidence: {cone_confidence}%",
             f"Rubber end: {cone_end if cone_end is not None else 'N/A'}",
             f"Object dist: {self.object_dist:.2f} m",
+            f"Side L/R: {self._fmt_side(self.side_left)}"
+            f" / {self._fmt_side(self.side_right)}",
             f"Box: {self.box_size:.0f}px^2  car_lane={self.car_lane}",
+            f"Current lane: {self._lane_label(self.detected_lane)}",
+            f"Lane cmd: {self._lane_command_text()}",
         ]
-        image = np.zeros((300, 640, 3), dtype=np.uint8)
+        # 줄 수에 맞춰 캔버스를 잡는다. 높이를 고정해 두면 줄을 추가했을 때
+        # 마지막 줄이 조용히 화면 밖으로 밀려난다.
+        image = np.zeros((30 + len(lines) * 32, 640, 3), dtype=np.uint8)
         for index, text in enumerate(lines):
             cv2.putText(
                 image,
@@ -482,18 +765,36 @@ class MainNode(Node):
                 (255, 255, 255),
                 2,
             )
-        cv2.imshow("Status", image)
-        cv2.waitKey(1)
+        # imshow/waitKey는 여기서 직접 부르지 않고 표시 스레드에 넘긴다.
+        with self._status_img_lock:
+            self._status_img = image
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = MainNode()
     try:
-        rclpy.spin(node)
+        if node.show_debug:
+            # OpenCV(GTK 백엔드)는 imshow/waitKey를 **메인 스레드**에서 불러야
+            # 창이 화면에 매핑된다. 백그라운드 스레드에서 부르면 창 객체는
+            # 만들어지지만(AUTOSIZE 조회는 성공) 실제로 보이지 않는다.
+            # 그래서 rclpy를 보조 스레드로 돌리고 표시를 메인 스레드가 맡는다.
+            spin_thread = threading.Thread(
+                target=rclpy.spin,
+                args=(node,),
+                daemon=True,
+            )
+            spin_thread.start()
+            node.run_display_loop()
+        else:
+            rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

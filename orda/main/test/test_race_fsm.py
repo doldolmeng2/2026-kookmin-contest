@@ -630,3 +630,68 @@ def test_legacy_unwired_mission_fields_do_not_invent_transitions(state):
     assert context.state_entered_at == 10.0
     assert context.finish_gate_passes == 1
     assert context.last_gate_event_at == 9.0
+
+
+def test_stop_returns_to_the_mode_it_stopped_from_after_hold():
+    """센서가 회복되면 정지 직전 구간으로 복귀한다."""
+    fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
+    context = RaceContext(state_entered_at=0.0)
+
+    stop = fsm.step(
+        MissionObservation(now=1.0),
+        context,
+        SafetyDecision(must_stop=True, reason="stale required inputs: sensor:scan"),
+    )
+    assert stop.target is Mode.STOP
+
+    healthy = SafetyDecision(must_stop=False, inputs_ready=True)
+    # 안정화 대기 시간(0.5s) 전에는 아직 복귀하지 않는다
+    assert fsm.step(MissionObservation(now=1.1), context, healthy).changed is False
+    assert fsm.step(MissionObservation(now=1.4), context, healthy).changed is False
+
+    resumed = fsm.step(MissionObservation(now=1.7), context, healthy)
+    assert resumed.target is Mode.CONE_DRIVE
+    assert context.stop_reason is None
+
+
+def test_stop_does_not_recover_while_inputs_are_still_missing():
+    fsm = RaceFSM(initial_state=Mode.LANE_DRIVE)
+    context = RaceContext(state_entered_at=0.0)
+    fsm.step(
+        MissionObservation(now=1.0),
+        context,
+        SafetyDecision(must_stop=True, reason="fault"),
+    )
+
+    unhealthy = SafetyDecision(must_stop=False, inputs_ready=False)
+    for now in (1.2, 2.0, 5.0):
+        assert fsm.step(MissionObservation(now=now), context, unhealthy).changed is False
+    assert fsm.state is Mode.STOP
+
+
+def test_flapping_inputs_do_not_bounce_out_of_stop():
+    """입력이 깜빡이면 안정화 타이머가 다시 시작되어 진동하지 않는다."""
+    fsm = RaceFSM(initial_state=Mode.LANE_DRIVE)
+    context = RaceContext(state_entered_at=0.0)
+    fsm.step(
+        MissionObservation(now=0.0),
+        context,
+        SafetyDecision(must_stop=True, reason="fault"),
+    )
+
+    healthy = SafetyDecision(must_stop=False, inputs_ready=True)
+    unhealthy = SafetyDecision(must_stop=False, inputs_ready=False)
+
+    fsm.step(MissionObservation(now=0.1), context, healthy)
+    fsm.step(MissionObservation(now=0.3), context, unhealthy)   # 타이머 리셋
+    assert fsm.step(MissionObservation(now=0.5), context, healthy).changed is False
+    assert fsm.state is Mode.STOP
+
+
+def test_finish_stays_terminal():
+    fsm = RaceFSM(initial_state=Mode.FINISH)
+    context = RaceContext(state_entered_at=0.0)
+    healthy = SafetyDecision(must_stop=False, inputs_ready=True)
+
+    assert fsm.step(MissionObservation(now=5.0), context, healthy).changed is False
+    assert fsm.state is Mode.FINISH

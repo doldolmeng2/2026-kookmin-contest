@@ -25,7 +25,7 @@ class RaceContext:
         self,
         completed_laps: int = 0,
         shortcut_lap: Optional[int] = None,
-        lane_target: LaneTarget = LaneTarget.LANE_TWO,
+        lane_target: LaneTarget = LaneTarget.CENTER,
         race_started_at: Optional[float] = None,
         state_entered_at: Optional[float] = None,
         cone_entered_at: Optional[float] = None,

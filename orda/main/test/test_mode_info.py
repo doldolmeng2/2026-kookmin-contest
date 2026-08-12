@@ -53,9 +53,14 @@ def test_mode_info_data_preserves_current_lane_detector_two_field_contract():
     assert mode_info_data(Mode.REJOIN, 1) == [2, 1]
 
 
-@pytest.mark.parametrize("invalid_lane", [-1, 2, None, True, "1"])
-def test_invalid_lane_value_uses_safe_existing_lane_value(invalid_lane):
-    assert mode_info_data(Mode.LANE_DRIVE, invalid_lane) == [3, 1]
+@pytest.mark.parametrize("invalid_lane", [-1, 3, None, True, "1"])
+def test_invalid_lane_value_falls_back_to_center(invalid_lane):
+    # 기본 주행이 중앙이므로 알 수 없는 값은 중앙(2)으로 떨어뜨린다.
+    assert mode_info_data(Mode.LANE_DRIVE, invalid_lane) == [3, 0]
+
+
+def test_center_is_a_valid_lane_value():
+    assert mode_info_data(Mode.LANE_DRIVE, 0) == [3, 0]
 
 
 def test_lane_change_code_exists_only_as_consumer_contract_not_fsm_mapping():
@@ -67,8 +72,10 @@ def test_lane_change_code_exists_only_as_consumer_contract_not_fsm_mapping():
 
 
 @pytest.mark.parametrize("mode", [Mode.FIXED_AVOID, Mode.OVERTAKE])
-def test_action_level_mode_info_orders_stop_change_then_lane(mode):
-    stopped = mode_info_data(mode, 0)
+def test_action_level_mode_info_never_emits_stop_inside_a_zone(mode):
+    # 구간 안에서는 정지 코드(0)를 쓰지 않는다. 인지가 신선하지 않으면
+    # 차선 변경(5) 대신 차선 주행(3)으로 둔다.
+    unauthorized = mode_info_data(mode, 0)
     changing = mode_info_data(
         mode,
         1,
@@ -82,18 +89,19 @@ def test_action_level_mode_info_orders_stop_change_then_lane(mode):
         lane_change_active=False,
     )
 
-    assert stopped == [0, 0]
+    assert unauthorized == [3, 0]
     assert changing == [5, 1]
     assert settled == [3, 1]
 
 
 def test_lane_change_code_is_not_emitted_while_action_is_unsafe():
+    # 미허가 상태에서는 변경(5)이 아니라 차선 주행(3)으로 떨어진다.
     assert mode_info_data(
         Mode.FIXED_AVOID,
         0,
         mission_lane_control_enabled=False,
         lane_change_active=True,
-    ) == [0, 0]
+    ) == [3, 0]
 
 
 def test_rejoin_completion_changes_external_mode_to_lane_not_fixed_avoid():
