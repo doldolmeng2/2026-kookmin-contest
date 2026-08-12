@@ -422,34 +422,6 @@ ros2 launch manual_drive manual_drive.launch.py
 ros2 launch manual_drive ordabag.launch.py
 ```
 
-### 고정장애물 회피만 단독으로 검증 (실차 벤치)
-
-`rubbercone_node` 오검출로 `CONE_DRIVE` 에 새는 것을 피하려면 필요한 노드만 띄운다.
-대회 실행 명령은 위의 `ros2 launch` 형태를 쓰고, 아래는 **개발 검증용**이다.
-터미널마다 `source install/setup.bash` 를 먼저 실행한다.
-
-```bash
-ros2 launch xycar_cam xycar_cam.launch.py        # /image_raw
-ros2 launch xycar_lidar xycar_lidar.launch.py    # /scan
-ros2 run image_resize resize_node                # /resized_image
-ros2 run lane_detection lane_node                # /lane_offset, /lane_fit, /lane_position
-ros2 run object_detection object_node            # /object_info
-ros2 run main main_node --ros-args -p mode:=3 -p show_debug:=true
-```
-
-`traffic_node` 는 `mode:=3`(`LANE_DRIVE` 시작)에서 요구 입력이 아니므로 뺀다.
-`mode:=0` 으로 시작하면 `/traffic_detection` 이 없어 즉시 STOP 이 된다.
-`joy_node` 는 `main_node` 가 `/joy` 를 구독하지 않아 불필요하다.
-
-`object_node` 기동 직후 `YOLO 로드 완료: ...` 로그가 뜨는지 확인한다. 안 뜨면 모델
-경로를 못 찾은 것이고, 박스가 안 나와 회피가 시작되지 않는다.
-그럴 때는 `-p model_path:=<경로>` 로 직접 지정한다.
-
-`show_debug:=true` 의 Status 창에는 전방 거리(`Object dist`) 아래에 측면 LiDAR
-거리(`Side L/R`)가 표시된다. 추월 완료 판정이 이 값으로 이뤄지므로, 회피 중 감시
-측면 값이 `side_detect_m`(0.40 m) 아래로 내려가는 시점을 눈으로 확인할 수 있다.
-해당 섹터에 유효 반사가 없으면 `N/A` 로 표시된다.
-
 ### 단위 테스트 / 오프라인 검증
 
 ```bash
