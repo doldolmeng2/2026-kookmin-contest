@@ -19,6 +19,9 @@ class LabelEditorTest(unittest.TestCase):
             image = np.full((12, 16, 3), 100, dtype=np.uint8)
             label = np.full((12, 16), 4, dtype=np.uint8)
             cv2.imwrite(str(image_path), image)
+            old_preview = root / 'previews/train/frame.png'
+            old_preview.parent.mkdir(parents=True)
+            cv2.imwrite(str(old_preview), image)
 
             editor = LabelEditor.__new__(LabelEditor)
             editor.root = root
@@ -34,6 +37,8 @@ class LabelEditorTest(unittest.TestCase):
             preview = root / 'previews/train/frame.jpg'
             self.assertTrue(np.array_equal(saved, label))
             self.assertTrue(preview.exists())
+            self.assertFalse(old_preview.exists())
+            self.assertEqual(len(list(preview.parent.glob('frame.*'))), 1)
 
     def test_undo_restores_previous_label(self):
         editor = LabelEditor.__new__(LabelEditor)

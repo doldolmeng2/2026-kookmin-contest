@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 
 import cv2
@@ -56,8 +57,15 @@ class LabelEditor:
         preview_path = self.root / 'previews' / self.split / f'{image_path.stem}.jpg'
         preview_path.parent.mkdir(parents=True, exist_ok=True)
         preview = overlay(self.image, self.label, self.config, 0.5)
-        if not cv2.imwrite(str(preview_path), preview):
+        temporary_path = preview_path.with_name(f'{preview_path.stem}.tmp.jpg')
+        if not cv2.imwrite(str(temporary_path), preview):
             raise OSError(f'미리보기 저장 실패: {preview_path}')
+        # Older datasets may contain PNG/JPEG previews for the same frame.
+        # Keep exactly one canonical JPG instead of leaving the old preview beside it.
+        for existing in preview_path.parent.glob(f'{image_path.stem}.*'):
+            if existing != temporary_path and existing.is_file():
+                existing.unlink()
+        os.replace(temporary_path, preview_path)
 
     def navigate(self, delta, save=True):
         if save:
