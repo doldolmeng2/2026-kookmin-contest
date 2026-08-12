@@ -1,72 +1,229 @@
-#!/usr/bin/env python3
-# ─────────────────────────────────────────────────────────────────────────────
-# joystic.py
-#
-# 역할: Xbox 컨트롤러(조이스틱) 입력을 Xycar 모터 명령으로 변환하는 수동 주행 노드
-#
-# 구독: /joy (sensor_msgs/Joy) - 조이스틱 축/버튼 상태
-# 발행: xycar_motor (std_msgs/Float32MultiArray) - [조향각, 속도]
-#
-# 매핑:
-#   axes[0] × -100 → 조향각 (왼쪽 스틱 좌우)
-#   axes[4] ×   50 → 속도   (오른쪽 스틱 상하)
-#
-# 10Hz (0.1초 타이머)로 최신 축 값을 주기적으로 발행한다.
-# ─────────────────────────────────────────────────────────────────────────────
+"""Deadman-gated Xbox Joy to Xycar motor command adapter."""
+
+from dataclasses import dataclass
+import math
+from typing import Sequence
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Joy
 from std_msgs.msg import Float32MultiArray
 
 
+@dataclass(frozen=True)
+class ManualDriveCommand:
+    steering: float = 0.0
+    speed: float = 0.0
+
+
+STOP_COMMAND = ManualDriveCommand()
+
+
+@dataclass(frozen=True)
+class ManualDriveConfig:
+    steering_axis: int = 0
+    steering_scale: float = -100.0
+    speed_axis: int = 4
+    speed_scale: float = 50.0
+    deadman_button: int = -1
+    max_abs_steering: float = 45.0
+    max_abs_speed: float = 7.5
+    joy_timeout_s: float = 0.25
+    publish_rate_hz: float = 20.0
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ('steering_axis', self.steering_axis),
+            ('speed_axis', self.speed_axis),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f'{name} must be a non-negative integer')
+        if (
+            isinstance(self.deadman_button, bool)
+            or not isinstance(self.deadman_button, int)
+            or self.deadman_button < -1
+        ):
+            raise ValueError('deadman_button must be -1 or a non-negative integer')
+        for name, value in (
+            ('steering_scale', self.steering_scale),
+            ('speed_scale', self.speed_scale),
+        ):
+            if not _finite_number(value):
+                raise ValueError(f'{name} must be finite')
+        for name, value in (
+            ('max_abs_steering', self.max_abs_steering),
+            ('max_abs_speed', self.max_abs_speed),
+            ('joy_timeout_s', self.joy_timeout_s),
+            ('publish_rate_hz', self.publish_rate_hz),
+        ):
+            if not _finite_number(value) or value <= 0.0:
+                raise ValueError(f'{name} must be finite and positive')
+
+
+class ManualDriveGate:
+    """Pure deadman, shape validation, clamp, and receipt-time watchdog."""
+
+    def __init__(self, config: ManualDriveConfig):
+        self.config = config
+        self.last_received_at = None
+        self.latest_command = STOP_COMMAND
+
+    def record_joy(
+        self,
+        axes: Sequence[float],
+        buttons: Sequence[int],
+        received_at: float,
+    ) -> ManualDriveCommand:
+        if not _finite_number(received_at):
+            self.latest_command = STOP_COMMAND
+            return STOP_COMMAND
+
+        self.last_received_at = float(received_at)
+        config = self.config
+        required_axis = max(config.steering_axis, config.speed_axis)
+        if (
+            config.deadman_button < 0
+            or len(axes) <= required_axis
+            or len(buttons) <= config.deadman_button
+            or buttons[config.deadman_button] != 1
+        ):
+            self.latest_command = STOP_COMMAND
+            return STOP_COMMAND
+
+        steering_input = axes[config.steering_axis]
+        speed_input = axes[config.speed_axis]
+        if not (
+            _finite_number(steering_input)
+            and _finite_number(speed_input)
+        ):
+            self.latest_command = STOP_COMMAND
+            return STOP_COMMAND
+
+        self.latest_command = ManualDriveCommand(
+            steering=_clamp(
+                float(steering_input) * config.steering_scale,
+                config.max_abs_steering,
+            ),
+            speed=_clamp(
+                float(speed_input) * config.speed_scale,
+                config.max_abs_speed,
+            ),
+        )
+        return self.latest_command
+
+    def command_at(self, now: float) -> ManualDriveCommand:
+        if not (
+            _finite_number(now)
+            and self.last_received_at is not None
+        ):
+            return STOP_COMMAND
+        age_s = float(now) - self.last_received_at
+        if not 0.0 <= age_s <= self.config.joy_timeout_s:
+            self.latest_command = STOP_COMMAND
+        return self.latest_command
+
+
 class JoyToMotor(Node):
-    """
-    조이스틱 입력을 모터 명령으로 변환하는 노드.
-    joy 토픽을 구독하고, 10Hz 타이머에서 최신 축 값을 모터 토픽으로 발행한다.
-    """
+    """Publish manual commands only while fresh Joy deadman input is held."""
 
     def __init__(self):
-        super().__init__('joy_to_motor')
+        super().__init__('manual_drive_node')
 
-        # 조이스틱 축 현재값 (joy_callback에서 갱신)
-        self.axis_0 = 0.0  # 왼쪽 스틱 좌우 (조향)
-        self.axis_4 = 0.0  # 오른쪽 스틱 상하 (속도)
-        self.last_speed = 0.0 #이전 속도 (브레이킹 감지용)
+        self.config = ManualDriveConfig(
+            steering_axis=self.declare_parameter('steering_axis', 0).value,
+            steering_scale=self.declare_parameter(
+                'steering_scale', -100.0
+            ).value,
+            speed_axis=self.declare_parameter('speed_axis', 4).value,
+            speed_scale=self.declare_parameter('speed_scale', 50.0).value,
+            deadman_button=self.declare_parameter('deadman_button', -1).value,
+            max_abs_steering=self.declare_parameter(
+                'max_abs_steering', 45.0
+            ).value,
+            max_abs_speed=self.declare_parameter(
+                'max_abs_speed', 7.5
+            ).value,
+            joy_timeout_s=self.declare_parameter('joy_timeout_s', 0.25).value,
+            publish_rate_hz=self.declare_parameter(
+                'publish_rate_hz', 20.0
+            ).value,
+        )
+        self.gate = ManualDriveGate(self.config)
 
-        # 모터 명령 메시지 (재사용)
-        self.motor_msg = Float32MultiArray()
+        joy_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        command_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.joy_sub = self.create_subscription(
+            Joy,
+            '/joy',
+            self.joy_callback,
+            joy_qos,
+        )
+        self.motor_pub = self.create_publisher(
+            Float32MultiArray,
+            'xycar_motor',
+            command_qos,
+        )
+        self.timer = self.create_timer(
+            1.0 / self.config.publish_rate_hz,
+            self.publish_cycle,
+        )
 
-        # joy 구독: 조이스틱 축/버튼 상태 수신
-        self.create_subscription(Joy, '/joy', self.joy_callback, 10)
+        self.publish_command(STOP_COMMAND)
+        deadman = (
+            str(self.config.deadman_button)
+            if self.config.deadman_button >= 0
+            else 'UNCONFIGURED (STOP only)'
+        )
+        self.get_logger().warning(
+            'Manual drive started: hold deadman for non-zero output; '
+            f'deadman_button={deadman}, timeout={self.config.joy_timeout_s:.2f}s'
+        )
 
-        # 모터 발행: xycar_motor [조향각, 속도]
-        self.motor_pub = self.create_publisher(Float32MultiArray, 'xycar_motor', 10)
+    def _now_seconds(self) -> float:
+        return self.get_clock().now().nanoseconds / 1_000_000_000.0
 
-        # 20Hz 타이머로 주기적 발행
-        self.create_timer(0.05, self.publish_motor)
+    def joy_callback(self, msg: Joy) -> None:
+        command = self.gate.record_joy(
+            msg.axes,
+            msg.buttons,
+            self._now_seconds(),
+        )
+        # Release and malformed input publish STOP in the callback cycle.
+        self.publish_command(command)
 
-        self.get_logger().info("Joy → Motor 노드 시작 (20Hz)")
+    def publish_cycle(self) -> None:
+        self.publish_command(self.gate.command_at(self._now_seconds()))
 
-    def joy_callback(self, msg: Joy):
-        """조이스틱 축 값을 갱신한다. axes[0]: 조향, axes[4]: 속도."""
-        if len(msg.axes) > 4:
-            self.axis_0 = msg.axes[0]
-            self.axis_4 = msg.axes[4]
+    def publish_command(self, command: ManualDriveCommand) -> None:
+        msg = Float32MultiArray()
+        msg.data = [float(command.steering), float(command.speed)]
+        self.motor_pub.publish(msg)
 
-    def publish_motor(self):
-        """
-        최신 축 값으로 조향각과 속도를 계산하여 xycar_motor에 발행한다.
-          조향각 = axes[0] × -100  (부호 반전: 왼쪽 스틱 왼쪽 → 양수 조향)
-          속도   = axes[4] ×   50
-        """
-        angle = -100 * self.axis_0
-        speed =   7.5 * self.axis_4
-        self.last_speed = speed
+    def publish_stop(self) -> None:
+        self.gate.latest_command = STOP_COMMAND
+        self.publish_command(STOP_COMMAND)
 
-        self.motor_msg.data = [float(angle), float(speed)]
-        self.motor_pub.publish(self.motor_msg)
-        print(f"[PUBLISH] Angle: {angle:.2f}, Speed: {speed:.2f}", flush=True)
+
+def _finite_number(value) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _clamp(value: float, maximum: float) -> float:
+    return max(-maximum, min(maximum, value))
 
 
 def main(args=None):
@@ -74,11 +231,17 @@ def main(args=None):
     node = JoyToMotor()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        try:
+            node.publish_stop()
+        except Exception:
+            # Context shutdown may already have invalidated the publisher.
+            pass
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

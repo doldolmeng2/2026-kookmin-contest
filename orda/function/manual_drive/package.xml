@@ -3,13 +3,15 @@
 <package format="3">
   <name>manual_drive</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Deadman-gated Xbox manual drive for Xycar</description>
   <maintainer email="ktypet13@hanyang.ac.kr">xytron</maintainer>
   <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>xycar_msgs</depend>
+  <exec_depend>joy</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
