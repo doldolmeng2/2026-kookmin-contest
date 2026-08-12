@@ -25,3 +25,7 @@ __pycache__/
 
 # ── 백업 ───────────────────────────────────────────────────
 *.bak
+
+# ── 라벨링 데이터셋 (Notion 등 외부 저장소로 공유) ──────────
+annotation_batches/*
+!annotation_batches/.gitkeep
