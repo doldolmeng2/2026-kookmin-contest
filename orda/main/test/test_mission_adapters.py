@@ -305,17 +305,24 @@ def test_stale_lane_command_is_zero_even_when_fixed_action_is_authorized():
     assert cycle.control.source is ControlSource.STOP
 
 
-def test_internal_zone_and_complete_seams_drive_only_the_declared_chain():
+def test_retained_fixed_zone_entry_seam_no_longer_changes_lane_drive():
     runtime = adapter(Mode.LANE_DRIVE)
 
     runtime.record_fixed_zone_entry(1.1)
-    fixed = runtime.step(1.1, lane=candidate(1.1))
+    ignored = runtime.step(1.1, lane=candidate(1.1))
+
+    assert ignored.transition.changed is False
+    assert runtime.fsm.state is Mode.LANE_DRIVE
+
+
+def test_internal_completion_seams_drive_only_the_declared_chain():
+    runtime = adapter(Mode.FIXED_AVOID)
+
     runtime.record_fixed_zone_exit(1.2)
     overtake = runtime.step(1.2, lane=candidate(1.2))
     runtime.record_overtake_complete(1.3)
     lane = runtime.step(1.3, lane=candidate(1.3))
 
-    assert fixed.transition.target is Mode.FIXED_AVOID
     assert overtake.transition.target is Mode.OVERTAKE
     assert lane.transition.target is Mode.LANE_DRIVE
 

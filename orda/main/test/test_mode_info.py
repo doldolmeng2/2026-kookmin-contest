@@ -96,7 +96,7 @@ def test_lane_change_code_is_not_emitted_while_action_is_unsafe():
     ) == [0, 0]
 
 
-def test_rejoin_completion_changes_external_mode_to_lane_not_fixed_avoid():
+def test_rejoin_completion_enters_fixed_avoid_with_fail_safe_external_mode():
     fsm = RaceFSM(
         initial_state=Mode.REJOIN,
         lane_validity_config=LaneValidityConfig(
@@ -117,6 +117,6 @@ def test_rejoin_completion_changes_external_mode_to_lane_not_fixed_avoid():
         SafetyDecision(inputs_ready=True),
     )
 
-    assert transition.target is Mode.LANE_DRIVE
-    assert fsm.state is Mode.LANE_DRIVE
-    assert external_mode_code(fsm.state) is LegacyModeInfoCode.LANE_DRIVE
+    assert transition.target is Mode.FIXED_AVOID
+    assert fsm.state is Mode.FIXED_AVOID
+    assert external_mode_code(fsm.state) is LegacyModeInfoCode.STOP

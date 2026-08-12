@@ -84,7 +84,7 @@ def test_safety_fault_precedes_every_nonterminal_mission_transition(mode):
         assert context.stop_reason == "contract fault"
 
 
-def test_rejoin_success_contract_returns_to_lane_and_never_enters_fixed_avoid():
+def test_rejoin_success_contract_enters_fixed_avoid_directly():
     fsm = RaceFSM(
         initial_state=Mode.REJOIN,
         lane_validity_config=LaneValidityConfig(
@@ -107,5 +107,4 @@ def test_rejoin_success_contract_returns_to_lane_and_never_enters_fixed_avoid():
     )
 
     assert transition.source is Mode.REJOIN
-    assert transition.target is Mode.LANE_DRIVE
-    assert transition.target is not Mode.FIXED_AVOID
+    assert transition.target is Mode.FIXED_AVOID

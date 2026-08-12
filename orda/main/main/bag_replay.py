@@ -61,8 +61,7 @@ _ALLOWED_TRANSITIONS = frozenset(
         (Mode.WAIT_GREEN, Mode.LANE_DRIVE),
         (Mode.LANE_DRIVE, Mode.CONE_DRIVE),
         (Mode.CONE_DRIVE, Mode.REJOIN),
-        (Mode.REJOIN, Mode.LANE_DRIVE),
-        (Mode.LANE_DRIVE, Mode.FIXED_AVOID),
+        (Mode.REJOIN, Mode.FIXED_AVOID),
         (Mode.FIXED_AVOID, Mode.OVERTAKE),
         (Mode.OVERTAKE, Mode.LANE_DRIVE),
         (Mode.LANE_DRIVE, Mode.SHORTCUT),
@@ -964,7 +963,7 @@ class OfflineBagReplay:
             )
         if "/lane_valid" in topic_types:
             scope.append(
-                "REJOIN to LANE_DRIVE on fresh recorded lane-validity edges"
+                "REJOIN to FIXED_AVOID on fresh recorded lane-validity edges"
             )
         if "/scan" in topic_types:
             scope.append("recorded scan receipt gap statistics")
@@ -973,7 +972,6 @@ class OfflineBagReplay:
     @staticmethod
     def _unverifiable_scope(topic_types: Mapping[str, str]) -> List[str]:
         scope = [
-            "fixed-obstacle entry from LANE_DRIVE",
             "fixed-vehicle avoidance and moving-vehicle overtake",
             "lap/Gate counting and FINISH entry",
             "left-turn recognition, shortcut readiness, and SHORTCUT entry",
@@ -981,7 +979,7 @@ class OfflineBagReplay:
             "motor adapter behavior or live vehicle motion",
         ]
         if "/lane_valid" not in topic_types:
-            scope.append("REJOIN to LANE_DRIVE lane-validity debounce")
+            scope.append("REJOIN to FIXED_AVOID lane-validity debounce")
         if "/traffic_detection" not in topic_types:
             scope.append("recorded start-green debounce")
         if "/rubbercone_info" not in topic_types:

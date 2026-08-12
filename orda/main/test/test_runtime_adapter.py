@@ -203,8 +203,13 @@ def test_second_normal_cone_session_dispatches_one_new_reset():
         1.51,
         lane=candidate(1.0, 5.0, 1.51),
     )
-    assert first_rejoin.transition.target is Mode.LANE_DRIVE
-    assert first_rejoin.control.source is ControlSource.LANE
+    assert first_rejoin.transition.target is Mode.FIXED_AVOID
+    assert first_rejoin.control.source is ControlSource.STOP
+
+    adapter.record_fixed_zone_exit(1.6)
+    assert adapter.step(1.6).transition.target is Mode.OVERTAKE
+    adapter.record_overtake_complete(1.7)
+    assert adapter.step(1.7).transition.target is Mode.LANE_DRIVE
 
     second_entry = enter_cone(adapter, 2.1)
     dispatch_cone_reset(second_entry, lambda: resets.append(2))
@@ -221,8 +226,8 @@ def test_second_normal_cone_session_dispatches_one_new_reset():
         2.61,
         lane=candidate(1.0, 5.0, 2.61),
     )
-    assert second_rejoin.transition.target is Mode.LANE_DRIVE
-    assert second_rejoin.control.source is ControlSource.LANE
+    assert second_rejoin.transition.target is Mode.FIXED_AVOID
+    assert second_rejoin.control.source is ControlSource.STOP
 
     stayed = adapter.step(2.63)
     dispatch_cone_reset(stayed, lambda: resets.append(99))

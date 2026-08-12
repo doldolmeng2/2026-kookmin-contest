@@ -224,26 +224,6 @@ class RaceFSM:
             if route_transition is not None:
                 return route_transition
 
-            # Explicit course-zone evidence outranks opportunistic cone
-            # perception. Object detection is deliberately not an entry guard.
-            if (
-                not context.on_shortcut_lap
-                and observation.fixed_zone_entered is True
-                and self._accept_mission_edge(
-                    "fixed_zone_entry",
-                    observation.fixed_zone_entry_received_at,
-                    observation,
-                    context,
-                )
-            ):
-                self._cone_entry.deactivate()
-                return self._change(
-                    Mode.FIXED_AVOID,
-                    "fresh fixed-zone entry",
-                    context,
-                    observation.now,
-                )
-
             if context.on_shortcut_lap:
                 self._cone_entry.deactivate()
                 return self._stay("normal-route missions suppressed on shortcut lap")
@@ -296,7 +276,7 @@ class RaceFSM:
             if decision.triggered:
                 self._lane_validity.deactivate()
                 return self._change(
-                    Mode.LANE_DRIVE,
+                    Mode.FIXED_AVOID,
                     "fresh lane validity confirmed",
                     context,
                     observation.now,

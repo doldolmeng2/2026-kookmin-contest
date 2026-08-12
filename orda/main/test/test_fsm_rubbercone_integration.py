@@ -44,7 +44,7 @@ def one_message_entry_runtime():
     )
 
 
-def test_integrated_cone_session_resets_once_and_rejoins_lane():
+def test_integrated_cone_session_resets_once_and_enters_fixed_avoid():
     adapter = one_message_entry_runtime()
     resets = []
     adapter.record_scan(1.0)
@@ -87,11 +87,11 @@ def test_integrated_cone_session_resets_once_and_rejoins_lane():
         assert waiting.control.source is ControlSource.STOP
 
     adapter.record_lane_validity(True, 1.51)
-    lane = adapter.step(1.51, lane=candidate(1.0, 5.0, 1.51))
+    fixed = adapter.step(1.51, lane=candidate(1.0, 5.0, 1.51))
 
-    assert lane.transition.source is Mode.REJOIN
-    assert lane.transition.target is Mode.LANE_DRIVE
-    assert lane.control.source is ControlSource.LANE
+    assert fixed.transition.source is Mode.REJOIN
+    assert fixed.transition.target is Mode.FIXED_AVOID
+    assert fixed.control.source is ControlSource.STOP
 
 
 def test_safety_stop_wins_over_fresh_cone_exit_in_integrated_cycle():
