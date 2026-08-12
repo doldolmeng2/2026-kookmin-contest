@@ -31,7 +31,7 @@ class OvertakeConfig:
     pass_delay_s: float = 2.0
 
     # 방해차량을 못 만난 바퀴에서도 구간을 빠져나가기 위한 상한.
-    zone_timeout_s: float = 8.0
+    zone_timeout_s: float = 12.0
 
     # 측면으로 볼 각도 범위(도). LiDAR는 차 맨 앞에 달려 있고 차체가 뒤쪽을
     # 가린다. bag의 각도별 프로파일상 |각도| > 약 105도 구간은 자기 차체가
