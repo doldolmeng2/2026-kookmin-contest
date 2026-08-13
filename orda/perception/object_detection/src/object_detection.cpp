@@ -57,10 +57,33 @@ public:
         min_cluster_points_ = this->declare_parameter<int>("min_cluster_points",      3);
         // 장애물 존재로 판단할 최대 거리 (m)
         detect_threshold_m_ = this->declare_parameter<double>("detect_threshold_m",   6.0);
-        // OpenCV imshow 디버그 창 활성화 여부
-        enable_gui_         = this->declare_parameter<bool>("enable_gui",             true);
-        // 박스 중심이 중앙선에서 ±lane_split_margin_px_ 이상 벗어나면 차선 레이블 부여
-        lane_split_margin_px_ = this->declare_parameter<double>("lane_split_margin_px", 10.0);
+        // OpenCV imshow 디버그 창 활성화 여부.
+        //
+        // 기본값을 false로 둔다. "OBJECT DEBUG"/"CAMERA VIEW" 두 창을 30 Hz로
+        // 갱신하면 같은 프로세스의 YOLO 추론과 CPU를 다투고, 그만큼 /object_info
+        // 와 /lane_offset 이 늦어진다. 실측(bag): 카메라는 18.8 Hz 로 들어오는데
+        // 인지 결과는 5.9 Hz 로 나왔다. 필요할 때만 enable_gui:=true 로 켠다.
+        enable_gui_         = this->declare_parameter<bool>("enable_gui",             false);
+        // 박스 중심이 중앙선에서 ±lane_split_margin_px_ 이상 벗어나면 차선 레이블 부여.
+        //
+        // 10 px 은 /lane_fit 의 흔들림보다 작아서 사실상 데드밴드가 없었다.
+        // rosbag2_2026_08_13-09_30_09 실측: 같은 방해차량을 보는 동안 box_cx 는
+        // 155.5 -> 159.0 으로 거의 안 움직였는데 x_line 이 약 68 px 튀어
+        // dx 가 -41 -> +31 로 부호까지 뒤집혔다(car_lane 1 -> 2). 마진을 실측
+        // 노이즈 수준으로 올리면 그런 프레임은 "미확정(0)"이 되어 반대 방향으로
+        // 오인되지 않는다. 진짜 좌/우 판정의 |dx| 는 같은 구간에서 77~84 px 였다.
+        lane_split_margin_px_ = this->declare_parameter<double>("lane_split_margin_px", 45.0);
+        // /lane_fit 이 이보다 오래되면 차선 판정에 쓰지 않는다. 낡은 회귀선으로
+        // 계산한 x_line 은 박스가 그대로여도 dx 부호를 바꿔 놓는다.
+        lane_fit_max_age_s_ = this->declare_parameter<double>("lane_fit_max_age_s",    0.5);
+        // YOLO 결과가 이보다 오래되면 박스 필드를 0으로 내보낸다.
+        //
+        // /object_info 는 50 Hz 타이머로 나가는데 YOLO 는 그보다 훨씬 느리다.
+        // 갱신되지 않은 박스를 계속 재발행하면 소비자는 "방금 본 장애물"과
+        // "300 ms 전에 본 장애물"을 구분할 수 없고, 카메라가 아예 죽어도
+        // 마지막 박스가 영원히 살아 있는 것처럼 보인다. 0을 내보내면 기존
+        // 계약 그대로 "이 프레임에는 카메라 증거 없음"으로 읽힌다.
+        box_max_age_s_      = this->declare_parameter<double>("box_max_age_s",         0.5);
         // lane_fit이 프레임 좌표계면 true (BEV 좌표계면 false)
         lane_fit_is_frame_  = this->declare_parameter<bool>("lane_fit_is_frame",     true);
         // YOLO 모델(.onnx) 경로. 빈 문자열이면 share 디렉터리를 탐색한다.
@@ -196,6 +219,7 @@ private:
         fit_m_     = msg->data[0];
         fit_b_     = msg->data[1];
         fit_valid_ = std::isfinite(fit_m_) && std::isfinite(fit_b_);
+        fit_stamp_ = now();
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -357,6 +381,7 @@ private:
             spn      = st_span_;
             cnt      = st_count_;
         }
+        rclcpp::Time box_stamp{0, 0, RCL_ROS_TIME};
         {
             std::lock_guard<std::mutex> lk(mtx_box_);
             box_area   = last_box_area_pix_;
@@ -364,6 +389,18 @@ private:
             cy         = last_box_cy_;
             dx         = last_box_dx_;
             lane_label = last_lane_label_;
+            box_stamp  = last_box_stamp_;
+        }
+
+        // 오래된 YOLO 결과는 재발행하지 않는다 (box_max_age_s_ 주석 참고).
+        const double box_age_s =
+            box_stamp.nanoseconds() > 0
+                ? (now() - box_stamp).seconds()
+                : std::numeric_limits<double>::infinity();
+        if (!(box_age_s >= 0.0 && box_age_s <= box_max_age_s_)) {
+            box_area   = 0.0f;
+            cx = cy = dx = 0.0f;
+            lane_label = 0;
         }
 
         const float exists = (lidar_ok && (minr <= detect_threshold_m_)) ? 1.0f : 0.0f;
@@ -527,10 +564,25 @@ private:
                         // 박스 중심과 차선 중앙선 x 비교 → lane_label 결정
                         float m = 0.f, b = 0.f;
                         bool lane_ok = false;
+                        rclcpp::Time fit_stamp{0, 0, RCL_ROS_TIME};
                         {
                             std::lock_guard<std::mutex> lk(mtx_lane_);
                             lane_ok = fit_valid_;
                             m = fit_m_; b = fit_b_;
+                            fit_stamp = fit_stamp_;
+                        }
+                        // 낡은 /lane_fit 은 쓰지 않는다. 차선 판정을 포기하면
+                        // lane_label 은 0(미확정)으로 남고, 소비자(runtime_adapter)
+                        // 는 이를 "반대 증거"가 아니라 "증거 없음"으로 다룬다.
+                        if (lane_ok && fit_stamp.nanoseconds() > 0) {
+                            const double fit_age_s = (now() - fit_stamp).seconds();
+                            if (fit_age_s < 0.0 || fit_age_s > lane_fit_max_age_s_) {
+                                lane_ok = false;
+                                RCLCPP_WARN_THROTTLE(
+                                    this->get_logger(), *this->get_clock(), 5000,
+                                    "/lane_fit 이 %.2f초 지연되어 차선 판정을 건너뜁니다.",
+                                    fit_age_s);
+                            }
                         }
                         if (lane_ok && lane_fit_is_frame_) {
                             float x_line = m * box_cy + b;
@@ -549,7 +601,7 @@ private:
                                            cv::Point((int)std::round(box_cx), (int)std::round(box_cy)),
                                            4, {0,255,0}, cv::FILLED);
 
-                                if (fit_valid_) {
+                                if (lane_ok) {
                                     // 차선 중앙선 그리기
                                     int x_top = (int)std::round(m * 0.0f  + b);
                                     int x_bot = (int)std::round(m * (H-1.0f) + b);
@@ -581,7 +633,9 @@ private:
             }
         }
 
-        // YOLO 결과 공유 변수 갱신 (onPublishTick에서 읽음)
+        // YOLO 결과 공유 변수 갱신 (onPublishTick에서 읽음).
+        // 박스를 못 찾은 프레임도 갱신 시각을 남긴다. "방금 봤는데 아무것도
+        // 없었다"와 "한참 전 결과가 남아 있다"는 다르다.
         {
             std::lock_guard<std::mutex> lk(mtx_box_);
             last_box_area_pix_ = box_area;
@@ -589,6 +643,7 @@ private:
             last_box_cy_       = box_cy;
             last_box_dx_       = box_dx;
             last_lane_label_   = lane_label;
+            last_box_stamp_    = now();
         }
     }
 
@@ -650,6 +705,8 @@ private:
     int    min_cluster_points_;
     bool   enable_gui_;
     double lane_split_margin_px_;
+    double lane_fit_max_age_s_;
+    double box_max_age_s_;
     bool   lane_fit_is_frame_;
     std::string model_path_;
 
@@ -687,11 +744,13 @@ private:
     float last_box_cx_       = 0.f, last_box_cy_ = 0.f;
     float last_box_dx_       = 0.f;
     int   last_lane_label_   = 0;
+    rclcpp::Time last_box_stamp_{0, 0, RCL_ROS_TIME};  // 마지막 YOLO 갱신 시각
 
     // ── 차선 회귀 공유 변수 (뮤텍스: mtx_lane_) ────────────────────────
     std::mutex mtx_lane_;
     float fit_m_     = 0.f, fit_b_ = 0.f;
     bool  fit_valid_ = false;
+    rclcpp::Time fit_stamp_{0, 0, RCL_ROS_TIME};  // 마지막 /lane_fit 수신 시각
 
     // ── LiDAR 상태 공유 변수 (뮤텍스: mtx_state_) ──────────────────────
     std::mutex mtx_state_;

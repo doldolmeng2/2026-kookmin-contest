@@ -106,6 +106,15 @@ def generate_launch_description():
         description='라바콘 LiDAR 인식 디버그 창 표시 여부'
     )
     rubbercone_enable_gui = LaunchConfiguration('rubbercone_enable_gui')
+    object_enable_gui_arg = DeclareLaunchArgument(
+        'object_enable_gui',
+        default_value='false',
+        description=(
+            '장애물 검출 디버그 창 표시 여부. 켜면 같은 프로세스의 YOLO 추론과 '
+            'CPU를 다투어 /object_info 와 /lane_offset 이 느려진다.'
+        )
+    )
+    object_enable_gui = LaunchConfiguration('object_enable_gui')
 
     # ── 소프트웨어 노드 (하드웨어 드라이버 제외) ────────────────────────────
     main_node = Node(
@@ -165,6 +174,7 @@ def generate_launch_description():
         executable='object_node',
         name='object_node',
         output='screen',
+        parameters=[{'enable_gui': object_enable_gui}],
     )
 
     return LaunchDescription([
@@ -182,6 +192,7 @@ def generate_launch_description():
         rubbercone_offset_gain_arg,
         rubbercone_offset_limit_arg,
         rubbercone_enable_gui_arg,
+        object_enable_gui_arg,
         main_node,
         traffic_node,
         rubbercone_node,

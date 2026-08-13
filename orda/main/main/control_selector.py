@@ -43,12 +43,17 @@ class ControlDecision:
 class ControlSelectorConfig:
     """Freshness policy for controller outputs in one shared clock domain.
 
-    The 0.25-second defaults are conservative integration defaults, not
-    race-day controller-performance thresholds. Producer rates must be
-    measured before live integration.
+    이 값은 실측 발행 주기에서 나온다. rosbag2_2026_08_13-09_30_09 (275초)
+    에서 ``/lane_offset`` 은 평균 169 ms, p90 358 ms, p99 721 ms 주기로
+    나왔다(카메라는 18.8 Hz인데 인지가 5.9 Hz). 예전 기본값 0.25초는 그
+    간격의 19%를 "stale"로 분류해, 정상 주행 중에 ControlSource.STOP 이
+    끊임없이 튀어나오고 속도가 0으로 리셋됐다.
+
+    라바콘 명령(``/rubbercone_info``)은 LiDAR 전용 노드라 카메라 부하와
+    무관하고 10 Hz 로 안정적이므로 0.25초를 유지한다.
     """
 
-    max_lane_age_s: float = 0.25
+    max_lane_age_s: float = 0.8
     max_cone_age_s: float = 0.25
 
     def __post_init__(self) -> None:

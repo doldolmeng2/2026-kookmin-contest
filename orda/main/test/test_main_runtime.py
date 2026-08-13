@@ -14,7 +14,7 @@ from rclpy.qos import (
     qos_profile_sensor_data,
 )
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Empty, Float32MultiArray, Int32MultiArray
+from std_msgs.msg import Bool, Empty, Float32MultiArray, Int32, Int32MultiArray
 
 from main.main import (
     LANE_VALIDITY_REQUIRED_RATE_HZ,
@@ -276,6 +276,14 @@ def test_generated_ros_entities_have_exact_topic_type_and_qos():
         assert lane_change_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
         assert lane_change_sub.qos_profile.durability is DurabilityPolicy.VOLATILE
 
+        # traffic_node 는 /traffic_detection 을 std_msgs/Int32 로 발행한다.
+        # 여기서 Bool 로 구독하면 타입이 어긋나 연결 자체가 성립하지 않고,
+        # INIT 의 필수 입력이 영영 채워지지 않는다.
+        traffic_sub = node.traffic_sub
+        assert traffic_sub.topic_name == "/traffic_detection"
+        assert traffic_sub.msg_type is Int32
+        assert traffic_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
+
         object_sub = node.object_info_sub
         assert object_sub.topic_name == "/object_info"
         assert object_sub.msg_type is Float32MultiArray
@@ -435,3 +443,98 @@ def test_is_change_end_follows_lane_change_state_feedback():
         assert node.is_change_end() is True
     finally:
         rclpy.shutdown()
+
+
+class ShapeHarness:
+    """_shape_selected_control 만 떼어 보기 위한 최소 상태."""
+
+    def __init__(self, *, now_speed=0.0, now_angle=0.0, race_started_at=None):
+        self.runtime = SimpleNamespace(
+            context=RaceContext(race_started_at=race_started_at),
+        )
+        self.now_speed = now_speed
+        self.now_angle = now_angle
+
+
+def test_stop_source_ramps_speed_down_and_holds_the_steering_angle():
+    """인지 한 프레임 공백이 완전 정지로 번지지 않게 램프로 감속한다.
+
+    예전에는 ControlSource.STOP 이면 속도를 즉시 0으로, 조향을 0으로 꺾었다.
+    재가속이 사이클당 +0.1(=5/초)이라 21.5까지 4초 넘게 걸렸고, 그 전에 다음
+    stale 이 와서 차가 앞으로 못 나갔다 (실측 평균 속도 2.24).
+    """
+    from main.control_selector import ControlSource, DriveCommand
+    from main.main import MainNode, STOP_DECEL_STEP
+
+    harness = ShapeHarness(now_speed=21.5, now_angle=12.0)
+
+    angle, speed = MainNode._shape_selected_control(
+        harness,
+        ControlSource.STOP,
+        DriveCommand(0.0, 0.0),
+        1.0,
+    )
+
+    assert speed == pytest.approx(21.5 - STOP_DECEL_STEP)
+    # 곡선 주행 중 앞바퀴를 펴면 감속하는 동안 코스 밖으로 밀려난다.
+    assert angle == pytest.approx(12.0)
+
+
+def test_stop_source_still_reaches_a_full_stop_quickly():
+    from main.control_selector import ControlSource, DriveCommand
+    from main.main import MainNode
+
+    harness = ShapeHarness(now_speed=21.5)
+
+    speed = 21.5
+    cycles = 0
+    while speed > 0.0 and cycles < 200:
+        _, speed = MainNode._shape_selected_control(
+            harness,
+            ControlSource.STOP,
+            DriveCommand(0.0, 0.0),
+            1.0,
+        )
+        cycles += 1
+
+    assert speed == 0.0
+    assert cycles <= 40          # 50 Hz 기준 0.8초 이내
+
+
+def test_lane_source_recovers_cruise_speed_in_about_one_second():
+    from main.control_selector import ControlSource, DriveCommand
+    from main.main import MainNode
+
+    harness = ShapeHarness()
+
+    speed = 0.0
+    cycles = 0
+    while speed < 21.5 and cycles < 500:
+        _, speed = MainNode._shape_selected_control(
+            harness,
+            ControlSource.LANE,
+            DriveCommand(3.0, 21.5),
+            1.0,
+        )
+        cycles += 1
+
+    assert speed == pytest.approx(21.5)
+    assert cycles <= 60          # 50 Hz 기준 1.2초 이내
+
+
+@pytest.mark.parametrize(
+    ("code", "green"),
+    [(0, False), (1, False), (2, True), (3, True)],
+)
+def test_traffic_callback_maps_int32_signal_codes_to_green(code, green):
+    """0=미검출, 1=적색/주황, 2=녹색, 3=좌회전 녹색 (traffic_node.infer)."""
+    from main.main import MainNode
+
+    harness = CallbackHarness([7.0], mode=Mode.WAIT_GREEN)
+
+    MainNode.traffic_callback(harness, SimpleNamespace(data=code))
+    cycle = harness.runtime.step(7.01)
+
+    assert harness.traffic_signal == code
+    assert cycle.observation.green_detected is green
+    assert cycle.observation.traffic_message_received_at == 7.0
