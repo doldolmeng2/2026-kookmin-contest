@@ -27,6 +27,7 @@ from main.control_selector import (
 )
 from main.mode_info import mode_info_data
 from main.overtake import OvertakeGuard, side_clearance
+from main.same_lane_brake import SameLaneBrake, SameLaneBrakeDecision
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
     RaceRuntimeAdapter,
@@ -183,6 +184,11 @@ class MainNode(Node):
 
         # 구간(FIXED_AVOID / OVERTAKE) 종료 판정. 순수 로직은 main.overtake가 갖는다.
         self.overtake = OvertakeGuard()
+        # 같은 차선 고정장애물 감속. 순수 로직은 main.same_lane_brake 가 갖는다.
+        self.same_lane_brake = SameLaneBrake()
+        self.last_same_lane_brake = SameLaneBrakeDecision(
+            speed_limit=float("inf"), same_lane=False, reason="not evaluated yet"
+        )
         self._zone_state: Optional[Mode] = None   # 직전 사이클의 FSM 상태
         self._zone_exit_sent = False              # 현재 구간의 종료 엣지를 이미 냈는지
         self._fixed_entry_sent = False            # 이번 LANE_DRIVE 세션에서 진입 엣지를 냈는지
@@ -414,6 +420,13 @@ class MainNode(Node):
             self.runtime.context.state_entered_at = now
 
         self._drive_mission_zones(now)
+        # 같은 차선 감속 판정은 제어값을 만들기 전에 갱신한다.
+        self.last_same_lane_brake = self.same_lane_brake.update(
+            now=now,
+            car_lane=self.car_lane,
+            ego_lane=self.detected_lane,
+            box_px=self.box_size,
+        )
         lane_candidate, cone_candidate = self._command_candidates()
 
         cycle = self.runtime.step(
@@ -534,6 +547,21 @@ class MainNode(Node):
         )
         return f"{confirmed} (streak {decision.streak})"
 
+    def _same_lane_brake_text(self) -> str:
+        """같은 차선 감속 상태를 표시한다.
+
+        상한이 무한대면 개입하지 않는 상태이므로 그대로 'off' 로 적는다.
+        hold 로 유지 중인지도 함께 보여야, 카메라가 잠깐 놓친 것인지 정말
+        차선을 벗어난 것인지 화면에서 구분할 수 있다.
+        """
+
+        decision = self.last_same_lane_brake
+        if not decision.same_lane:
+            return "off"
+        limit = decision.speed_limit
+        cap = "no cap" if not np.isfinite(limit) else f"<= {limit:.1f}"
+        return f"SAME LANE {cap}{' (hold)' if decision.holding else ''}"
+
     def _lane_command_text(self) -> str:
         """실제로 나가 있는 차선 명령을 표시한다.
 
@@ -572,6 +600,10 @@ class MainNode(Node):
         self.cone_controller = Controller()
 
         self.overtake.reset()
+        self.same_lane_brake.reset()
+        self.last_same_lane_brake = SameLaneBrakeDecision(
+            speed_limit=float("inf"), same_lane=False, reason="reset"
+        )
         self._zone_state = None
         self._zone_exit_sent = False
 
@@ -675,10 +707,16 @@ class MainNode(Node):
                 self.object_dist,
                 100,
             )
+            speed = float(self.lane_controller.get_speed() / 2.0)
+            # 고정장애물이 우리 차선에 있으면 접근할수록 속도를 낮춘다.
+            # 구간(FIXED_AVOID) 안팎을 가리지 않는다 — 진입 전에 미리 줄여 두는
+            # 편이 회피할 시간을 벌기 때문이다. 회피에 성공해 차선을 옮기면
+            # car_lane != ego_lane 이 되어 상한이 곧바로 풀린다.
+            speed = min(speed, self.last_same_lane_brake.speed_limit)
             lane_candidate = CommandCandidate(
                 DriveCommand(
                     angle=float(self.lane_controller.get_angle()),
-                    speed=float(self.lane_controller.get_speed() / 2.0),
+                    speed=speed,
                 ),
                 received_at=lane_received_at,
             )
@@ -807,6 +845,7 @@ class MainNode(Node):
             f"Avoid dir: {self._avoid_direction_text()}",
             f"Current lane: {self._lane_label(self.detected_lane)}",
             f"Lane cmd: {self._lane_command_text()}",
+            f"Same-lane brake: {self._same_lane_brake_text()}",
         ]
         # 줄 수에 맞춰 캔버스를 잡는다. 높이를 고정해 두면 줄을 추가했을 때
         # 마지막 줄이 조용히 화면 밖으로 밀려난다.
