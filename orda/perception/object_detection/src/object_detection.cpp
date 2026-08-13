@@ -182,7 +182,7 @@ private:
         // 소스 트리를 직접 가리키므로 모델을 교체하면 재빌드 없이 반영된다.
         static const std::vector<std::string> MODEL_PATH_CANDIDATES = {
             // 개발 PC
-            "/home/dxer1/2026-kookmin-contest/orda/perception/object_detection/best.onnx",
+            "/home/dxer0/xycar_ws/src/orda/perception/object_detection/best.onnx",
             // 실차 (Xycar)
             "/home/xytron/xycar_ws/src/orda/perception/object_detection/best.onnx",
         };

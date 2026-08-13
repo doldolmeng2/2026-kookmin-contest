@@ -108,10 +108,13 @@ def generate_launch_description():
     rubbercone_enable_gui = LaunchConfiguration('rubbercone_enable_gui')
     object_enable_gui_arg = DeclareLaunchArgument(
         'object_enable_gui',
-        default_value='false',
+        default_value='true',
         description=(
-            '장애물 검출 디버그 창 표시 여부. 켜면 같은 프로세스의 YOLO 추론과 '
-            'CPU를 다투어 /object_info 와 /lane_offset 이 느려진다.'
+            '장애물 검출 디버그 창(CAMERA VIEW / OBJECT DEBUG) 표시 여부. '
+            '기본 true. 켜두면 같은 프로세스의 YOLO 추론과 CPU를 다투어 '
+            '/object_info 와 /lane_offset 이 느려지므로(실측: 카메라 18.8 Hz '
+            '입력에 인지 5.9 Hz 출력), 기록 주행·성능 측정 시에는 '
+            'object_enable_gui:=false 로 끌 것.'
         )
     )
     object_enable_gui = LaunchConfiguration('object_enable_gui')
