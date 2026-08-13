@@ -38,6 +38,34 @@ def adapter(mode, *, lane_target=LaneTarget.CENTER):
     )
 
 
+# 회피 방향은 한 프레임으로 확정되지 않는다. AvoidDirectionDebouncer 가
+# 같은 방향의 표본 min_consecutive_frames(기본 3)개와, 그 구간이 덮는 시간
+# min_duration_s(기본 0.25초)를 함께 요구한다. 시간 조건이 없으면
+# object_detection 이 같은 YOLO 결과를 50 Hz 로 재발행하는 것만으로
+# 디바운스가 채워진다(실측: 메시지의 85.7%가 직전과 동일한 재발행).
+#
+# 표본 간격 0.15초는 실측 YOLO 갱신 주기(평균 0.30초, p10 0.15초)를 따른다.
+DIRECTION_TIMES = (1.1, 1.25, 1.4)
+
+
+def feed_direction(runtime, lane, times, *, box=100.0, exists=1.0, distance=1.2):
+    """같은 방향 표본을 연속으로 넣고 마지막 사이클을 돌려준다."""
+
+    cycle = None
+    for received_at in times:
+        assert runtime.record_object_info(
+            object_message(
+                exists=exists,
+                distance=distance,
+                lane=lane,
+                box=box,
+            ),
+            received_at,
+        ).accepted
+        cycle = runtime.step(received_at, lane=candidate(received_at))
+    return cycle
+
+
 def test_object_lane_and_lane_target_domains_are_explicitly_separate():
     assert opposite_lane_target(ObjectLane.LEFT) is LaneTarget.LANE_TWO
     assert opposite_lane_target(ObjectLane.RIGHT) is LaneTarget.LANE_ONE
@@ -110,11 +138,7 @@ def test_no_object_then_valid_object_restores_actionable_snapshot():
 
     assert runtime.record_object_info(no_cluster_message(), 1.1).accepted
     absent = runtime.step(1.1, lane=candidate(1.1))
-    assert runtime.record_object_info(
-        object_message(lane=ObjectLane.LEFT.value),
-        1.2,
-    ).accepted
-    detected = runtime.step(1.2, lane=candidate(1.2))
+    detected = feed_direction(runtime, ObjectLane.LEFT.value, (1.2, 1.35, 1.5))
 
     assert absent.observation.object_distance is None
     assert absent.observation.object_lane is ObjectLane.UNKNOWN
@@ -127,10 +151,9 @@ def test_no_object_then_valid_object_restores_actionable_snapshot():
 def test_valid_object_then_no_object_cannot_complete_pending_action():
     runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
 
-    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.1)
-    runtime.step(1.1, lane=candidate(1.1))
-    assert runtime.record_object_info(no_cluster_message(), 1.2).accepted
-    absent = runtime.step(1.2, lane=candidate(1.2))
+    feed_direction(runtime, ObjectLane.LEFT.value, DIRECTION_TIMES)
+    assert runtime.record_object_info(no_cluster_message(), 1.5).accepted
+    absent = runtime.step(1.5, lane=candidate(1.5))
 
     assert absent.observation.object_exists is False
     assert absent.observation.object_distance is None
@@ -139,7 +162,30 @@ def test_valid_object_then_no_object_cannot_complete_pending_action():
     assert runtime.lane_action.completed is False
 
 
-def test_stale_pre_entry_no_object_cannot_start_or_complete_action():
+def test_stale_object_snapshot_stops_the_avoid_zone():
+    """구간 안에서 인지가 실제로 끊기면(예산 초과) 정지한다."""
+
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
+
+    assert runtime.record_object_info(no_cluster_message(), 1.1).accepted
+    # 0.8초 공백. object_max_age_s(0.6)를 넘는다.
+    cycle = runtime.step(1.9, lane=candidate(1.9))
+
+    assert cycle.observation.object_exists is False
+    assert runtime.lane_action.pending is False
+    assert runtime.lane_action.completed is False
+    assert runtime.lane_action.safe_to_drive is False
+    assert cycle.control.source is ControlSource.STOP
+
+
+def test_fresh_pre_entry_no_object_holds_the_lane_without_starting_action():
+    """구간 진입 직전 표본은 주행을 막지 않지만 회피를 시작하지도 않는다.
+
+    예전에는 '진입 이후 표본'이 아니면 safe_to_drive 를 내려 STOP 으로
+    떨어뜨렸다. 그러면 구간에 들어서자마자 다음 /object_info 가 올 때까지
+    (실측 최대 0.35초) 장애물 앞에서 멈춰 섰다.
+    """
+
     runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
 
     assert runtime.record_object_info(no_cluster_message(), 0.9).accepted
@@ -148,8 +194,8 @@ def test_stale_pre_entry_no_object_cannot_start_or_complete_action():
     assert cycle.observation.object_exists is False
     assert runtime.lane_action.pending is False
     assert runtime.lane_action.completed is False
-    assert runtime.lane_action.safe_to_drive is False
-    assert cycle.control.source is ControlSource.STOP
+    assert runtime.lane_action.safe_to_drive is True
+    assert cycle.control.source is ControlSource.LANE
 
 
 @pytest.mark.parametrize(
@@ -195,8 +241,7 @@ def test_duplicate_lane_change_receipt_is_rejected():
 def test_left_object_starts_lane_two_action_and_success_does_not_exit_fixed():
     runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
 
-    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.1)
-    started = runtime.step(1.1, lane=candidate(1.1))
+    started = feed_direction(runtime, ObjectLane.LEFT.value, DIRECTION_TIMES)
     assert runtime.lane_action.pending is True
     assert runtime.context.lane_target is LaneTarget.LANE_TWO
     assert started.control.source is ControlSource.LANE
@@ -207,9 +252,9 @@ def test_left_object_starts_lane_two_action_and_success_does_not_exit_fixed():
         lane_change_active=runtime.lane_action.pending,
     ) == [5, 2]
 
-    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.2)
-    runtime.record_lane_change_state([1, 1], 1.21)
-    completed = runtime.step(1.21, lane=candidate(1.21))
+    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.5)
+    runtime.record_lane_change_state([1, 1], 1.51)
+    completed = runtime.step(1.51, lane=candidate(1.51))
 
     assert completed.transition.changed is False
     assert runtime.fsm.state is Mode.FIXED_AVOID
@@ -226,8 +271,7 @@ def test_left_object_starts_lane_two_action_and_success_does_not_exit_fixed():
 def test_right_object_maps_to_lane_one():
     runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_TWO)
 
-    runtime.record_object_info(object_message(lane=ObjectLane.RIGHT.value), 1.1)
-    runtime.step(1.1, lane=candidate(1.1))
+    feed_direction(runtime, ObjectLane.RIGHT.value, DIRECTION_TIMES)
 
     assert runtime.context.lane_target is LaneTarget.LANE_ONE
     assert runtime.lane_action.target is LaneTarget.LANE_ONE
@@ -237,11 +281,10 @@ def test_right_object_maps_to_lane_one():
 def test_overtake_reuses_lane_action_and_waits_for_explicit_completion():
     runtime = adapter(Mode.OVERTAKE, lane_target=LaneTarget.LANE_ONE)
 
-    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.1)
-    started = runtime.step(1.1, lane=candidate(1.1))
-    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.2)
-    runtime.record_lane_change_state([1, 1], 1.21)
-    success = runtime.step(1.21, lane=candidate(1.21))
+    started = feed_direction(runtime, ObjectLane.LEFT.value, DIRECTION_TIMES)
+    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.5)
+    runtime.record_lane_change_state([1, 1], 1.51)
+    success = runtime.step(1.51, lane=candidate(1.51))
 
     assert started.control.source is ControlSource.LANE
     assert success.transition.changed is False
@@ -257,40 +300,55 @@ def test_overtake_reuses_lane_action_and_waits_for_explicit_completion():
 @pytest.mark.parametrize(
     ("payload", "step_time"),
     [
+        # 좌/우 미확정: 방향을 못 정하니 회피는 시작하지 않는다.
         (object_message(exists=1.0, lane=ObjectLane.UNKNOWN.value), 1.1),
-        (object_message(exists=1.0, lane=ObjectLane.LEFT.value), 1.5),
+        # 한 프레임짜리 좌/우: 디바운스를 못 채워 아직 확정이 아니다.
+        (object_message(exists=1.0, lane=ObjectLane.LEFT.value), 1.1),
     ],
 )
-def test_unknown_or_stale_object_cannot_authorize_lane_action(payload, step_time):
+def test_unconfirmed_direction_holds_the_lane_instead_of_stopping(
+    payload,
+    step_time,
+):
+    """방향이 아직 확정되지 않았다고 구간 한복판에서 멈추지 않는다.
+
+    지금 차선을 유지한 채 계속 가는 편이, 장애물 앞에서 정지하는 것보다
+    안전하다. 카메라가 아무것도 못 보는 프레임(box=0)을 이미 그렇게 다루고
+    있었으므로 취급도 일관된다.
+    """
+
     runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
     runtime.record_object_info(payload, 1.1)
 
     cycle = runtime.step(step_time, lane=candidate(step_time))
 
     assert runtime.lane_action.pending is False
-    assert runtime.lane_action.safe_to_drive is False
-    assert cycle.control.source is ControlSource.STOP
+    assert runtime.context.lane_target is LaneTarget.LANE_ONE
+    assert runtime.lane_action.safe_to_drive is True
+    assert cycle.control.source is ControlSource.LANE
 
 
 def test_object_snapshot_from_before_state_entry_cannot_start_action():
     runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
-    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 0.9)
 
+    # 방향은 확정될 만큼 들어왔지만 전부 구간 진입(1.0) 이전 표본이다.
+    feed_direction(runtime, ObjectLane.LEFT.value, (0.6, 0.75, 0.9))
     cycle = runtime.step(1.1, lane=candidate(1.1))
 
+    assert runtime.avoid_direction.confirmed is LaneTarget.LANE_TWO
     assert runtime.lane_action.pending is False
-    assert cycle.control.source is ControlSource.STOP
+    assert runtime.context.lane_target is LaneTarget.LANE_ONE
+    assert cycle.control.source is ControlSource.LANE
 
 
 def test_pre_action_success_is_consumed_and_cannot_complete_later_action():
     runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.LANE_ONE)
     runtime.record_lane_change_state([1, 1], 1.05)
     runtime.step(1.05)
-    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.1)
-    runtime.step(1.1, lane=candidate(1.1))
-    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.2)
-    runtime.record_lane_change_state([1, 1], 1.21)
-    sticky = runtime.step(1.21, lane=candidate(1.21))
+    feed_direction(runtime, ObjectLane.LEFT.value, DIRECTION_TIMES)
+    runtime.record_object_info(object_message(lane=ObjectLane.LEFT.value), 1.5)
+    runtime.record_lane_change_state([1, 1], 1.51)
+    sticky = runtime.step(1.51, lane=candidate(1.51))
 
     assert sticky.observation.lane_change_success_edge is False
     assert runtime.lane_action.pending is True
@@ -306,7 +364,8 @@ def test_stale_lane_command_is_zero_even_when_fixed_action_is_authorized():
         1.1,
     )
 
-    cycle = runtime.step(1.3, lane=candidate(1.0))
+    # 차선 명령은 0.9초 전 것이라 max_lane_age_s(0.8)를 넘었다.
+    cycle = runtime.step(1.3, lane=candidate(0.4))
 
     assert runtime.lane_action.safe_to_drive is True
     assert cycle.control.source is ControlSource.STOP
@@ -321,17 +380,14 @@ def test_camera_alone_decides_avoid_direction_without_lidar():
     """
 
     runtime = adapter(Mode.FIXED_AVOID)
-    runtime.record_object_info(
-        object_message(
-            exists=0.0,
-            distance=math.inf,
-            lane=ObjectLane.LEFT.value,
-            box=10549.0,
-        ),
-        1.1,
+    feed_direction(
+        runtime,
+        ObjectLane.LEFT.value,
+        DIRECTION_TIMES,
+        exists=0.0,
+        distance=math.inf,
+        box=10549.0,
     )
-
-    runtime.step(1.1, lane=candidate(1.1))
 
     assert runtime.context.lane_target is LaneTarget.LANE_TWO
     assert runtime.lane_action.target is LaneTarget.LANE_TWO
@@ -339,25 +395,22 @@ def test_camera_alone_decides_avoid_direction_without_lidar():
     assert runtime.lane_action.safe_to_drive is True
 
 
-def test_camera_box_without_lane_label_does_not_authorize_action():
-    """박스는 있는데 좌/우가 미확정이면 방향을 못 정하므로 인가하지 않는다."""
+def test_camera_box_without_lane_label_holds_lane_without_action():
+    """박스는 있는데 좌/우가 미확정이면 방향을 정하지 않되, 멈추지도 않는다."""
 
     runtime = adapter(Mode.FIXED_AVOID)
-    runtime.record_object_info(
-        object_message(
-            exists=0.0,
-            distance=math.inf,
-            lane=ObjectLane.UNKNOWN.value,
-            box=2000.0,
-        ),
-        1.1,
+    feed_direction(
+        runtime,
+        ObjectLane.UNKNOWN.value,
+        DIRECTION_TIMES,
+        exists=0.0,
+        distance=math.inf,
+        box=2000.0,
     )
-
-    runtime.step(1.1, lane=candidate(1.1))
 
     assert runtime.context.lane_target is LaneTarget.CENTER
     assert runtime.lane_action.pending is False
-    assert runtime.lane_action.safe_to_drive is False
+    assert runtime.lane_action.safe_to_drive is True
 
 
 def test_internal_zone_and_complete_seams_drive_only_the_declared_chain():
@@ -443,17 +496,81 @@ def test_avoidance_stays_in_the_lane_it_moved_to():
     runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.CENTER)
 
     # 오른쪽(Lane2) 고정장애물 → 1차선으로 회피
-    runtime.record_object_info(object_message(lane=ObjectLane.RIGHT.value), 1.1)
-    runtime.step(1.1, lane=candidate(1.1))
+    feed_direction(runtime, ObjectLane.RIGHT.value, DIRECTION_TIMES)
     assert runtime.context.lane_target is LaneTarget.LANE_ONE
 
-    runtime.record_lane_change_state([1, 1], 1.2)
-    runtime.step(1.2, lane=candidate(1.2))
+    runtime.record_lane_change_state([1, 1], 1.5)
+    runtime.step(1.5, lane=candidate(1.5))
 
     # 장애물이 사라져도 1차선에 그대로 머문다
     runtime.record_object_info(no_cluster_message(), 1.3)
     runtime.step(1.3, lane=candidate(1.3))
     assert runtime.context.lane_target is LaneTarget.LANE_ONE
+
+
+def test_single_car_lane_flip_cannot_commit_the_colliding_direction():
+    """rosbag2_2026_08_13-09_30_09 t=42.3~43.4 실측 재생 (어댑터 통합).
+
+    car_lane 이 1 -> 2 -> 1 로 한 프레임 반전했을 때, 예전 코드는 그 한
+    프레임으로 lane_target 을 1차선(장애물이 있는 쪽)으로 확정하고 되돌리지
+    못했다. /mode_info 는 [5, 1] 로 나갔고 박스는 3772 -> 21600 px^2 로
+    커졌다(= 장애물로 들어감).
+    """
+
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.CENTER)
+    samples = [
+        (42.34, ObjectLane.LEFT),
+        (42.54, ObjectLane.LEFT),
+        (42.76, ObjectLane.RIGHT),   # 단 한 프레임 반전
+        (42.95, ObjectLane.LEFT),
+        (43.15, ObjectLane.LEFT),
+        (43.35, ObjectLane.LEFT),
+    ]
+
+    targets = []
+    for received_at, lane in samples:
+        runtime.record_object_info(
+            object_message(lane=lane.value, box=3500.0),
+            received_at,
+        )
+        runtime.step(received_at, lane=candidate(received_at))
+        targets.append(runtime.context.lane_target)
+
+    assert LaneTarget.LANE_ONE not in targets
+    assert runtime.context.lane_target is LaneTarget.LANE_TWO
+
+
+def test_wrong_direction_is_corrected_after_the_change_completed():
+    """구간 안에서 방향을 고칠 수 있어야 한다.
+
+    예전에는 재타겟 조건에 ``not action.completed`` 가 걸려 있어서, 변경이 한
+    번 끝나면 반대 증거가 아무리 쌓여도 목표를 되돌릴 수 없었다.
+    """
+
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.CENTER)
+
+    # 잘못된 방향으로 1차선 변경이 시작되고 완료된다.
+    feed_direction(runtime, ObjectLane.RIGHT.value, DIRECTION_TIMES)
+    assert runtime.context.lane_target is LaneTarget.LANE_ONE
+    runtime.measured_lane = LaneTarget.LANE_ONE.value
+    runtime.record_object_info(object_message(lane=ObjectLane.RIGHT.value), 1.5)
+    runtime.step(1.5, lane=candidate(1.5))
+    assert runtime.lane_action.completed is True
+
+    # 이후 카메라가 "장애물은 왼쪽"이라고 계속 말한다.
+    feed_direction(runtime, ObjectLane.LEFT.value, (1.9, 2.05, 2.2))
+
+    assert runtime.context.lane_target is LaneTarget.LANE_TWO
+    assert runtime.lane_action.target is LaneTarget.LANE_TWO
+    assert runtime.lane_action.pending is True
+    assert runtime.lane_action.completed is False
+    # 명령도 다시 차선 변경(5)으로 나가야 lane_detection 이 기준선을 옮긴다.
+    assert mode_info_data(
+        runtime.fsm.state,
+        runtime.context.lane_target.value,
+        mission_lane_control_enabled=runtime.lane_action.safe_to_drive,
+        lane_change_active=runtime.lane_action.pending,
+    ) == [5, 2]
 
 
 def test_center_is_the_default_before_any_avoidance():
@@ -475,15 +592,14 @@ def test_lane_change_completes_when_measured_lane_reaches_the_target():
     runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.CENTER)
 
     # 오른쪽(Lane2) 장애물 → 1차선으로 회피 명령
-    runtime.record_object_info(object_message(lane=ObjectLane.RIGHT.value), 1.1)
-    runtime.step(1.1, lane=candidate(1.1))
+    feed_direction(runtime, ObjectLane.RIGHT.value, DIRECTION_TIMES)
     assert runtime.context.lane_target is LaneTarget.LANE_ONE
     assert runtime.lane_action.pending is True
 
     # 아직 옮겨가지 못한 동안에는 완료가 아니다
     runtime.measured_lane = 0
-    runtime.record_object_info(object_message(lane=ObjectLane.RIGHT.value), 1.2)
-    runtime.step(1.2, lane=candidate(1.2))
+    runtime.record_object_info(object_message(lane=ObjectLane.RIGHT.value), 1.5)
+    runtime.step(1.5, lane=candidate(1.5))
     assert runtime.lane_action.completed is False
 
     # 실측 차선이 목표에 도달하면 완료

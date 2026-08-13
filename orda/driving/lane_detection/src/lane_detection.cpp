@@ -1007,6 +1007,8 @@ private:
     // false면 보조 차선 디버그 창을 숨기고 SlidingWindows / Mask-Yellow 만 남긴다.
     // debug_view_ 가 false면 이 값과 무관하게 모든 창이 꺼진다.
     bool debug_lane_view_ = config_.debug_lane_view;
+    // "Vehicle Dynamics" 창 마지막 표시 시각 (10 Hz 제한용)
+    rclcpp::Time last_dynamics_draw_{0, 0, RCL_ROS_TIME};
 
     // ── 모드/차선 상태 ──────────────────────────────────────────────────
     int  current_mode_ = 0;
@@ -1248,11 +1250,20 @@ private:
         last_steer_cmd_ = msg->data[0];
         if (msg->data.size() >= 2) last_speed_cmd_ = msg->data[1];
 
-        // /xycar_motor가 도착할 때마다 즉시 갱신: main.py의 "Status" 창과 같은
-        // 주기(제어 루프 주기)로 표시되도록, 카메라 프레임 콜백을 기다리지 않는다.
+        // 카메라 프레임 콜백을 기다리지 않고 /xycar_motor 수신마다 갱신하되,
+        // 표시 주기는 10 Hz 로 제한한다. /xycar_motor 는 제어 주기(50 Hz)로
+        // 들어오는데, 그때마다 imshow + waitKey 를 부르면 같은 스레드에서 도는
+        // 차선 인지가 그만큼 밀린다. 실측(bag): 카메라 18.8 Hz 입력에
+        // /lane_offset 은 5.9 Hz 출력. 눈으로 보는 창은 10 Hz 면 충분하다.
         if (debug_view_) {
-            cv::imshow("Vehicle Dynamics", drawVehicleDynamicsView());
-            cv::waitKey(1);
+            const rclcpp::Time stamp = this->get_clock()->now();
+            if (last_dynamics_draw_.nanoseconds() == 0 ||
+                (stamp - last_dynamics_draw_).seconds() >= 0.1 ||
+                (stamp - last_dynamics_draw_).seconds() < 0.0) {
+                last_dynamics_draw_ = stamp;
+                cv::imshow("Vehicle Dynamics", drawVehicleDynamicsView());
+                cv::waitKey(1);
+            }
         }
     }
 };

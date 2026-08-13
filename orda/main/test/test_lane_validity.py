@@ -98,7 +98,8 @@ def test_rejoin_stops_until_commit_then_selects_fresh_lane_control():
     assert committed.control.command == DriveCommand(2.0, 5.0)
 
 
-@pytest.mark.parametrize("candidate", [None, lane_candidate(1.0)])
+# 0.4초 수신은 now=1.31 기준 0.91초 전이라 max_lane_age_s(0.8)를 넘는다.
+@pytest.mark.parametrize("candidate", [None, lane_candidate(0.4)])
 def test_rejoin_to_lane_without_fresh_lane_command_selects_stop(candidate):
     config = LaneValidityConfig(min_messages=1, min_duration_s=0.0)
     fsm = RaceFSM(

@@ -15,6 +15,7 @@ from std_msgs.msg import (
     Empty,
     Float32MultiArray,
     Int16,
+    Int32,
     Int32MultiArray,
 )
 
@@ -41,6 +42,15 @@ LANE_CHANGE_STATE_TOPIC = "/lane_change_state"
 LANE_VALIDITY_REQUIRED_RATE_HZ = 10.0
 CONE_EVENT_WARNING_PERIOD_S = 5.0
 
+# /traffic_detection 값 규약 (traffic_light/traffic_node.py 의 infer()):
+#   0 = 미검출, 1 = 적색/주황, 2 = 녹색, 3 = 좌회전 녹색
+#
+# 이 노드는 예전에 같은 토픽을 std_msgs/Bool 로 구독했다. 발행 타입이 Int32라
+# 타입이 어긋나 연결 자체가 성립하지 않았고, /traffic_detection 은 한 번도
+# 도착하지 않았다. 그 결과 INIT 의 필수 입력이 영영 채워지지 않아 WAIT_GREEN
+# 으로 넘어가지 못했다 (런치에서 mode:=3 으로 띄우면 가려지는 증상이다).
+TRAFFIC_GREEN_CODES = (2, 3)
+
 # The controller gains remain the proven legacy implementation. These limits
 # are output shaping only; they do not participate in mission transitions.
 # 0.10 (5.0/s) took 2.2 s to reach the tuned 11.0 cruise speed in short
@@ -49,6 +59,17 @@ CONE_EVENT_WARNING_PERIOD_S = 5.0
 RUBBERCONE_ACCEL_STEP = 0.25
 RUBBERCONE_DECEL_STEP = 0.35
 RUBBERCONE_STEERING_STEP = 3.0
+
+# 차선 주행 가감속 (50 Hz 제어 주기 기준, 사이클당 증분).
+#
+# LANE_ACCEL_STEP: 예전 값 0.1 은 초당 5 여서 목표 속도 21.5 까지 4.3초가
+#   걸렸다. 인지가 잠깐 끊길 때마다 속도가 0으로 리셋됐으므로, 재가속이 끝나기
+#   전에 다음 끊김이 왔고 차는 사실상 앞으로 못 나갔다. 0.4 는 초당 20으로
+#   약 1.1초 만에 순항 속도를 회복한다.
+# STOP_DECEL_STEP: 초당 30. 21.5 에서 0까지 약 0.7초다. 정지는 여전히 확실히
+#   이뤄지되, 한두 프레임짜리 인지 공백이 완전 정지로 번지지 않는다.
+LANE_ACCEL_STEP = 0.4
+STOP_DECEL_STEP = 0.6
 
 # 이보다 크게 시각이 역행하면 "bag이 처음부터 다시 재생됨"으로 본다.
 # 실차 wall clock도 NTP 보정으로 아주 드물게 살짝 뒤로 갈 수 있어, 그런 미세
@@ -158,6 +179,7 @@ class MainNode(Node):
         self.side_right = float("inf")  # 우측면 최소 거리 (m, /scan 에서 계산)
         self.left = float("inf")
         self.right = float("inf")
+        self.traffic_signal = 0        # /traffic_detection 최신 코드 (표시용)
 
         # 구간(FIXED_AVOID / OVERTAKE) 종료 판정. 순수 로직은 main.overtake가 갖는다.
         self.overtake = OvertakeGuard()
@@ -213,7 +235,7 @@ class MainNode(Node):
             qos_fast,
         )
         self.traffic_sub = self.create_subscription(
-            Bool,
+            Int32,
             "traffic_detection",
             self.traffic_callback,
             qos_fast,
@@ -295,9 +317,13 @@ class MainNode(Node):
                 received_at,
             )
 
-    def traffic_callback(self, msg: Bool) -> None:
+    def traffic_callback(self, msg: Int32) -> None:
         received_at = self._now_seconds()
-        self.runtime.record_traffic(msg.data, received_at)
+        self.traffic_signal = int(msg.data)
+        self.runtime.record_traffic(
+            self.traffic_signal in TRAFFIC_GREEN_CODES,
+            received_at,
+        )
 
     def scan_callback(self, msg: LaserScan) -> None:
         self.runtime.record_scan(self._now_seconds())
@@ -492,6 +518,22 @@ class MainNode(Node):
             return "N/A"
         return f"{distance:.2f} m"
 
+    def _avoid_direction_text(self) -> str:
+        """디바운스를 통과한 회피 방향과 현재 연속 일치 수를 표시한다.
+
+        car_lane 한 프레임(위 Box 줄)과 실제로 방향을 확정한 값(이 줄)이
+        다를 수 있다는 것을 화면에서 바로 볼 수 있게 한다.
+        """
+        decision = self.runtime.last_avoid_direction
+        if decision is None:
+            return "N/A"
+        confirmed = (
+            self._lane_label(decision.target.value)
+            if decision.target is not None
+            else "unconfirmed"
+        )
+        return f"{confirmed} (streak {decision.streak})"
+
     def _lane_command_text(self) -> str:
         """실제로 나가 있는 차선 명령을 표시한다.
 
@@ -500,14 +542,17 @@ class MainNode(Node):
 
         구간 밖인지 여부는 바로 위 Mode 줄에 이미 나오므로 여기서 되풀이하지
         않는다. 변경 중일 때만 화살표로 구분한다.
+
+        유지 중이어도 래치된 목표 차선을 반드시 함께 찍는다. 예전에는 그냥
+        "Holding" 이라고만 써서, 차선 변경이 끝난 뒤 lane_target 이 1차선에
+        물려 있는 상태(= lane_detection 이 기준선을 1차선으로 계속 유지하는
+        상태)를 화면 어디서도 볼 수 없었다. 그래서 "Holding 인데 차가 왼쪽으로
+        꺾인다"처럼 보였다.
         """
+        target = self._lane_label(self.runtime.context.lane_target.value)
         if self.runtime.lane_action.pending:
-            target = self._lane_label(self.runtime.context.lane_target.value)
             return f"-> {target} (changing)"
-        # 유지 중일 때는 차선 이름을 붙이지 않는다. "Center" 라고 쓰면 중앙으로
-        # 옮기라는 명령처럼 읽히는데, 실제로는 지금 차선을 그대로 두는 상태다.
-        # 현재 차선은 바로 위 Current lane 줄에 실측값으로 나온다.
-        return "Holding"
+        return f"Holding @ {target}"
 
     def _reset_for_bag_loop(self) -> None:
         """bag이 처음부터 다시 재생될 때 내부 상태를 시작 시점으로 되돌린다.
@@ -674,8 +719,15 @@ class MainNode(Node):
             target_speed = min(target_speed, 5.0)
 
         if source is ControlSource.STOP:
-            self.now_angle = 0.0
-            self.now_speed = 0.0
+            # 감속은 램프로 한다. 인지가 한 프레임 늦었다고 속도를 즉시 0으로
+            # 꺾으면 재가속에 수 초가 걸려, 다음 끊김 전에 순항 속도를 회복하지
+            # 못한다. 실측(bag): 속도 0인 사이클 24.2%, 5 미만 83.4%, 평균 2.24
+            # (LANE_DRIVE 목표는 21.5). 램프면 0.3초짜리 공백은 속도를 조금
+            # 깎을 뿐이고, 진짜 정지 사유는 0.7초 안에 완전히 멈춘다.
+            #
+            # 조향은 마지막 값을 유지한다. 곡선 주행 중 감속하면서 앞바퀴를
+            # 0으로 펴면 차가 코스 밖으로 밀려난다.
+            self.now_speed = max(0.0, self.now_speed - STOP_DECEL_STEP)
         elif source is ControlSource.CONE:
             angle_delta = target_angle - self.now_angle
             self.now_angle += max(
@@ -695,7 +747,10 @@ class MainNode(Node):
         else:
             self.now_angle = target_angle
             if self.now_speed < target_speed:
-                self.now_speed = min(target_speed, self.now_speed + 0.1)
+                self.now_speed = min(
+                    target_speed,
+                    self.now_speed + LANE_ACCEL_STEP,
+                )
             else:
                 self.now_speed = target_speed
 
@@ -749,6 +804,7 @@ class MainNode(Node):
             f"Side L/R: {self._fmt_side(self.side_left)}"
             f" / {self._fmt_side(self.side_right)}",
             f"Box: {self.box_size:.0f}px^2  car_lane={self.car_lane}",
+            f"Avoid dir: {self._avoid_direction_text()}",
             f"Current lane: {self._lane_label(self.detected_lane)}",
             f"Lane cmd: {self._lane_command_text()}",
         ]
