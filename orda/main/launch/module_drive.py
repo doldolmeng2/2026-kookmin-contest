@@ -32,6 +32,8 @@
 #   rubbercone_offset_gain (기본값: 150) - 목표점(m)→조향 오프셋 변환 이득
 #   rubbercone_offset_limit (기본값: 45) - LiDAR 오프셋 안전 한계
 #   rubbercone_enable_gui (기본값: true) - 라바콘 LiDAR 인식 디버그 창 표시
+#   object_enable_gui (기본값: true) - 장애물 검출 디버그 창 표시
+#     (성능에 영향. 기록 주행 시 object_enable_gui:=false 권장)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -132,10 +134,13 @@ def generate_launch_description():
     rubbercone_enable_gui = LaunchConfiguration('rubbercone_enable_gui')
     object_enable_gui_arg = DeclareLaunchArgument(
         'object_enable_gui',
-        default_value='false',
+        default_value='true',
         description=(
-            '장애물 검출 디버그 창 표시 여부. 켜면 같은 프로세스의 YOLO 추론과 '
-            'CPU를 다투어 /object_info 와 /lane_offset 이 느려진다.'
+            '장애물 검출 디버그 창(CAMERA VIEW / OBJECT DEBUG) 표시 여부. '
+            '기본 true. 켜두면 같은 프로세스의 YOLO 추론과 CPU를 다투어 '
+            '/object_info 와 /lane_offset 이 느려지므로(실측: 카메라 18.8 Hz '
+            '입력에 인지 5.9 Hz 출력), 기록 주행·성능 측정 시에는 '
+            'object_enable_gui:=false 로 끌 것.'
         )
     )
     object_enable_gui = LaunchConfiguration('object_enable_gui')

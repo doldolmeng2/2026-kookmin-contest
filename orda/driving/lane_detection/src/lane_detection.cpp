@@ -1285,7 +1285,7 @@ private:
 static std::string resolve_config_path(int argc, char** argv) {
     static const std::vector<std::string> CONFIG_PATH_CANDIDATES = {
         // 개발 PC
-        "/home/dxer1/2026-kookmin-contest/orda/driving/lane_detection/lane_detection_parameter.json",
+        "/home/dxer0/xycar_ws/src/orda/driving/lane_detection/lane_detection_parameter.json",
         // 실차 (Xycar)
         "/home/xytron/xycar_ws/src/orda/driving/lane_detection/lane_detection_parameter.json",
     };
