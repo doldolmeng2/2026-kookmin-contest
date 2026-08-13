@@ -115,8 +115,6 @@ public:
         // ── YOLO 모델 초기화 ────────────────────────────────────────────
         // 모델 경로는 개발 PC / 실차 두 곳을 순서대로 확인한다 (resolveModelPath).
         // 예전에는 실차 경로 하나만 박혀 있어서, 개발 PC에서 재생할 때 모델
-        // 로드가 조용히 실패하고 CAMERA VIEW에 박스가 전혀 안 그려졌다.
-        // 에러가 터미널이 아니라 노드 로그에만 남아 원인 파악이 어려웠다.
         const std::string resolved = resolveModelPath();
         if (resolved.empty()) {
             RCLCPP_ERROR(this->get_logger(),
