@@ -1,6 +1,6 @@
 import unittest
 
-from main.control import BEFORE, CHANGE_LANE, LANE_DRIVE, Controller
+from main.control import BEFORE, CENTER_LANE, CHANGE_LANE, LANE_DRIVE, Controller
 
 
 class PurePursuitTest(unittest.TestCase):
@@ -19,7 +19,7 @@ class PurePursuitTest(unittest.TestCase):
         self.assertAlmostEqual(negative, -positive)
 
     def test_lane_modes_use_pure_pursuit(self):
-        for mode in (LANE_DRIVE, BEFORE, CHANGE_LANE):
+        for mode in (LANE_DRIVE, BEFORE, CHANGE_LANE, CENTER_LANE):
             with self.subTest(mode=mode):
                 controller = self.make_controller()
                 expected = controller._compute_steering_pure_pursuit(30)

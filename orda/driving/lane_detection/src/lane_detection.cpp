@@ -701,7 +701,9 @@ public:
         dot_x = std::clamp(dot_x, 0, sw - 1);
         circle(slider, Point(dot_x, sh/2), 6, Scalar(0, 0, 255), FILLED);
 
-        string mode_str   = (mode == LaneMode::LANE_ONE) ? "Mode: 1-Lane" : "Mode: 2-Lane";
+        string mode_str = "Mode: Center-Lane";
+        if (mode == LaneMode::LANE_ONE) mode_str = "Mode: 1-Lane";
+        else if (mode == LaneMode::LANE_TWO) mode_str = "Mode: 2-Lane";
         string offset_str = "Offset(px): " + std::to_string(static_cast<int>(std::round(offset_px)));
         putText(slider, mode_str,   Point(10, 20), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(220,220,220), 1);
         putText(slider, offset_str, Point(10, 42), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(220,220,220), 1);
@@ -922,8 +924,9 @@ public:
 
     // 차선 모드에 대응하는 목표 ref 비율(0~1) 반환
     float getTargetRefForMode(LaneMode m) const {
-        float r = (m == LaneMode::LANE_ONE) ? center_reference_lane_one_
-                                            : center_reference_lane_two_;
+        float r = 0.5f;
+        if (m == LaneMode::LANE_ONE) r = center_reference_lane_one_;
+        else if (m == LaneMode::LANE_TWO) r = center_reference_lane_two_;
         return std::clamp(r, 0.0f, 1.0f);
     }
 
@@ -1153,9 +1156,12 @@ private:
         current_mode_ = new_mode;
         current_lane_ = new_lane;
 
-        // lane_mode_ 갱신: 모드 5이거나 비3 → 3 전환 시에만 업데이트
+        // 중앙차선 모드(6)는 노란선을 BEV 정중앙에 둔다. 기존 차선 모드는
+        // 모드 5이거나 비3 → 3 전환 시 lane 필드에 따라 갱신한다.
         LaneMode old_lane_mode = lane_mode_;
-        if (new_mode == 5 || (prev_mode != 3 && new_mode == 3)) {
+        if (new_mode == 6) {
+            lane_mode_ = LaneMode::CENTER;
+        } else if (new_mode == 5 || (prev_mode != 3 && new_mode == 3)) {
             lane_mode_ = (new_lane == 0) ? LaneMode::LANE_ONE : LaneMode::LANE_TWO;
         }
 

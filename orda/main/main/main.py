@@ -41,6 +41,7 @@ RUBBERCONE_END   = 2  # 라바콘 종료 후 차선 진입 (고정 조향)
 LANE_DRIVE       = 3  # 차선 주행
 BEFORE           = 4  # 장애물 접근 대기 (추월 판단 중)
 CHANGE_LANE      = 5  # 차선 변경 중
+CENTER_LANE      = 6  # 노란 중앙선 직접 추종
 
 # 라바콘 구간은 LiDAR 프레임마다 경로 신뢰도가 달라질 수 있다. 목표 속도 변화는
 # 아래 단계로 제한해, 한 프레임의 경계 누락이 모터 명령의 급변으로 이어지지 않게 한다.
@@ -169,7 +170,7 @@ class MainNode(Node):
 
         if b == 1 and self.prev_b == 0:
             # B 버튼: 모드 증가
-            self.mode = min(CHANGE_LANE, self.mode + 1)
+            self.mode = min(CENTER_LANE, self.mode + 1)
             self.get_logger().info(f"Mode++ -> {self.mode}")
 
         self.prev_x = x
@@ -363,6 +364,7 @@ class MainNode(Node):
             LANE_DRIVE:       'LANE_DRIVE',
             BEFORE:           'BEFORE',
             CHANGE_LANE:      'CHANGE_LANE',
+            CENTER_LANE:      'CENTER_LANE',
         }
         lines = [
             f"Mode: {mode_map.get(self.mode, 'UNKNOWN')}",

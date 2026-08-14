@@ -8,10 +8,12 @@ using json = nlohmann::json;
 // 문자열 → LaneMode 열거형 변환
 // "LANE_ONE" → LaneMode::LANE_ONE
 // "LANE_TWO" → LaneMode::LANE_TWO
+// "CENTER" → LaneMode::CENTER
 // 그 외 문자열 → std::runtime_error 예외
 LaneMode lane_mode_from_string(const std::string& mode_str) {
     if (mode_str == "LANE_ONE") return LaneMode::LANE_ONE;
     if (mode_str == "LANE_TWO") return LaneMode::LANE_TWO;
+    if (mode_str == "CENTER") return LaneMode::CENTER;
     throw std::runtime_error("잘못된 lane_mode 값: " + mode_str);
 }
 

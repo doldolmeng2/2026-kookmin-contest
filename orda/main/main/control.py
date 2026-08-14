@@ -10,6 +10,7 @@
 #   LANE_DRIVE      (3): Pure Pursuit 조향 + 속도 감속 로직
 #   BEFORE          (4): 차선 주행 조향 + 장애물 접근 감속
 #   CHANGE_LANE     (5): Pure Pursuit 조향 + 속도 감속 로직
+#   CENTER_LANE     (6): 노란 중앙선 Pure Pursuit 직접 추종
 # ─────────────────────────────────────────────────────────────────────────────
 
 from collections import namedtuple
@@ -22,6 +23,7 @@ RUBBERCONE_END   = 2  # 라바콘 종료 후 차선 진입
 LANE_DRIVE       = 3  # 차선 주행
 BEFORE           = 4  # 장애물 접근 대기
 CHANGE_LANE      = 5  # 차선 변경
+CENTER_LANE      = 6  # 노란 중앙선 직접 추종
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 파라미터 설정 구역
@@ -55,6 +57,7 @@ PURE_PURSUIT_PARAMS = {
 SPEED_PARAMS = {
     LANE_DRIVE:       (31.0, 12.0, 0.5),
     CHANGE_LANE:      (31.0, 12.0, 0.5),
+    CENTER_LANE:      (31.0, 12.0, 0.5),
 }
 
 # 라바콘 속도 제어 파라미터.
@@ -173,6 +176,13 @@ class Controller:
             self.angle = self._compute_steering_pure_pursuit(offset)
             params     = self.speed_params.get(mode)
             self.speed = self._compute_speed_from_angle(mode, self.angle, params) if params else 0.5
+
+        elif mode == CENTER_LANE:
+            # lane_detection이 중앙선 기준(offset ref=0.5)을 발행한다.
+            self.angle = self._compute_steering_pure_pursuit(offset)
+            params = self.speed_params.get(mode)
+            self.speed = self._compute_speed_from_angle(
+                mode, self.angle, params) if params else 0.5
 
         else:
             # 정의되지 않은 모드: 안전 정지

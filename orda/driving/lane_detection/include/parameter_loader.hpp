@@ -2,10 +2,11 @@
 #include <string>
 
 // 차선 모드 열거형
-// LANE_ONE: 1차선 주행 기준, LANE_TWO: 2차선 주행 기준
+// LANE_ONE: 1차선, LANE_TWO: 2차선, CENTER: 노란 중앙선 직접 추종 기준
 enum class LaneMode {
     LANE_ONE,
-    LANE_TWO
+    LANE_TWO,
+    CENTER
 };
 
 // JSON 파라미터 파일에서 로드하는 전체 설정 구조체
