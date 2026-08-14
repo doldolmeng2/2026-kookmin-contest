@@ -38,10 +38,41 @@ PD_PARAMS = {
 #   scale_factor : |조향각| × scale_factor 만큼 최대 속도에서 감속
 SPEED_PARAMS = {
     Mode.LANE_DRIVE: (43.0, 16.0, 0.5),
-    # 회피 중에는 낮은 속도로 안정적으로 옮겨간다. 빠르면 차선 변경이 끝나기
-    # 전에 장애물에 도달한다.
-    # ★ 실차 튜닝 지점: 회피가 늦으면 max_speed를 낮추고, 굼뜨면 올린다.
-    Mode.FIXED_AVOID: (30.0, 14.0, 0.6),
+}
+
+# 고정장애물 속도 제어 파라미터. CONE_DRIVE와 같은 구조로, 조향각뿐 아니라
+# **장애물이 얼마나 가까운지**를 함께 본다. 최종 모터 속도는 main.py에서 이
+# 값의 1/2로 발행된다.
+#
+# 근접도는 YOLO 박스 면적으로 잰다. 면적은 거리의 대용값이고(대략 거리 제곱에
+# 반비례), 절대 거리로 환산하지 않는 이유는 실측에서 환산 상수가 일정하지
+# 않았기 때문이다 — 같은 bag에서 box·d²가 600~1200 사이로 흔들렸다. LiDAR
+# 전방 거리를 쓰지 않는 이유는 rosbag2_fixed_obstacles_overtake_1 실측에서
+# 전방 클러스터가 103 스캔 중 1번만 형성됐기 때문이다.
+FIXED_AVOID_SPEED_PARAMS = {
+    'cruise_speed':     30.0,  # 장애물이 멀 때 (최종 15.0)
+    'near_speed':       14.0,  # 근접 하한 (최종 7.0)
+    # 이 면적부터 감속을 시작한다. 구간 진입 임계값(FIXED_ENTRY_BOX_PX = 1900)과
+    # 같은 수준이라, 구간에 들어서는 시점부터 이미 속도가 떨어진다.
+    'slow_box_px':    2000.0,
+    # 이 면적에서 near_speed에 도달한다. stop bag 실측(같은 차선으로 판정된
+    # 프레임의 box_px 분포)은 최소 432 / 중앙 15040 / 최대 22885 였고, box
+    # 22686 px²인 프레임의 LiDAR min_dist가 0.23 m였다. 2만대는 접촉 직전이라
+    # 중앙값보다 앞에서 최저 속도에 닿도록 12000을 쓴다.
+    'near_box_px':   12000.0,
+    # 같은 차선에 장애물이 이만큼 크게 남아 있으면 정지한다. 회피에 성공해
+    # 차선을 옮기면 same_lane이 False가 되어 곧바로 풀린다.
+    'stop_box_px':   12000.0,
+    'turn_start_angle': 10.0,  # 이 조향각부터 감속
+    'turn_slowdown':     0.6,  # 큰 조향 시 감속 기울기
+    'turn_min_speed':   14.0,  # 조향 감속 하한 (최종 7.0)
+    # 박스를 놓친 프레임에서 마지막 판정을 유지하는 시간.
+    #
+    # 카메라가 매 프레임 박스를 주지는 않는다. 놓친 프레임을 곧바로 "장애물
+    # 없음"으로 읽으면 속도가 순항으로 튀어 올랐다가 다음 검출에서 다시
+    # 떨어진다. YOLO 갱신 주기 실측이 평균 0.30초(p10 0.15초)라 1.0초면
+    # 서너 프레임의 공백을 덮는다. 이 시간이 지나면 순항으로 돌아간다.
+    'box_hold_s':        1.0,
 }
 
 # 라바콘 속도 제어 파라미터.
@@ -82,6 +113,10 @@ class Controller:
         # 내부 제어 상태
         self.prev_offset       = 0.0  # 이전 오프셋 (PD 미분항 계산용)
         self.prev_mode: Optional[Mode] = None
+        # 마지막으로 본 박스와 그 시각 / 같은 차선 판정 (box_hold_s 동안 유지)
+        self.held_box_px       = 0.0
+        self.held_same_lane    = False
+        self.held_box_at: Optional[float] = None
 
         # PD / 속도 파라미터를 namedtuple로 변환
         self.pd_params = {
@@ -92,9 +127,12 @@ class Controller:
         }
 
         self.rubbercone_speed_params = RUBBERCONE_SPEED_PARAMS.copy()
+        self.fixed_avoid_speed_params = FIXED_AVOID_SPEED_PARAMS.copy()
 
-    def update(self, mode: Mode, offset: int, obstacle_dist: float,
-               rubbercone_confidence: int = 100):
+    def update(self, mode: Mode, offset: int,
+               rubbercone_confidence: int = 100,
+               box_px: float = 0.0, same_lane: bool = False,
+               now: Optional[float] = None):
         """
         메인 업데이트: 모드에 따라 조향각과 속도를 계산한다.
         모드가 바뀌면 내부 상태를 리셋한다.
@@ -112,7 +150,13 @@ class Controller:
             self.speed = self._compute_rubbercone_speed(
                 self.angle, rubbercone_confidence)
 
-        elif mode in (Mode.LANE_DRIVE, Mode.FIXED_AVOID):
+        elif mode is Mode.FIXED_AVOID:
+            # 고정장애물: 조향각 + 장애물 근접도로 감속한다.
+            self.angle = self._compute_steering_pd(mode, offset)
+            self.speed = self._compute_fixed_avoid_speed(
+                self.angle, box_px, same_lane, now)
+
+        elif mode is Mode.LANE_DRIVE:
             # PD 조향 + 조향각 기반 속도 감속
             self.angle = self._compute_steering_pd(mode, offset)
             params     = self.speed_params.get(mode)
@@ -156,6 +200,64 @@ class Controller:
         speed = params.max_speed - abs(angle) * params.scale_factor
         return max(params.min_speed, speed)
 
+    def _compute_fixed_avoid_speed(
+        self,
+        angle: float,
+        box_px: float,
+        same_lane: bool,
+        now: Optional[float] = None,
+    ) -> float:
+        """장애물 근접도와 조향각으로 회피 구간 속도를 만든다.
+
+        근접 감속과 조향 감속 중 **더 느린 쪽**을 쓴다. 같은 차선에 장애물이
+        너무 크게 남아 있으면(피하지 못한 상태) 0을 돌려 정지시킨다.
+
+        박스가 없는 프레임에서는 마지막 판정을 box_hold_s 동안 유지한다.
+        ``now`` 를 넘기지 않으면 유지 없이 이번 프레임 값만 쓴다.
+        """
+        params = self.fixed_avoid_speed_params
+        box = float(box_px) if box_px and box_px > 0.0 else 0.0
+
+        valid_now = (
+            now is not None
+            and not isinstance(now, bool)
+            and isinstance(now, (int, float))
+        )
+        if box > 0.0:
+            self.held_box_px = box
+            self.held_same_lane = same_lane
+            self.held_box_at = now if valid_now else None
+        elif (
+            valid_now
+            and self.held_box_at is not None
+            and now - self.held_box_at <= params['box_hold_s']
+        ):
+            # 카메라가 잠깐 놓친 프레임. 마지막 판정을 그대로 쓴다.
+            box = self.held_box_px
+            same_lane = self.held_same_lane
+
+        if same_lane and box >= params['stop_box_px']:
+            return 0.0
+
+        if box <= params['slow_box_px']:
+            near_speed = params['cruise_speed']
+        elif box >= params['near_box_px']:
+            near_speed = params['near_speed']
+        else:
+            remaining = (params['near_box_px'] - box) / (
+                params['near_box_px'] - params['slow_box_px'])
+            near_speed = (
+                params['near_speed']
+                + (params['cruise_speed'] - params['near_speed']) * remaining
+            )
+
+        turn_excess = max(0.0, abs(angle) - params['turn_start_angle'])
+        turn_speed = max(
+            params['turn_min_speed'],
+            params['cruise_speed'] - turn_excess * params['turn_slowdown'],
+        )
+        return min(near_speed, turn_speed)
+
     def _compute_rubbercone_speed(self, angle: float, confidence: int) -> float:
         """
         라바콘 경로 신뢰도로 목표 속도를 계산한다.
@@ -197,6 +299,9 @@ class Controller:
     def reset(self):
         """내부 제어 상태 초기화 (모드 전환 시 호출)"""
         self.prev_offset = 0.0
+        self.held_box_px = 0.0
+        self.held_same_lane = False
+        self.held_box_at = None
 
     def get_angle(self) -> float:
         """현재 계산된 조향각 반환"""

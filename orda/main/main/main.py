@@ -27,7 +27,6 @@ from main.control_selector import (
 )
 from main.mode_info import mode_info_data
 from main.overtake import OvertakeGuard, side_clearance
-from main.same_lane_brake import SameLaneBrake, SameLaneBrakeDecision
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
     RaceRuntimeAdapter,
@@ -77,8 +76,8 @@ STOP_DECEL_STEP = 0.6
 # 역행까지 리셋으로 잡지 않도록 넉넉한 임계값을 둔다.
 BAG_LOOP_BACKJUMP_S = 2.0
 
-# 이 면적을 넘는 박스를 고정장애물로 보고 FIXED_AVOID 구간에 진입한다.
-# is_moving 필드가 아직 없어 검출된 장애물은 전부 고정장애물로 간주한다.
+# 이 면적을 넘는 박스를 장애물로 보고 구간에 진입한다. 어느 구간인지는
+# /object_info 의 is_moving 이 고른다 (0/없음 → FIXED_AVOID, 1 → OVERTAKE).
 FIXED_ENTRY_BOX_PX = 1900.0
 
 # 추월 완료 판정 임계값은 main.overtake.OvertakeConfig가 갖는다.
@@ -175,6 +174,8 @@ class MainNode(Node):
         self.box_cy = float("nan")
         self.box_dx = float("nan")
         self.car_lane = -1
+        # /object_info 11번째 is_moving. None = 필드 없음(고정장애물로 취급).
+        self.obj_is_moving: Optional[bool] = None
         self.detected_lane = -1         # 실측 현재 차선 (-1=미확정, 0=중앙, 1=왼쪽, 2=오른쪽)
         self.side_left = float("inf")   # 좌측면 최소 거리 (m, /scan 에서 계산)
         self.side_right = float("inf")  # 우측면 최소 거리 (m, /scan 에서 계산)
@@ -184,14 +185,10 @@ class MainNode(Node):
 
         # 구간(FIXED_AVOID / OVERTAKE) 종료 판정. 순수 로직은 main.overtake가 갖는다.
         self.overtake = OvertakeGuard()
-        # 같은 차선 고정장애물 감속. 순수 로직은 main.same_lane_brake 가 갖는다.
-        self.same_lane_brake = SameLaneBrake()
-        self.last_same_lane_brake = SameLaneBrakeDecision(
-            speed_limit=float("inf"), same_lane=False, reason="not evaluated yet"
-        )
         self._zone_state: Optional[Mode] = None   # 직전 사이클의 FSM 상태
         self._zone_exit_sent = False              # 현재 구간의 종료 엣지를 이미 냈는지
-        self._fixed_entry_sent = False            # 이번 LANE_DRIVE 세션에서 진입 엣지를 냈는지
+        # 진입 엣지를 이미 냈는지. 추월 완료 판정이 나야 다시 무장한다.
+        self._fixed_entry_sent = False
 
         self.now_speed = 0.0
         self.now_angle = 0.0
@@ -387,6 +384,10 @@ class MainNode(Node):
         self.box_cy = float(data[7])
         self.box_dx = float(data[8])
         self.car_lane = int(data[9])
+        # 11번째 is_moving 은 어댑터가 이미 검증했다. 필드가 없는 구세대
+        # 메시지면 None 이고, 그때는 고정장애물로 본다(아래 _drive_mission_zones).
+        snapshot = self.runtime.latest_object_snapshot
+        self.obj_is_moving = snapshot.is_moving if snapshot is not None else None
 
     def lane_change_state_callback(self, msg: Int32MultiArray) -> None:
         received_at = self._now_seconds()
@@ -420,13 +421,6 @@ class MainNode(Node):
             self.runtime.context.state_entered_at = now
 
         self._drive_mission_zones(now)
-        # 같은 차선 감속 판정은 제어값을 만들기 전에 갱신한다.
-        self.last_same_lane_brake = self.same_lane_brake.update(
-            now=now,
-            car_lane=self.car_lane,
-            ego_lane=self.detected_lane,
-            box_px=self.box_size,
-        )
         lane_candidate, cone_candidate = self._command_candidates()
 
         cycle = self.runtime.step(
@@ -510,8 +504,6 @@ class MainNode(Node):
             self.get_logger().info(
                 f"측면 방해차량 인식 ({decision.side_distance:.2f}m), "
                 f"{self.overtake.config.pass_delay_s:.1f}초 후 추월 완료")
-        if decision.timed_out:
-            self.get_logger().info("방해차량 구간 시간 상한 초과 -> 차선 주행 복귀")
         return decision.complete
 
     @staticmethod
@@ -546,21 +538,6 @@ class MainNode(Node):
             else "unconfirmed"
         )
         return f"{confirmed} (streak {decision.streak})"
-
-    def _same_lane_brake_text(self) -> str:
-        """같은 차선 감속 상태를 표시한다.
-
-        상한이 무한대면 개입하지 않는 상태이므로 그대로 'off' 로 적는다.
-        hold 로 유지 중인지도 함께 보여야, 카메라가 잠깐 놓친 것인지 정말
-        차선을 벗어난 것인지 화면에서 구분할 수 있다.
-        """
-
-        decision = self.last_same_lane_brake
-        if not decision.same_lane:
-            return "off"
-        limit = decision.speed_limit
-        cap = "no cap" if not np.isfinite(limit) else f"<= {limit:.1f}"
-        return f"SAME LANE {cap}{' (hold)' if decision.holding else ''}"
 
     def _lane_command_text(self) -> str:
         """실제로 나가 있는 차선 명령을 표시한다.
@@ -600,12 +577,9 @@ class MainNode(Node):
         self.cone_controller = Controller()
 
         self.overtake.reset()
-        self.same_lane_brake.reset()
-        self.last_same_lane_brake = SameLaneBrakeDecision(
-            speed_limit=float("inf"), same_lane=False, reason="reset"
-        )
         self._zone_state = None
         self._zone_exit_sent = False
+        self._fixed_entry_sent = False
 
         # 인지 캐시도 비운다. 이전 루프의 마지막 프레임이 새 루프 첫 판단에
         # 섞이지 않게 한다.
@@ -613,6 +587,7 @@ class MainNode(Node):
         self.obj_exists = 0.0
         self.box_size = 0.0
         self.car_lane = -1
+        self.obj_is_moving = None
         self.detected_lane = -1
         self.side_left = float("inf")
         self.side_right = float("inf")
@@ -638,7 +613,8 @@ class MainNode(Node):
         부르면 된다 (API는 이미 있다).
 
         진입(fixed_zone_entry)은 지금 단계에서 **고정장애물 검출**로 만든다.
-        is_moving 이 없어 방해차량과 구분할 수 없으므로, 검출된 장애물을 전부
+        /object_info 의 11번째 is_moving 은 검출기가 고정장애물만 학습해
+        항상 0 이라 아직 방해차량을 구분해 주지 못하므로, 검출된 장애물을 전부
         고정장애물로 간주한다. 진입 publisher/topic 계약이 확정되면 이 블록을
         지우고 그 구독 콜백에서 record_fixed_zone_entry() 를 부르면 된다.
 
@@ -658,8 +634,6 @@ class MainNode(Node):
         self._zone_state = state
 
         if state is Mode.LANE_DRIVE:
-            if entered:
-                self._fixed_entry_sent = False
             entered_at = self.runtime.context.state_entered_at
             # 엣지는 state_entered_at 보다 "뒤"여야 수락되고 한 번만 소비된다.
             if (
@@ -669,9 +643,32 @@ class MainNode(Node):
                 and now > entered_at
             ):
                 self._fixed_entry_sent = True
-                self.runtime.record_fixed_zone_entry(now)
-                self.get_logger().info(
-                    f"고정장애물 검출 ({self.box_size:.0f}px^2) -> 고정장애물 구간 진입")
+                # 여기서 미션이 갈린다. is_moving 이 1이면 방해차량 추월
+                # (OVERTAKE), 0이면 고정장애물 회피(FIXED_AVOID)다. 필드가
+                # 없는 구세대 메시지(None)는 고정장애물로 본다 — 검출기가
+                # 이동체를 구분하기 전의 동작을 그대로 유지한다.
+                if self.obj_is_moving is True:
+                    self.runtime.record_overtake_entry(now)
+                    self.get_logger().info(
+                        f"방해차량 검출 ({self.box_size:.0f}px^2) -> 추월 구간 진입")
+                else:
+                    self.runtime.record_fixed_zone_entry(now)
+                    self.get_logger().info(
+                        f"고정장애물 검출 ({self.box_size:.0f}px^2) -> 고정장애물 구간 진입")
+            return
+
+        if state is Mode.OVERTAKE:
+            if entered:
+                self._enter_zone(now)
+            # 종료 판정은 고정장애물과 같은 측면 LiDAR 확인을 쓰되, 엣지는
+            # overtake_complete 로 낸다 (race_fsm 의 OVERTAKE 분기 계약).
+            if not self._zone_exit_sent and self.is_pass_comp(now):
+                self._zone_exit_sent = True
+                # 추월 완료 판정이 나야 다음 진입 엣지를 낼 수 있다.
+                self._fixed_entry_sent = False
+                self.runtime.record_pass_complete(now)
+                self.runtime.record_overtake_complete(now)
+                self.get_logger().info("방해차량 추월 확인 -> 차선 주행 복귀")
             return
 
         if state is Mode.FIXED_AVOID:
@@ -682,6 +679,13 @@ class MainNode(Node):
             # 취소되고, /mode_info 코드가 5↔3↔0 으로 요동친다.
             if not self._zone_exit_sent and self.is_pass_comp(now):
                 self._zone_exit_sent = True
+                # 진입 엣지는 여기서만 다시 무장한다. 추월 완료 판정 없이
+                # LANE_DRIVE 로 돌아오는 경로(안전 STOP 복귀 등)에서는
+                # 같은 장애물로 다시 들어가지 않는다.
+                self._fixed_entry_sent = False
+                # 차선 변경 명령 잠금도 이 시각을 기준으로 풀린다
+                # (COMMAND_RELEASE_AFTER_PASS_S).
+                self.runtime.record_pass_complete(now)
                 self.runtime.record_fixed_zone_exit(now)
                 self.get_logger().info("고정장애물 추월 확인 -> 차선 주행 복귀")
             return
@@ -701,18 +705,20 @@ class MainNode(Node):
                 if self.runtime.fsm.state is Mode.FIXED_AVOID
                 else Mode.LANE_DRIVE
             )
+            # 회피 구간 감속은 Controller 가 박스 면적으로 직접 한다
+            # (control.FIXED_AVOID_SPEED_PARAMS). 같은 차선 판정은 정지
+            # 조건에만 쓰이며, 회피에 성공해 차선을 옮기면 곧바로 풀린다.
             self.lane_controller.update(
                 control_mode,
                 lane_offset,
-                self.object_dist,
-                100,
+                box_px=self.box_size,
+                same_lane=(
+                    self.car_lane in (1, 2)
+                    and self.car_lane == self.detected_lane
+                ),
+                now=self._last_now,
             )
             speed = float(self.lane_controller.get_speed() / 2.0)
-            # 고정장애물이 우리 차선에 있으면 접근할수록 속도를 낮춘다.
-            # 구간(FIXED_AVOID) 안팎을 가리지 않는다 — 진입 전에 미리 줄여 두는
-            # 편이 회피할 시간을 벌기 때문이다. 회피에 성공해 차선을 옮기면
-            # car_lane != ego_lane 이 되어 상한이 곧바로 풀린다.
-            speed = min(speed, self.last_same_lane_brake.speed_limit)
             lane_candidate = CommandCandidate(
                 DriveCommand(
                     angle=float(self.lane_controller.get_angle()),
@@ -727,7 +733,6 @@ class MainNode(Node):
             self.cone_controller.update(
                 Mode.CONE_DRIVE,
                 cone_event.offset,
-                self.object_dist,
                 cone_event.confidence,
             )
             cone_candidate = CommandCandidate(
@@ -845,7 +850,6 @@ class MainNode(Node):
             f"Avoid dir: {self._avoid_direction_text()}",
             f"Current lane: {self._lane_label(self.detected_lane)}",
             f"Lane cmd: {self._lane_command_text()}",
-            f"Same-lane brake: {self._same_lane_brake_text()}",
         ]
         # 줄 수에 맞춰 캔버스를 잡는다. 높이를 고정해 두면 줄을 추가했을 때
         # 마지막 줄이 조용히 화면 밖으로 밀려난다.

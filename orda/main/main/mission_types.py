@@ -55,6 +55,13 @@ class ObjectSnapshot:
     # YOLO 바운딩 박스 면적(px^2). exists/distance 는 LiDAR 산출물이지만 이 값과
     # lane 은 카메라 단독으로 나온다. 회피 방향은 이 둘만 보고 정한다.
     box_px: float = 0.0
+    # 박스 중심 x 와 중앙선까지의 거리(px). x_line = box_cx - box_dx 로
+    # 차선 피팅 기준선을 복원해 안정성을 본다 (main.avoid_direction).
+    box_cx: float = 0.0
+    box_dx: float = 0.0
+    # /object_info 11번째 필드. True=방해차량(OVERTAKE), False=고정장애물
+    # (FIXED_AVOID). None 은 "필드가 없는 구세대 메시지"라 판단 근거가 아니다.
+    is_moving: Optional[bool] = None
 
 
 @dataclass(frozen=True)

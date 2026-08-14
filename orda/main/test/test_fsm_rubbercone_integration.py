@@ -141,15 +141,15 @@ def test_stale_rubbercone_command_stops_without_lane_fallback():
 def test_controller_accepts_only_current_fsm_drive_modes_and_keeps_tuning():
     controller = Controller()
 
-    controller.update(Mode.CONE_DRIVE, 45, float("inf"), 100)
+    controller.update(Mode.CONE_DRIVE, 45, 100)
     assert controller.get_angle() == pytest.approx(45.0)
     assert controller.get_speed() == pytest.approx(16.0)
 
-    controller.update(Mode.REJOIN, 45, float("inf"), 100)
+    controller.update(Mode.REJOIN, 45, 100)
     assert controller.get_angle() == 0.0
     assert controller.get_speed() == 0.0
 
-    controller.update(Mode.LANE_DRIVE, 0, float("inf"), 100)
+    controller.update(Mode.LANE_DRIVE, 0, 100)
     assert controller.get_speed() == pytest.approx(43.0)
 
 
