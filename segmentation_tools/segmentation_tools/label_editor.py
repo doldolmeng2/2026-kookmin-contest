@@ -9,6 +9,7 @@ from .core import CLASS_NAMES, load_config, overlay
 
 
 WINDOW = 'Segmentation label editor'
+HEADER_HEIGHT = 52
 
 
 def print_controls(dataset, split, sample_count):
@@ -120,6 +121,13 @@ class LabelEditor:
             self.label[components == component_id] = self.class_id
 
     def mouse(self, event, x, y, _flags, _param):
+        # The status header is displayed above the image, not on top of it.
+        # Convert window coordinates back to label-image coordinates.
+        y -= HEADER_HEIGHT
+        if event == cv2.EVENT_LBUTTONUP:
+            self.drawing = False
+            self.last_point = None
+            return
         if not (0 <= x < self.label.shape[1] and 0 <= y < self.label.shape[0]):
             return
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -136,19 +144,15 @@ class LabelEditor:
             else:
                 self.apply_component(x, y)
             self.last_point = (x, y)
-        elif event == cv2.EVENT_LBUTTONUP:
-            self.drawing = False
-            self.last_point = None
-
     def render(self):
         canvas = overlay(self.image, self.label, self.config, self.alpha) if self.show_overlay else self.image.copy()
         image_name = self.items[self.index][0].name
         line1 = f'{self.index + 1}/{len(self.items)} {image_name}'
         line2 = f'{self.mode}  class {self.class_id}:{CLASS_NAMES[self.class_id]}  brush={self.brush_size}'
-        cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 52), (0, 0, 0), -1)
-        cv2.putText(canvas, line1, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(canvas, line2, (8, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.imshow(WINDOW, canvas)
+        header = np.zeros((HEADER_HEIGHT, canvas.shape[1], 3), dtype=np.uint8)
+        cv2.putText(header, line1, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(header, line2, (8, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.imshow(WINDOW, cv2.vconcat([header, canvas]))
 
     def run(self):
         while True:

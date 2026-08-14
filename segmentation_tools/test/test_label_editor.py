@@ -7,10 +7,25 @@ from io import StringIO
 import cv2
 import numpy as np
 
-from segmentation_tools.label_editor import LabelEditor, print_controls
+from segmentation_tools.label_editor import HEADER_HEIGHT, LabelEditor, print_controls
 
 
 class LabelEditorTest(unittest.TestCase):
+    def test_mouse_header_is_not_painted_and_image_y_is_adjusted(self):
+        editor = LabelEditor.__new__(LabelEditor)
+        editor.label = np.zeros((10, 10), dtype=np.uint8)
+        editor.class_id = 4
+        editor.mode = 'brush'
+        editor.brush_size = 1
+        editor.drawing = False
+        editor.last_point = None
+        editor.undo_stack = []
+
+        editor.mouse(cv2.EVENT_LBUTTONDOWN, 5, 10, 0, None)
+        self.assertFalse(editor.drawing)
+        editor.mouse(cv2.EVENT_LBUTTONDOWN, 5, HEADER_HEIGHT + 3, 0, None)
+        self.assertEqual(editor.label[3, 5], 4)
+
     def test_print_controls_lists_required_keys_and_paths(self):
         output = StringIO()
         with redirect_stdout(output):
