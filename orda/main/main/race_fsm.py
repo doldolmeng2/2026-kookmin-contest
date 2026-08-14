@@ -288,29 +288,6 @@ class RaceFSM:
                     observation.now,
                 )
 
-            # 방해차량(is_moving=1)은 같은 검출에서 갈라지는 별개 미션이다.
-            # 규칙이 다르다: OVERTAKE 는 추월 중 차선 이탈이 허용되고
-            # (README), 종료도 fixed_zone_exit 이 아니라 overtake_complete
-            # 로 확정한다. 어느 엣지를 낼지는 main_node 가 is_moving 으로
-            # 고르고, 여기서는 온 엣지를 그대로 신뢰한다.
-            if (
-                not context.on_shortcut_lap
-                and observation.overtake_entered is True
-                and self._accept_mission_edge(
-                    "overtake_entry",
-                    observation.overtake_entry_received_at,
-                    observation,
-                    context,
-                )
-            ):
-                self._cone_entry.deactivate()
-                return self._change(
-                    Mode.OVERTAKE,
-                    "fresh overtake entry",
-                    context,
-                    observation.now,
-                )
-
             if context.on_shortcut_lap:
                 self._cone_entry.deactivate()
                 return self._stay("normal-route missions suppressed on shortcut lap")
@@ -384,8 +361,7 @@ class RaceFSM:
             ):
                 # 고정장애물 구간이 끝나면 곧바로 차선 주행으로 돌아간다.
                 # OVERTAKE 는 "움직이는 방해차량" 상황용이라 이 경로에서는
-                # 거치지 않는다. 그쪽은 LANE_DRIVE 에서 overtake_entry 로
-                # 직접 갈라진다.
+                # 거치지 않는다. 진입 계약이 생기면 그때 연결한다.
                 return self._change(
                     Mode.LANE_DRIVE,
                     "fresh fixed-zone exit",

@@ -81,7 +81,8 @@ def test_object_lane_and_lane_target_domains_are_explicitly_separate():
     "payload",
     [
         object_message()[:-1],
-        # 길이 초과는 오류가 아니다. 11번째 is_moving 이 계약에 있다.
+        # 길이 초과는 더 이상 오류가 아니다. object_detection이 측면 LiDAR
+        # 거리를 11·12번째 필드로 덧붙였고, 어댑터는 앞 10필드만 쓴다.
         object_message(distance=math.nan),
         object_message(distance=math.inf),
         object_message(lane=1.5),
@@ -275,6 +276,7 @@ def test_right_object_maps_to_lane_one():
     assert runtime.context.lane_target is LaneTarget.LANE_ONE
     assert runtime.lane_action.target is LaneTarget.LANE_ONE
     assert runtime.lane_action.pending is True
+
 
 def test_overtake_reuses_lane_action_and_waits_for_explicit_completion():
     runtime = adapter(Mode.OVERTAKE, lane_target=LaneTarget.LANE_ONE)
@@ -471,6 +473,20 @@ def test_route_encounter_seam_is_one_shot_and_updates_lap_context():
     assert runtime.context.completed_laps == 1
 
 
+def test_object_info_accepts_extra_side_lidar_fields():
+    """object_detection이 붙인 측면 LiDAR 2필드(11·12번째)를 받아들여야 한다.
+
+    이 두 필드가 거부되면 /object_info 전체가 버려져 회피 판단 입력이 끊긴다.
+    """
+
+    runtime = adapter(Mode.FIXED_AVOID)
+
+    result = runtime.record_object_info(object_message() + [0.42, 1.30], 1.1)
+
+    assert result.accepted is True
+    assert runtime.latest_object_snapshot is not None
+
+
 def test_avoidance_stays_in_the_lane_it_moved_to():
     """회피 후 되돌아오지 않는다.
 
@@ -522,6 +538,39 @@ def test_single_car_lane_flip_cannot_commit_the_colliding_direction():
 
     assert LaneTarget.LANE_ONE not in targets
     assert runtime.context.lane_target is LaneTarget.LANE_TWO
+
+
+def test_wrong_direction_is_corrected_after_the_change_completed():
+    """구간 안에서 방향을 고칠 수 있어야 한다.
+
+    예전에는 재타겟 조건에 ``not action.completed`` 가 걸려 있어서, 변경이 한
+    번 끝나면 반대 증거가 아무리 쌓여도 목표를 되돌릴 수 없었다.
+    """
+
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.CENTER)
+
+    # 잘못된 방향으로 1차선 변경이 시작되고 완료된다.
+    feed_direction(runtime, ObjectLane.RIGHT.value, DIRECTION_TIMES)
+    assert runtime.context.lane_target is LaneTarget.LANE_ONE
+    runtime.measured_lane = LaneTarget.LANE_ONE.value
+    runtime.record_object_info(object_message(lane=ObjectLane.RIGHT.value), 1.5)
+    runtime.step(1.5, lane=candidate(1.5))
+    assert runtime.lane_action.completed is True
+
+    # 이후 카메라가 "장애물은 왼쪽"이라고 계속 말한다.
+    feed_direction(runtime, ObjectLane.LEFT.value, (1.9, 2.05, 2.2))
+
+    assert runtime.context.lane_target is LaneTarget.LANE_TWO
+    assert runtime.lane_action.target is LaneTarget.LANE_TWO
+    assert runtime.lane_action.pending is True
+    assert runtime.lane_action.completed is False
+    # 명령도 다시 차선 변경(5)으로 나가야 lane_detection 이 기준선을 옮긴다.
+    assert mode_info_data(
+        runtime.fsm.state,
+        runtime.context.lane_target.value,
+        mission_lane_control_enabled=runtime.lane_action.safe_to_drive,
+        lane_change_active=runtime.lane_action.pending,
+    ) == [5, 2]
 
 
 def test_center_is_the_default_before_any_avoidance():
