@@ -62,24 +62,6 @@ SCAN_MAX_AGE_S = 0.5
 TRAFFIC_MAX_AGE_S = 0.5
 OBJECT_MAX_AGE_S = 0.6
 
-# 차선 변경 명령을 한 번 낸 뒤, 측면 LiDAR 추월 완료 판정이 나고도 이만큼
-# 더 지나야 다음 명령을 낼 수 있다.
-#
-# 장애물 옆을 지나는 동안 회피 방향을 다시 확정하면 안 되기 때문이다.
-# rosbag2_fixed_obstacles_overtake_2 실측 — 옆을 지나가는 동안 장애물이
-# 화면을 가로질러 쓸려나가면서 car_lane 이 1에서 2로 정직하게 반전했고,
-# 그 증거로 [5, 1] 명령이 나갔다. 지나가고 있는 장애물 쪽으로 되돌아가라는
-# 명령이다:
-#
-#   t=5.97~6.92  box  1144→ 4590  cx 333→344  dx -150→-125  car_lane=1
-#   t=7.13       box  5044        cx 379      dx  -15       car_lane=0
-#   t=7.33~7.55  box  8928→14570  cx 486→562  dx +109→+226  car_lane=2
-#
-# 추월 완료 판정(main.overtake.OvertakeGuard)은 측면 LiDAR 로 장애물이
-# 옆을 지나간 것을 확인한 시점이다. 거기서 2초를 더 두면 차체가 완전히
-# 빠져나간 뒤에야 다음 명령이 가능해진다.
-COMMAND_RELEASE_AFTER_PASS_S = 2.0
-
 _MOTION_MODES = frozenset(
     {
         Mode.LANE_DRIVE,
@@ -251,7 +233,6 @@ class RaceRuntimeAdapter:
         object_max_age_s: float = OBJECT_MAX_AGE_S,
         lane_change_max_age_s: float = 0.25,
         avoid_direction_config: Optional[AvoidDirectionConfig] = None,
-        command_release_after_pass_s: float = COMMAND_RELEASE_AFTER_PASS_S,
     ) -> None:
         if (
             isinstance(cone_queue_capacity, bool)
@@ -280,11 +261,6 @@ class RaceRuntimeAdapter:
         self.cone_queue_capacity = cone_queue_capacity
         self.object_max_age_s = float(object_max_age_s)
         self.lane_change_max_age_s = float(lane_change_max_age_s)
-        self.command_release_after_pass_s = float(command_release_after_pass_s)
-        # 마지막으로 낸 차선 변경 명령 시각과, 그 뒤의 추월 완료 판정 시각.
-        # 모드가 바뀌어도 유지된다 (lane_action 은 구간마다 새로 만들어진다).
-        self.last_lane_command_at: Optional[float] = None
-        self.pass_completed_at: Optional[float] = None
         self.avoid_direction = AvoidDirectionDebouncer(avoid_direction_config)
 
         self._cone_events: Deque[ConeMessageEvent] = deque()
@@ -295,7 +271,6 @@ class RaceRuntimeAdapter:
         self._mission_events: dict[str, Deque[MissionEdgeEvent]] = {
             "fixed_zone_entry": deque(),
             "fixed_zone_exit": deque(),
-            "overtake_entry": deque(),
             "overtake_complete": deque(),
             "shortcut_complete": deque(),
         }
@@ -367,24 +342,10 @@ class RaceRuntimeAdapter:
     ) -> InputRecordResult:
         """Validate the object_info payload and retain its typed subset.
 
-        README 계약은 11필드다:
-
-            [exists, min_dist, angle, span, cluster_size,
-             box_size, box_cx, box_cy, dx, car_lane, is_moving]
-
-        11번째 is_moving 은 회피 규칙을 고른다 (0=고정장애물 → FIXED_AVOID,
-        1=방해차량 → OVERTAKE). 검출기가 아직 고정장애물만 학습해 상수 0을
-        넣으므로(object_detection.cpp 의 kIsMovingFixedObstacle) 지금은 늘
-        고정장애물 경로로 간다. 이동체를 구분하는 모델이 들어오면 이 필드만
-        1로 바뀌어도 분기가 살아난다.
-
-        길이를 '정확히 11'이 아니라 '10 이상'으로 보는 이유는 is_moving 이
-        생기기 전에 기록한 bag 때문이다 (rosbag2_object1 은 10필드,
-        rosbag2_fixed_obstacles_* 는 11필드). 앞 10필드는 두 세대가 같고,
-        11번째가 없으면 is_moving 은 None(판단 근거 없음)이 된다.
-
-        측면 LiDAR 거리(side_left, side_right)는 이 토픽에 없다. main_node 가
-        /scan 에서 직접 계산한다 (main.py 의 side_clearance 호출).
+        앞 10필드는 고정 계약이고, 그 뒤는 추가 필드다. object_detection이
+        측면 LiDAR 거리(side_left, side_right)를 11·12번째로 붙였으므로
+        길이를 '정확히 10'이 아니라 '10 이상'으로 본다. 이 어댑터가 쓰는 것은
+        앞 10필드뿐이고, 추가 필드는 main_node가 직접 읽는다.
         """
 
         try:
@@ -396,20 +357,9 @@ class RaceRuntimeAdapter:
         if not self._valid_timestamp(received_at):
             return InputRecordResult(False, "invalid object_info receipt timestamp")
 
-        # 11번째 is_moving 은 계약상 0/1 뿐이다. 그 밖의 값은 검출기 버그이고,
-        # 회피 규칙을 고르는 값이라 조용히 삼키면 안 된다.
-        is_moving: Optional[bool] = None
-        if len(values) >= 11:
-            flag = values[10]
-            if (
-                isinstance(flag, bool)
-                or not isinstance(flag, (int, float))
-                or float(flag) not in (0.0, 1.0)
-            ):
-                return InputRecordResult(False, "object_info is_moving must be 0 or 1")
-            is_moving = float(flag) == 1.0
-
-        # 나머지 검증은 앞 10필드에만 적용한다.
+        # 검증은 계약된 앞 10필드에만 적용한다. 뒤에 붙는 측면 LiDAR 거리는
+        # 옆에 아무것도 없으면 정당하게 inf라, 여기서 함께 검사하면 정상
+        # 메시지가 통째로 거부된다.
         values = values[:10]
         if any(
             not isinstance(value, (int, float)) or isinstance(value, bool)
@@ -480,11 +430,8 @@ class RaceRuntimeAdapter:
             exists=bool(exists_value),
             distance=snapshot_distance,
             box_px=box_px,
-            box_cx=numeric_values[6],
-            box_dx=numeric_values[8],
             lane=snapshot_lane,
             received_at=received_at,
-            is_moving=is_moving,
         )
         self.perception_received_at["object_info"] = received_at
         return InputRecordResult(True)
@@ -573,15 +520,6 @@ class RaceRuntimeAdapter:
 
     def record_fixed_zone_exit(self, received_at: float) -> InputRecordResult:
         return self._record_mission_edge("fixed_zone_exit", received_at)
-
-    def record_pass_complete(self, now: float) -> None:
-        """측면 LiDAR 추월 완료 판정 시각을 기록한다 (명령 잠금 해제 기준)."""
-
-        if self._valid_timestamp(now):
-            self.pass_completed_at = now
-
-    def record_overtake_entry(self, received_at: float) -> InputRecordResult:
-        return self._record_mission_edge("overtake_entry", received_at)
 
     def record_overtake_complete(self, received_at: float) -> InputRecordResult:
         return self._record_mission_edge("overtake_complete", received_at)
@@ -771,15 +709,6 @@ class RaceRuntimeAdapter:
             object_box_px=(
                 object_snapshot.box_px if object_snapshot is not None else 0.0
             ),
-            object_box_cx=(
-                object_snapshot.box_cx if object_snapshot is not None else 0.0
-            ),
-            object_box_dx=(
-                object_snapshot.box_dx if object_snapshot is not None else 0.0
-            ),
-            object_is_moving=(
-                object_snapshot.is_moving if object_snapshot is not None else None
-            ),
             object_received_at=(
                 object_snapshot.received_at if object_snapshot is not None else None
             ),
@@ -813,12 +742,6 @@ class RaceRuntimeAdapter:
             fixed_zone_exit_received_at=(
                 mission_events["fixed_zone_exit"].received_at
                 if mission_events["fixed_zone_exit"] is not None
-                else None
-            ),
-            overtake_entered=mission_events["overtake_entry"] is not None,
-            overtake_entry_received_at=(
-                mission_events["overtake_entry"].received_at
-                if mission_events["overtake_entry"] is not None
                 else None
             ),
             overtake_complete=mission_events["overtake_complete"] is not None,
@@ -957,23 +880,10 @@ class RaceRuntimeAdapter:
         # 박스 최대 10549 px^2, car_lane=1을 안정적으로 냈다.
         #
         # 단, 한 프레임짜리 car_lane 반전으로 방향을 확정하지는 않는다.
-        # AvoidDirectionDebouncer 가 연속 프레임 합의에 더해 **차선 피팅과
-        # 박스가 둘 다 안정할 것**을 요구한다.
-        #
-        # 명령을 한 번 낸 뒤에는, 그 명령보다 뒤에 나온 추월 완료 판정이
-        # command_release_after_pass_s 만큼 묵어야 다음 명령을 낼 수 있다.
-        # lane_action 이 아니라 어댑터가 들고 있으므로 구간을 나갔다 들어와도
-        # 유지된다 — 방금 지나친 장애물로 재진입해도 명령이 다시 나가지 않는다.
-        command_locked = self.last_lane_command_at is not None and not (
-            self.pass_completed_at is not None
-            and self.pass_completed_at >= self.last_lane_command_at
-            and observation.now - self.pass_completed_at
-            >= self.command_release_after_pass_s
-        )
+        # AvoidDirectionDebouncer 가 연속 프레임 합의를 요구한다.
         target = direction.target
         if (
             object_fresh
-            and not command_locked
             and target is not None
             and target != self.context.lane_target
             and self.context.state_entered_at is not None
@@ -994,7 +904,6 @@ class RaceRuntimeAdapter:
             action.completed = False
             action.completed_at = None
             action.started_at = observation.now
-            self.last_lane_command_at = observation.now
 
         # 차선 변경 완료 판정 ①: 실측 차선(/lane_position)이 목표와 일치.
         #
