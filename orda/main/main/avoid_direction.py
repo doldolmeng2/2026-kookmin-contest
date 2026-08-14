@@ -52,6 +52,21 @@ class AvoidDirectionConfig:
     # 이미 확정한 방향을 반대로 뒤집는 최소 간격. 좌우로 번갈아 흔들리는 것을
     # 막되, 지속적인 반대 증거는 통과시킨다.
     retarget_hold_s: float = 0.5
+    # 연속 구간이 성립하려면 **차선 피팅과 박스가 둘 다 안정**해야 한다.
+    # 프레임 사이에 이보다 크게 움직이면 그 구간은 끊고 다시 센다.
+    #
+    # 차선 피팅 기준선은 x_line = box_cx - box_dx 로 복원한다. 방향 판정
+    # (dx 의 부호)이 이 선을 기준으로 나오므로, 선이 튀는 동안의 좌/우
+    # 판정은 박스가 가만히 있어도 뒤집힌다.
+    #
+    # 값의 근거 — 고정장애물 bag 6개에서 진입 무렵(box 1000~6000) 연속 YOLO
+    # 프레임 간 변화량:
+    #   |Δx_line|   중앙 4.2~30.5, p90 12.4~56.3, 최대 76.8
+    #   |Δbox_cx|   중앙 0.5~28.0, p90  1.5~38.0, 최대 54.0
+    # 60 px 는 여섯 bag 의 p90 을 모두 덮어 정상 접근을 통과시키면서,
+    # 방해차량 bag 에서 부호를 뒤집었던 138~258 px 점프는 걸러낸다.
+    max_line_jump_px: float = 60.0
+    max_box_jump_px: float = 60.0
 
     def __post_init__(self) -> None:
         if (
@@ -66,6 +81,8 @@ class AvoidDirectionConfig:
             ("min_duration_s", self.min_duration_s),
             ("max_age_s", self.max_age_s),
             ("retarget_hold_s", self.retarget_hold_s),
+            ("max_line_jump_px", self.max_line_jump_px),
+            ("max_box_jump_px", self.max_box_jump_px),
         ):
             if (
                 isinstance(value, bool)
@@ -109,6 +126,9 @@ class AvoidDirectionDebouncer:
         self.streak = 0
         self.streak_started_at: Optional[float] = None
         self.last_sample_at: Optional[float] = None
+        # 직전 표본의 기준선/박스 위치. 안정성 판정에만 쓴다.
+        self.last_x_line: Optional[float] = None
+        self.last_box_cx: Optional[float] = None
 
     def reset(self) -> None:
         self.confirmed = None
@@ -117,6 +137,8 @@ class AvoidDirectionDebouncer:
         self.streak = 0
         self.streak_started_at = None
         self.last_sample_at = None
+        self.last_x_line = None
+        self.last_box_cx = None
 
     def update(self, observation: MissionObservation) -> AvoidDirectionDecision:
         received_at = observation.object_received_at
@@ -151,6 +173,25 @@ class AvoidDirectionDebouncer:
             # 카메라가 방해차량을 못 본 프레임. 반대 증거가 아니라 증거 없음이다.
             self._break_streak()
             return self._decision("no camera box in this frame", new_sample=True)
+
+        # 차선 피팅과 박스가 둘 다 안정해야 이 표본을 연속 구간에 넣는다.
+        box_cx = observation.object_box_cx
+        x_line = box_cx - observation.object_box_dx
+        unstable = (
+            self.last_x_line is not None
+            and self.last_box_cx is not None
+            and (
+                abs(x_line - self.last_x_line) > self.config.max_line_jump_px
+                or abs(box_cx - self.last_box_cx) > self.config.max_box_jump_px
+            )
+        )
+        self.last_x_line = x_line
+        self.last_box_cx = box_cx
+        if unstable:
+            # 튄 프레임 자체는 증거로 세지 않고 구간만 끊는다. 다음 프레임부터
+            # 다시 쌓이므로, 흔들림이 멈추면 자연히 확정된다.
+            self._break_streak()
+            return self._decision("lane fit or box jumped", new_sample=True)
 
         candidate = opposite_lane_target(observation.object_lane)
         if candidate is None:

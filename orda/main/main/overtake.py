@@ -41,9 +41,6 @@ class OvertakeConfig:
     # (차 중간)와 달리 이르게 반응하므로 차체가 빠져나갈 시간을 더 준다.
     pass_delay_s: float = 2.0
 
-    # 방해차량을 못 만난 바퀴에서도 구간을 빠져나가기 위한 상한.
-    zone_timeout_s: float = 12.0
-
     # 측면으로 볼 각도 범위(도). LiDAR는 차 맨 앞에 달려 있고 차체가 뒤쪽을
     # 가린다. bag의 각도별 프로파일상 |각도| > 약 105도 구간은 자기 차체가
     # 0.10~0.14 m로 잡히므로 그 안쪽만 본다.
@@ -56,7 +53,6 @@ class OvertakeConfig:
         for name, value in (
             ("side_detect_m", self.side_detect_m),
             ("pass_delay_s", self.pass_delay_s),
-            ("zone_timeout_s", self.zone_timeout_s),
             ("side_fov_min_deg", self.side_fov_min_deg),
             ("side_fov_max_deg", self.side_fov_max_deg),
             ("side_max_range_m", self.side_max_range_m),
@@ -79,7 +75,6 @@ class PassDecision:
     # 이번 호출에서 처음으로 측면 방해차량을 인식했는지 (로그 1회 출력용)
     side_just_seen: bool = False
     side_distance: float = float("inf")
-    timed_out: bool = False
 
 
 def side_clearance(
@@ -147,13 +142,6 @@ class OvertakeGuard:
         self.side_seen_at = None
         self.side_seen_distance = float("inf")
 
-    def zone_elapsed(self, now: float) -> Optional[float]:
-        """구간 진입 후 경과 시간(초). 진입 기록이 없으면 None."""
-
-        if self.zone_entered_at is None:
-            return None
-        return now - self.zone_entered_at
-
     def update_zone(
         self,
         *,
@@ -204,16 +192,6 @@ class OvertakeGuard:
                     reason="overtake confirmed after side pass",
                     side_just_seen=just_seen,
                     side_distance=self.side_seen_distance,
-                )
-
-        if self.zone_entered_at is not None:
-            if now - self.zone_entered_at >= self.config.zone_timeout_s:
-                return PassDecision(
-                    complete=True,
-                    reason="zone timeout",
-                    side_just_seen=just_seen,
-                    side_distance=self.side_seen_distance,
-                    timed_out=True,
                 )
 
         return PassDecision(

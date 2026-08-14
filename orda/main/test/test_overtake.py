@@ -18,7 +18,7 @@ def guard(**kwargs):
     return OvertakeGuard(OvertakeConfig(**kwargs)) if kwargs else OvertakeGuard()
 
 
-@pytest.mark.parametrize("field", ["side_detect_m", "pass_delay_s", "zone_timeout_s"])
+@pytest.mark.parametrize("field", ["side_detect_m", "pass_delay_s"])
 def test_config_rejects_negative(field):
     with pytest.raises(ValueError):
         OvertakeConfig(**{field: -1.0})
@@ -74,18 +74,6 @@ def test_side_just_seen_fires_once():
     assert second.side_just_seen is False
 
 
-def test_zone_timeout_is_the_escape_hatch():
-    """방해차량을 못 만난 바퀴에서도 구간을 빠져나가야 한다 (README)."""
-    g = guard(zone_timeout_s=12.0)
-    g.enter_zone(now=0.0)
-    assert g.update_zone(
-        now=11.9, lane_target=1, side_left=INF, side_right=INF
-    ).complete is False
-    late = g.update_zone(now=12.0, lane_target=1, side_left=INF, side_right=INF)
-    assert late.complete is True
-    assert late.timed_out is True
-
-
 def test_stuck_side_sensor_cannot_complete_before_the_delay():
     """고착된 센서가 있어도 지연 시간 자체는 우회할 수 없다.
 
@@ -132,11 +120,10 @@ def test_reset_and_enter_zone_clear_state():
 
     g.enter_zone(now=5.0)
     assert g.side_seen_at is None
-    assert g.zone_elapsed(6.0) == pytest.approx(1.0)
+    assert g.zone_entered_at == pytest.approx(5.0)
 
     g.reset()
     assert g.zone_entered_at is None
-    assert g.zone_elapsed(6.0) is None
 
 
 def test_center_lane_has_no_side_to_watch():

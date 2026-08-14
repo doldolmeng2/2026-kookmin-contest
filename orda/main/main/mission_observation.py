@@ -39,12 +39,20 @@ class MissionObservation:
     object_received_at: Optional[float] = None
     # YOLO 박스 면적(px^2). 0이면 카메라가 방해차량을 못 본 것이다.
     object_box_px: float = 0.0
+    # 박스 중심 x 와 중앙선 거리(px). x_line = cx - dx 로 피팅 기준선을 만든다.
+    object_box_cx: float = 0.0
+    object_box_dx: float = 0.0
+    # /object_info 11번째 is_moving. True=방해차량, False=고정장애물,
+    # None=필드가 없는 구세대 메시지.
+    object_is_moving: Optional[bool] = None
     lane_change_changing: bool = False
     lane_change_success: bool = False
     lane_change_success_edge: bool = False
     lane_change_received_at: Optional[float] = None
     fixed_zone_entered: bool = False
     fixed_zone_entry_received_at: Optional[float] = None
+    overtake_entered: bool = False
+    overtake_entry_received_at: Optional[float] = None
     fixed_zone_exited: bool = False
     fixed_zone_exit_received_at: Optional[float] = None
     route_traffic_signal: RouteTrafficSignal = RouteTrafficSignal.UNKNOWN
