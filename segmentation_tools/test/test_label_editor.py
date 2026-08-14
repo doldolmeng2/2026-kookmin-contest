@@ -26,6 +26,36 @@ class LabelEditorTest(unittest.TestCase):
         editor.mouse(cv2.EVENT_LBUTTONDOWN, 5, HEADER_HEIGHT + 3, 0, None)
         self.assertEqual(editor.label[3, 5], 4)
 
+    def test_mouse_move_without_button_clears_stale_drag(self):
+        editor = LabelEditor.__new__(LabelEditor)
+        editor.label = np.zeros((10, 10), dtype=np.uint8)
+        editor.class_id = 4
+        editor.mode = 'brush'
+        editor.brush_size = 1
+        editor.drawing = True
+        editor.last_point = (1, 1)
+        editor.undo_stack = []
+
+        editor.mouse(cv2.EVENT_MOUSEMOVE, 5, HEADER_HEIGHT + 5, 0, None)
+        self.assertFalse(editor.drawing)
+        self.assertIsNone(editor.last_point)
+        self.assertEqual(editor.label[5, 5], 0)
+
+    def test_mouse_move_with_button_continues_drag(self):
+        editor = LabelEditor.__new__(LabelEditor)
+        editor.label = np.zeros((10, 10), dtype=np.uint8)
+        editor.class_id = 4
+        editor.mode = 'brush'
+        editor.brush_size = 1
+        editor.drawing = True
+        editor.last_point = (1, 1)
+        editor.undo_stack = []
+
+        editor.mouse(cv2.EVENT_MOUSEMOVE, 5, HEADER_HEIGHT + 5,
+                     cv2.EVENT_FLAG_LBUTTON, None)
+        self.assertTrue(editor.drawing)
+        self.assertEqual(editor.label[5, 5], 4)
+
     def test_print_controls_lists_required_keys_and_paths(self):
         output = StringIO()
         with redirect_stdout(output):

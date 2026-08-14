@@ -120,11 +120,19 @@ class LabelEditor:
             component_id = components[y, x]
             self.label[components == component_id] = self.class_id
 
-    def mouse(self, event, x, y, _flags, _param):
+    def mouse(self, event, x, y, flags, _param):
         # The status header is displayed above the image, not on top of it.
         # Convert window coordinates back to label-image coordinates.
         y -= HEADER_HEIGHT
         if event == cv2.EVENT_LBUTTONUP:
+            self.drawing = False
+            self.last_point = None
+            return
+        # Releasing the button outside an OpenCV window does not always send
+        # EVENT_LBUTTONUP to this callback. Trust the OS button flag on every
+        # move so a stale internal drawing state cannot keep painting.
+        if (event == cv2.EVENT_MOUSEMOVE and self.drawing
+                and not (flags & cv2.EVENT_FLAG_LBUTTON)):
             self.drawing = False
             self.last_point = None
             return
