@@ -11,6 +11,32 @@ from .core import CLASS_NAMES, load_config, overlay
 WINDOW = 'Segmentation label editor'
 
 
+def print_controls(dataset, split, sample_count):
+    print(f'''\n{'=' * 66}
+  세그멘테이션 라벨 검수 도구
+  데이터셋 : {dataset}
+  분할     : {split} ({sample_count}장)
+{'-' * 66}
+  마우스 왼쪽 드래그 : 선택한 도구로 계속 칠하기
+
+  b       브러시 모드            g       연결 컴포넌트 모드
+  [ / ]   브러시 크기 축소/확대
+
+  0 또는 e  Background           1       중앙차선(노란색)
+  2         왼쪽 실선            3       오른쪽 실선
+  4         도로                 5       지름길
+
+  z       최근 작업 되돌리기     x       원본/오버레이 전환
+  - / +   오버레이 투명도 조절
+
+  a       저장 후 이전           d       저장 후 다음
+  c       저장 후 다음           q       저장 후 종료
+{'-' * 66}
+  라벨 저장 위치   : labels/{split}/*.png
+  Preview 저장 위치: previews/{split}/*.jpg
+{'=' * 66}\n''')
+
+
 class LabelEditor:
     def __init__(self, dataset, split='train', config=None):
         self.root = Path(dataset).expanduser().resolve()
@@ -36,6 +62,7 @@ class LabelEditor:
         self.undo_stack = []
         self.show_overlay = True
         self.load()
+        print_controls(self.root, self.split, len(self.items))
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(WINDOW, self.mouse)
 

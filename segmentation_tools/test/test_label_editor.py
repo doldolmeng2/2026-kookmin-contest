@@ -1,14 +1,25 @@
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import redirect_stdout
+from io import StringIO
 
 import cv2
 import numpy as np
 
-from segmentation_tools.label_editor import LabelEditor
+from segmentation_tools.label_editor import LabelEditor, print_controls
 
 
 class LabelEditorTest(unittest.TestCase):
+    def test_print_controls_lists_required_keys_and_paths(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            print_controls('/tmp/dataset', 'train', 250)
+        text = output.getvalue()
+        for expected in ('250장', '브러시 모드', '연결 컴포넌트',
+                         '되돌리기', '저장 후 종료', 'labels/train', 'previews/train'):
+            self.assertIn(expected, text)
+
     def test_save_updates_label_and_preview(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
