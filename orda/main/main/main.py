@@ -228,7 +228,7 @@ class MainNode(Node):
         메인 제어 루프. 매 20ms마다 호출된다.
           1) 자동 모드 전환 판정 (test_mode=False일 때)
           2) 오프셋 선택 (라바콘/차선)
-          3) Controller를 통해 조향각·속도 계산
+          3) Controller의 Pure Pursuit를 통해 차선 조향각·속도 계산
           4) 속도 부드러운 증가 적용
           5) LANE_DRIVE 초기 3초 속도 제한 적용
           6) 모터 및 모드 발행
