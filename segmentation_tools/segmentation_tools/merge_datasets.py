@@ -10,12 +10,18 @@ def merge(inputs, output):
     output = Path(output).expanduser().resolve()
     lines = []
     sources = []
+    recipe = {}
     for input_path in inputs:
         source = Path(input_path).expanduser().resolve()
         metadata_path = source / 'dataset.yaml'
         if metadata_path.exists():
             metadata = yaml.safe_load(metadata_path.read_text(encoding='utf-8'))
             sources.append(metadata.get('source_bag', str(source)))
+            # Carry the extraction recipe so a merged batch stays reproducible.
+            for key in ('source_topic', 'frames_from', 'interval_seconds', 'resize',
+                        'auto_labeled_classes', 'background_rows'):
+                if key in metadata:
+                    recipe.setdefault(key, metadata[key])
         list_path = source / 'lists' / 'train.lst'
         for line in list_path.read_text(encoding='utf-8').splitlines():
             if not line.strip():
@@ -37,7 +43,8 @@ def merge(inputs, output):
     (list_dir / 'val.lst').write_text('', encoding='utf-8')
     metadata = {
         'format': 'PIDNet list dataset', 'num_classes': 6, 'ignore_label': 255,
-        'source_bags': sources, 'train_samples': len(lines), 'val_samples': 0,
+        'source_bags': sources, **recipe,
+        'train_samples': len(lines), 'val_samples': 0,
     }
     (output / 'dataset.yaml').write_text(
         yaml.safe_dump(metadata, sort_keys=False, allow_unicode=True), encoding='utf-8')
