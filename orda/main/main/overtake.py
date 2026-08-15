@@ -36,12 +36,13 @@ class OvertakeConfig:
     # 때는 위 6개 bag으로 재측정할 것.
     side_detect_m: float = 0.40
 
-    # 옆에서 인식한 뒤 이만큼 더 지나야 추월 완료로 본다.
-    # LiDAR는 차 맨 앞에 있어 인식 시점엔 앞범퍼만 나란한 상태다. 초음파
-    # (차 중간)와 달리 이르게 반응하므로 차체가 빠져나갈 시간을 더 준다.
+    # 옆에서 한 번 인식한 장애물이 사라진 뒤, 이만큼 연속으로 비어 있어야
+    # 추월 완료로 본다. 다시 검출되면 clear 타이머를 즉시 초기화한다.
     pass_delay_s: float = 2.0
 
-    # 방해차량을 못 만난 바퀴에서도 구간을 빠져나가기 위한 상한.
+    # 측면 통과 증거를 못 얻었을 때 운전자/로그에 이상을 알리는 상한.
+    # 이 시간만으로 완료 처리하면 장애물 앞에서 차선 주행으로 돌아갈 수 있어
+    # fail-closed로 경고만 하고 현재 미션을 유지한다.
     zone_timeout_s: float = 12.0
 
     # 측면으로 볼 각도 범위(도). LiDAR는 차 맨 앞에 달려 있고 차체가 뒤쪽을
@@ -78,6 +79,7 @@ class PassDecision:
     reason: str
     # 이번 호출에서 처음으로 측면 방해차량을 인식했는지 (로그 1회 출력용)
     side_just_seen: bool = False
+    side_just_cleared: bool = False
     side_distance: float = float("inf")
     timed_out: bool = False
 
@@ -93,7 +95,7 @@ def side_clearance(
     """LaserScan 원시 값에서 좌/우 측면 최소 거리(m)를 뽑는다.
 
     premerge 가 초음파(`/xycar_ultrasonic`)를 그대로 읽던 자리에 LiDAR 를
-    넣은 것이다. `/object_info` 는 README 의 11필드 계약을 그대로 두고,
+    넣은 것이다. `/object_info`의 12필드 계약과 별개로,
     main_node 가 안전 감시용으로 이미 구독 중인 `/scan` 에서 직접 계산한다.
 
     반환: (side_left, side_right). 해당 섹터에 유효 점이 없으면 inf.
@@ -137,15 +139,19 @@ class OvertakeGuard:
         """상태 초기화. bag 루프 감지 등에서 호출한다."""
 
         self.side_seen_at: Optional[float] = None
+        self.clear_started_at: Optional[float] = None
         self.side_seen_distance: float = float("inf")
         self.zone_entered_at: Optional[float] = None
+        self._timeout_reported = False
 
     def enter_zone(self, now: float) -> None:
         """장애물 구간에 진입할 때 종료 판정 상태를 초기화한다."""
 
         self.zone_entered_at = now
         self.side_seen_at = None
+        self.clear_started_at = None
         self.side_seen_distance = float("inf")
+        self._timeout_reported = False
 
     def zone_elapsed(self, now: float) -> Optional[float]:
         """구간 진입 후 경과 시간(초). 진입 기록이 없으면 None."""
@@ -191,35 +197,56 @@ class OvertakeGuard:
         else:
             side_distance = float("inf")
         just_seen = False
+        just_cleared = False
 
-        if self.side_seen_at is None and side_distance < self.config.side_detect_m:
-            self.side_seen_at = now
-            self.side_seen_distance = side_distance
-            just_seen = True
+        if side_distance < self.config.side_detect_m:
+            if self.side_seen_at is None:
+                self.side_seen_at = now
+                self.side_seen_distance = side_distance
+                just_seen = True
+            else:
+                self.side_seen_distance = min(
+                    self.side_seen_distance,
+                    side_distance,
+                )
+            self.clear_started_at = None
+        elif self.side_seen_at is not None and self.clear_started_at is None:
+            self.clear_started_at = now
+            just_cleared = True
 
-        if self.side_seen_at is not None:
-            if now - self.side_seen_at >= self.config.pass_delay_s:
+        if self.clear_started_at is not None:
+            if now - self.clear_started_at + 1e-6 >= self.config.pass_delay_s:
                 return PassDecision(
                     complete=True,
-                    reason="overtake confirmed after side pass",
+                    reason="overtake confirmed after continuous side clearance",
                     side_just_seen=just_seen,
+                    side_just_cleared=just_cleared,
                     side_distance=self.side_seen_distance,
                 )
 
         if self.zone_entered_at is not None:
             if now - self.zone_entered_at >= self.config.zone_timeout_s:
+                report_timeout = not self._timeout_reported
+                self._timeout_reported = True
                 return PassDecision(
-                    complete=True,
-                    reason="zone timeout",
+                    complete=False,
+                    reason="zone timeout without a confirmed side-clear sequence",
                     side_just_seen=just_seen,
+                    side_just_cleared=just_cleared,
                     side_distance=self.side_seen_distance,
-                    timed_out=True,
+                    timed_out=report_timeout,
                 )
 
         return PassDecision(
             complete=False,
-            reason="waiting for side pass" if self.side_seen_at is None
-            else "waiting out pass delay",
+            reason=(
+                "waiting for side obstacle"
+                if self.side_seen_at is None
+                else "waiting for obstacle to clear"
+                if self.clear_started_at is None
+                else "holding continuous side clearance"
+            ),
             side_just_seen=just_seen,
+            side_just_cleared=just_cleared,
             side_distance=self.side_seen_distance,
         )

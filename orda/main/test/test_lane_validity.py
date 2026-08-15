@@ -68,7 +68,7 @@ def test_no_lane_validity_publisher_keeps_rejoin_and_selects_stop():
     assert result.control.command == DriveCommand(0.0, 0.0)
 
 
-def test_rejoin_stops_until_commit_then_selects_fresh_lane_control():
+def test_legacy_rejoin_stops_until_commit_then_enters_lane():
     fsm = RaceFSM(initial_state=Mode.REJOIN)
     context = RaceContext(state_entered_at=1.0)
     selector = ControlSelector()

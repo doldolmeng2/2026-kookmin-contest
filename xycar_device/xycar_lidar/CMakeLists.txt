@@ -23,6 +23,35 @@ find_package(std_srvs REQUIRED)
 ############## YDLIDAR SDK START#####################################
 #find ydlidar_sdk package
 find_package(ydlidar_sdk REQUIRED)
+
+# Some bundled YDLidar SDK releases export the library name but leave
+# YDLIDAR_SDK_LIBRARY_DIRS empty.  Derive the installed lib directory from
+# <prefix>/lib/cmake/ydlidar_sdk when using such an SDK.
+get_filename_component(
+  YDLIDAR_SDK_CONFIG_LIB_DIR
+  "${ydlidar_sdk_DIR}/../.."
+  ABSOLUTE
+)
+
+# The bundled SDK config exports "ydlidar_sdk" by name but does not export
+# its installed library directory. Resolve the actual library once and use
+# its absolute path so the linker does not depend on a global -L path.
+find_library(
+  YDLIDAR_SDK_LIBRARY
+  NAMES ydlidar_sdk
+  PATHS "${YDLIDAR_SDK_CONFIG_LIB_DIR}"
+  NO_DEFAULT_PATH
+)
+
+if(NOT YDLIDAR_SDK_LIBRARY)
+  message(FATAL_ERROR
+    "YDLidar SDK library not found in ${YDLIDAR_SDK_CONFIG_LIB_DIR}")
+endif()
+
+list(REMOVE_ITEM YDLIDAR_SDK_LIBRARIES ydlidar_sdk)
+list(INSERT YDLIDAR_SDK_LIBRARIES 0 "${YDLIDAR_SDK_LIBRARY}")
+
+message(STATUS "YDLidar SDK library: ${YDLIDAR_SDK_LIBRARY}")
 ############## YDLIDAR SDK END#####################################
 
 #Include directories
@@ -31,8 +60,7 @@ include_directories(
   ${PROJECT_SOURCE_DIR}/src
   ${YDLIDAR_SDK_INCLUDE_DIRS})
 
-#link library directories
-link_directories(${YDLIDAR_SDK_LIBRARY_DIRS})
+# YDLidar SDK is linked by the absolute library path resolved above.
 
 #---------------------------------------------------------------------------------------
 # generate excutable and add libraries
@@ -78,11 +106,15 @@ install(TARGETS
     ${PROJECT_NAME}_node ${PROJECT_NAME}_client
     DESTINATION lib/${PROJECT_NAME})
 
-# config 디렉터리는 이 패키지에 존재하지 않아 install 단계에서 빌드가 깨졌다.
-# launch/xycar_lidar.launch.py는 params/ydlidar.yaml을 쓰고, rviz 설정도
-# rviz/ 아래에 있어 config를 참조하는 곳이 없으므로 목록에서 제거한다.
-install(DIRECTORY launch params startup
-    DESTINATION share/${PROJECT_NAME})
+# Install only resource directories that exist in this vendor snapshot.
+foreach(resource_dir launch params startup rviz config)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${resource_dir}")
+    install(
+      DIRECTORY "${resource_dir}"
+      DESTINATION "share/${PROJECT_NAME}"
+    )
+  endif()
+endforeach()
 
 if(BUILD_TESTING)
     find_package(ament_lint_auto REQUIRED)
@@ -90,4 +122,3 @@ if(BUILD_TESTING)
 endif()
 
 ament_package()
-

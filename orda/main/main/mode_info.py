@@ -23,6 +23,9 @@ _CONFIRMED_MODE_CODES = {
     Mode.LANE_DRIVE: LegacyModeInfoCode.LANE_DRIVE,
     Mode.CONE_DRIVE: LegacyModeInfoCode.CONE_DRIVE,
     Mode.REJOIN: LegacyModeInfoCode.REJOIN,
+    # 지름길에서도 lane_node의 조향 출력을 사용한다. 종료만 CNN의
+    # /road_surface 계약으로 판정하므로 외부 차선 검출기는 주행 모드여야 한다.
+    Mode.SHORTCUT: LegacyModeInfoCode.LANE_DRIVE,
     Mode.FINISH: LegacyModeInfoCode.STOP,
     Mode.STOP: LegacyModeInfoCode.STOP,
 }

@@ -5,9 +5,9 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-set(OpenCV_DIR "/usr/local/lib/cmake/opencv4")
 
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -22,5 +22,16 @@ target_link_libraries(object_node ${OpenCV_LIBS})
 
 install(TARGETS object_node
   DESTINATION lib/${PROJECT_NAME})
+
+ament_python_install_package(${PROJECT_NAME})
+
+install(PROGRAMS
+  scripts/object_yolo_node.py
+  DESTINATION lib/${PROJECT_NAME})
+
+install(FILES
+  best.onnx
+  best_simplified.onnx
+  DESTINATION share/${PROJECT_NAME}/model)
 
 ament_package()

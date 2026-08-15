@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping, Optional
 
-from .mission_types import ObjectLane, RouteTrafficSignal
+from .mission_types import ObjectLane, ObjectType, RouteTrafficSignal
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,8 @@ class MissionObservation:
     object_received_at: Optional[float] = None
     # YOLO 박스 면적(px^2). 0이면 카메라가 방해차량을 못 본 것이다.
     object_box_px: float = 0.0
+    object_type: ObjectType = ObjectType.UNKNOWN
+    object_confidence: float = 0.0
     lane_change_changing: bool = False
     lane_change_success: bool = False
     lane_change_success_edge: bool = False
@@ -47,6 +49,12 @@ class MissionObservation:
     fixed_zone_entry_received_at: Optional[float] = None
     fixed_zone_exited: bool = False
     fixed_zone_exit_received_at: Optional[float] = None
+    # Deprecated pre-merge seam. Production uses fixed_zone_exited; retained
+    # only so old bags/tests fail closed instead of failing deserialization.
+    fixed_avoid_complete: bool = False
+    fixed_avoid_completed_at: Optional[float] = None
+    overtake_entered: bool = False
+    overtake_entry_received_at: Optional[float] = None
     route_traffic_signal: RouteTrafficSignal = RouteTrafficSignal.UNKNOWN
     route_traffic_received_at: Optional[float] = None
     traffic_encounter_started: bool = False

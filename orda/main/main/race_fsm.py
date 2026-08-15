@@ -22,7 +22,8 @@ _TIMESTAMP_EPSILON_S = 1e-6
 
 class Mode(str, Enum):
     INIT = "INIT"
-    WAIT_GREEN = "WAIT_GREEN"
+    WAIT_TRAFFIC = "WAIT_TRAFFIC"
+    WAIT_GREEN = "WAIT_TRAFFIC"  # compatibility alias
     LANE_DRIVE = "LANE_DRIVE"
     CONE_DRIVE = "CONE_DRIVE"
     REJOIN = "REJOIN"
@@ -268,6 +269,24 @@ class RaceFSM:
             if route_transition is not None:
                 return route_transition
 
+            if (
+                not context.on_shortcut_lap
+                and observation.overtake_entered is True
+                and self._accept_mission_edge(
+                    "overtake_entry",
+                    observation.overtake_entry_received_at,
+                    observation,
+                    context,
+                )
+            ):
+                self._cone_entry.deactivate()
+                return self._change(
+                    Mode.OVERTAKE,
+                    "fresh moving-obstacle entry",
+                    context,
+                    observation.now,
+                )
+
             # Explicit course-zone evidence outranks opportunistic cone
             # perception. Object detection is deliberately not an entry guard.
             if (
@@ -324,7 +343,7 @@ class RaceFSM:
                 self._lane_validity.deactivate()
                 self._cone_exit_armed = False
                 return self._change(
-                    Mode.REJOIN,
+                    Mode.LANE_DRIVE,
                     "fresh cone end flag",
                     context,
                     observation.now,
@@ -365,6 +384,21 @@ class RaceFSM:
                 return self._change(
                     Mode.LANE_DRIVE,
                     "fresh fixed-zone exit",
+                    context,
+                    observation.now,
+                )
+            if (
+                observation.fixed_avoid_complete is True
+                and self._accept_mission_edge(
+                    "fixed_avoid_complete",
+                    observation.fixed_avoid_completed_at,
+                    observation,
+                    context,
+                )
+            ):
+                return self._change(
+                    Mode.OVERTAKE,
+                    "legacy fixed completion chain",
                     context,
                     observation.now,
                 )

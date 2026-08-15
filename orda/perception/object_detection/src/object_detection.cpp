@@ -5,14 +5,16 @@
 //
 // 구독:
 //   /scan          (sensor_msgs/LaserScan)           - LiDAR 거리 데이터
-//   /resized_image (sensor_msgs/Image, BGR8)          - 카메라 영상
+//   /resized_image (sensor_msgs/Image, BGR8)          - 디버그 영상(선택)
+//   /object_yolo    (std_msgs/Float32MultiArray)       - ONNX Runtime 검출
 //   /lane_fit      (std_msgs/Float32MultiArray [m,b]) - 차선 회귀 결과
 //
 // 발행:
-//   /object_info (std_msgs/Float32MultiArray, 11개 필드)
+//   /object_info (std_msgs/Float32MultiArray, 12개 필드)
 //   [exists, min_dist, angle, span, cluster_size,
-//    box_size, box_cx, box_cy, dx(cx-x_line), lane_label, is_moving]
-//   is_moving: 0=고정장애물, 1=방해차량
+//    box_size, box_cx, box_cy, dx(cx-x_line), lane_label,
+//    object_type, confidence]
+//   object_type: -1=미검출, 0=고정장애물, 1=방해차량
 //
 // 디버그 창 (enable_gui=true 시):
 //   "OBJECT DEBUG" : exists / distance / cluster_size
@@ -88,6 +90,10 @@ public:
         lane_fit_is_frame_  = this->declare_parameter<bool>("lane_fit_is_frame",     true);
         // YOLO 모델(.onnx) 경로. 빈 문자열이면 share 디렉터리를 탐색한다.
         model_path_         = this->declare_parameter<std::string>("model_path",     "");
+        // J4012의 OpenCV 4.5.4 DNN은 현재 Ultralytics ONNX forward에서
+        // shape assertion으로 실패한다. 기본 경로는 검증된 Python ONNX Runtime
+        // 노드(/object_yolo)를 사용하고, 옛 C++ DNN은 명시적으로 끈다.
+        use_external_yolo_  = this->declare_parameter<bool>("use_external_yolo",    true);
 
 
         // QoS 프로파일
@@ -109,28 +115,38 @@ public:
             "/lane_fit", qos_fast,
             std::bind(&ObjectDetectionNode::onLaneFit, this, _1));
 
+        sub_yolo_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+            "/object_yolo", qos_fast,
+            std::bind(&ObjectDetectionNode::onYoloDetection, this, _1));
+
         // 장애물 정보 발행
         pub_obj_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/object_info", qos_fast);
 
         // ── YOLO 모델 초기화 ────────────────────────────────────────────
         // 모델 경로는 개발 PC / 실차 두 곳을 순서대로 확인한다 (resolveModelPath).
         // 예전에는 실차 경로 하나만 박혀 있어서, 개발 PC에서 재생할 때 모델
-        const std::string resolved = resolveModelPath();
-        if (resolved.empty()) {
-            RCLCPP_ERROR(this->get_logger(),
-                         "YOLO 모델(.onnx)을 찾지 못했습니다. "
-                         "model_path 파라미터로 경로를 직접 지정하세요.");
+        if (use_external_yolo_) {
             yolo_ok_ = false;
+            RCLCPP_INFO(this->get_logger(),
+                        "외부 ONNX Runtime YOLO 입력(/object_yolo)을 사용합니다.");
         } else {
-            try {
-                net_ = cv::dnn::readNet(resolved);
-                net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-                net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
-                yolo_ok_ = true;
-                RCLCPP_INFO(this->get_logger(), "YOLO 로드 완료: %s", resolved.c_str());
-            } catch (const cv::Exception& e) {
-                RCLCPP_ERROR(this->get_logger(), "YOLO 로드 실패: %s", e.what());
+            const std::string resolved = resolveModelPath();
+            if (resolved.empty()) {
+                RCLCPP_ERROR(this->get_logger(),
+                             "YOLO 모델(.onnx)을 찾지 못했습니다. "
+                             "model_path 파라미터로 경로를 직접 지정하세요.");
                 yolo_ok_ = false;
+            } else {
+                try {
+                    net_ = cv::dnn::readNet(resolved);
+                    net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+                    net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+                    yolo_ok_ = true;
+                    RCLCPP_INFO(this->get_logger(), "YOLO 로드 완료: %s", resolved.c_str());
+                } catch (const cv::Exception& e) {
+                    RCLCPP_ERROR(this->get_logger(), "YOLO 로드 실패: %s", e.what());
+                    yolo_ok_ = false;
+                }
             }
         }
         // 재학습 모델(빨간 고정 방해차량) 기준. 검증용 bag에서 이 값이 검출
@@ -218,6 +234,64 @@ private:
         fit_b_     = msg->data[1];
         fit_valid_ = std::isfinite(fit_m_) && std::isfinite(fit_b_);
         fit_stamp_ = now();
+    }
+
+    // /object_yolo 계약:
+    // [detected, object_type, confidence, box_area, cx, cy, x, y, w, h]
+    void onYoloDetection(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
+        if (!use_external_yolo_) return;
+        if (msg->data.size() < 10) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "/object_yolo 필드가 10개보다 적습니다.");
+            return;
+        }
+
+        const bool detected = msg->data[0] >= 0.5f;
+        const int object_type = static_cast<int>(std::lround(msg->data[1]));
+        const float confidence = msg->data[2];
+        const float box_area = msg->data[3];
+        const float box_cx = msg->data[4];
+        const float box_cy = msg->data[5];
+        if (!std::isfinite(confidence) || !std::isfinite(box_area) ||
+            !std::isfinite(box_cx) || !std::isfinite(box_cy) ||
+            (detected && object_type != 0 && object_type != 1)) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "유효하지 않은 /object_yolo 메시지를 무시합니다.");
+            return;
+        }
+
+        float box_dx = 0.0f;
+        int lane_label = 0;
+        float m = 0.0f, b = 0.0f;
+        bool lane_ok = false;
+        rclcpp::Time fit_stamp{0, 0, RCL_ROS_TIME};
+        {
+            std::lock_guard<std::mutex> lk(mtx_lane_);
+            lane_ok = fit_valid_;
+            m = fit_m_;
+            b = fit_b_;
+            fit_stamp = fit_stamp_;
+        }
+        if (lane_ok && fit_stamp.nanoseconds() > 0) {
+            const double age_s = (now() - fit_stamp).seconds();
+            lane_ok = age_s >= 0.0 && age_s <= lane_fit_max_age_s_;
+        }
+        if (detected && lane_ok && lane_fit_is_frame_) {
+            const float x_line = m * box_cy + b;
+            box_dx = box_cx - x_line;
+            if (box_dx <= -static_cast<float>(lane_split_margin_px_)) lane_label = 1;
+            else if (box_dx >= static_cast<float>(lane_split_margin_px_)) lane_label = 2;
+        }
+
+        std::lock_guard<std::mutex> lk(mtx_box_);
+        last_box_area_pix_ = detected ? box_area : 0.0f;
+        last_box_cx_ = detected ? box_cx : 0.0f;
+        last_box_cy_ = detected ? box_cy : 0.0f;
+        last_box_dx_ = detected ? box_dx : 0.0f;
+        last_lane_label_ = detected ? lane_label : 0;
+        last_object_type_ = detected ? object_type : -1;
+        last_object_confidence_ = detected ? confidence : 0.0f;
+        last_box_stamp_ = now();
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -370,6 +444,8 @@ private:
         float box_area;
         float cx, cy, dx;
         int   lane_label;
+        int   object_type;
+        float object_confidence;
 
         {
             std::lock_guard<std::mutex> lk(mtx_state_);
@@ -387,6 +463,8 @@ private:
             cy         = last_box_cy_;
             dx         = last_box_dx_;
             lane_label = last_lane_label_;
+            object_type = last_object_type_;
+            object_confidence = last_object_confidence_;
             box_stamp  = last_box_stamp_;
         }
 
@@ -399,22 +477,19 @@ private:
             box_area   = 0.0f;
             cx = cy = dx = 0.0f;
             lane_label = 0;
+            object_type = -1;
+            object_confidence = 0.0f;
         }
 
         const float exists = (lidar_ok && (minr <= detect_threshold_m_)) ? 1.0f : 0.0f;
 
         // /object_info 필드:
         // [exists, min_dist, angle, span, cluster_size,
-        //  box_size, box_cx, box_cy, dx, lane_label, is_moving]
-        //
-        // is_moving 은 지금 학습된 YOLO 모델이 고정장애물만 구분하므로 항상
-        // 0(고정장애물)이다. 이동체를 구분하는 모델이 들어오면 여기서 그
-        // 분류 결과를 넣는다.
-        constexpr float kIsMovingFixedObstacle = 0.0f;
+        //  box_size, box_cx, box_cy, dx, lane_label, object_type, confidence]
         std_msgs::msg::Float32MultiArray out;
         out.data = { exists, minr, ang, spn, static_cast<float>(cnt),
                      box_area, cx, cy, dx, static_cast<float>(lane_label),
-                     kIsMovingFixedObstacle };
+                     static_cast<float>(object_type), object_confidence };
         pub_obj_->publish(out);
 
         // 디버그 패널 갱신
@@ -641,6 +716,8 @@ private:
             last_box_cy_       = box_cy;
             last_box_dx_       = box_dx;
             last_lane_label_   = lane_label;
+            last_object_type_  = box_area > 0.0f ? 0 : -1;
+            last_object_confidence_ = 0.0f;
             last_box_stamp_    = now();
         }
     }
@@ -706,12 +783,14 @@ private:
     double lane_fit_max_age_s_;
     double box_max_age_s_;
     bool   lane_fit_is_frame_;
+    bool   use_external_yolo_;
     std::string model_path_;
 
     // ── ROS 통신 객체 ───────────────────────────────────────────────────
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr       sub_scan_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr           sub_img_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr  sub_lane_fit_;
+    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr  sub_yolo_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr     pub_obj_;
     rclcpp::TimerBase::SharedPtr timer_;      // 디버그 창 갱신 타이머
     rclcpp::TimerBase::SharedPtr pub_timer_;  // 발행 타이머
@@ -742,6 +821,8 @@ private:
     float last_box_cx_       = 0.f, last_box_cy_ = 0.f;
     float last_box_dx_       = 0.f;
     int   last_lane_label_   = 0;
+    int   last_object_type_  = -1;
+    float last_object_confidence_ = 0.0f;
     rclcpp::Time last_box_stamp_{0, 0, RCL_ROS_TIME};  // 마지막 YOLO 갱신 시각
 
     // ── 차선 회귀 공유 변수 (뮤텍스: mtx_lane_) ────────────────────────

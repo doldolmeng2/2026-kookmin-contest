@@ -21,13 +21,33 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    # ── 런치 인수: main_node 초기 모드 ──────────────────────────────────────
+    # ── 런치 인수: main_node 초기 모드 / mission test entry ────────────────
     mode_arg = DeclareLaunchArgument(
         'mode',
         default_value='0',
-        description='main_node 초기 주행 모드 (0=TRAFFIC_WAIT)'
+        description=(
+            '초기 모드 번호: 0=INIT, 1=WAIT_TRAFFIC, 2=LANE, 3=CONE, '
+            '4=FIXED, 5=OVERTAKE, 6=SHORTCUT, 7=FINISH, 8=STOP'
+        )
     )
     mode = LaunchConfiguration('mode')
+    lane_target_arg = DeclareLaunchArgument(
+        'lane_target',
+        default_value='0',
+        choices=('0', '1', '2'),
+        description='초기 차선 번호 (0=중앙, 1=1차선, 2=2차선)',
+    )
+    lane_target = LaunchConfiguration('lane_target')
+    test_profile_arg = DeclareLaunchArgument(
+        'test_profile',
+        default_value='0',
+        description=(
+            '격리된 bag-test 시작 번호 '
+            '(0=race, 1=wait_traffic, 2=lane_center, 3=lane_1, '
+            '4=lane_2, 5=cone, 6=fixed, 7=overtake, 8=shortcut)'
+        )
+    )
+    test_profile = LaunchConfiguration('test_profile')
     show_debug_arg = DeclareLaunchArgument(
         'show_debug',
         default_value='false',
@@ -102,16 +122,16 @@ def generate_launch_description():
     rubbercone_offset_limit = LaunchConfiguration('rubbercone_offset_limit')
     rubbercone_enable_gui_arg = DeclareLaunchArgument(
         'rubbercone_enable_gui',
-        default_value='true',
+        default_value='false',
         description='라바콘 LiDAR 인식 디버그 창 표시 여부'
     )
     rubbercone_enable_gui = LaunchConfiguration('rubbercone_enable_gui')
     object_enable_gui_arg = DeclareLaunchArgument(
         'object_enable_gui',
-        default_value='true',
+        default_value='false',
         description=(
             '장애물 검출 디버그 창(CAMERA VIEW / OBJECT DEBUG) 표시 여부. '
-            '기본 true. 켜두면 같은 프로세스의 YOLO 추론과 CPU를 다투어 '
+            '기본 false. 켜두면 영상 표시가 CPU를 사용해 '
             '/object_info 와 /lane_offset 이 느려지므로(실측: 카메라 18.8 Hz '
             '입력에 인지 5.9 Hz 출력), 기록 주행·성능 측정 시에는 '
             'object_enable_gui:=false 로 끌 것.'
@@ -125,13 +145,15 @@ def generate_launch_description():
         executable='main_node',
         name='main_node',
         output='screen',
-        # use_sim_time=True: main_node의 시간 기준을 bag 재생 시각(/clock)에 맞춘다.
-        # bag을 --loop --clock 으로 재생하면 루프 시작 시 시각이 뒤로 튀는데,
-        # main_node는 이를 감지해 "bag이 처음부터 다시 재생됨"으로 판단하고
-        # 상태머신을 리셋한다.
-        # ★ --clock 없이 재생하면 ROS 시계가 0에 멈춰 20ms 타이머가 한 번도
-        #   발동하지 않으므로, 반드시 `ros2 bag play ... --clock` 과 함께 쓸 것.
-        parameters=[{'mode': mode, 'show_debug': show_debug, 'use_sim_time': True}],
+        parameters=[{
+            'mode': mode,
+            'lane_target': lane_target,
+            'test_profile': test_profile,
+            'show_debug': show_debug,
+            # bag --loop 재생 시 /clock 역행을 감지해 FSM을 초기화한다.
+            # 반드시 `ros2 bag play ... --clock` 과 함께 사용할 것.
+            'use_sim_time': True,
+        }],
         remappings=[('xycar_motor', '/bag_test/xycar_motor')],
     )
     traffic_node = Node(
@@ -172,16 +194,28 @@ def generate_launch_description():
         name='lane_node',
         output='screen',
     )
+    object_yolo_node = Node(
+        package='object_detection',
+        executable='object_yolo_node.py',
+        name='object_yolo_node',
+        output='screen',
+        parameters=[{'use_sim_time': True}],
+    )
     object_node = Node(
         package='object_detection',
         executable='object_node',
         name='object_node',
         output='screen',
-        parameters=[{'enable_gui': object_enable_gui}],
+        parameters=[{
+            'enable_gui': object_enable_gui,
+            'use_sim_time': True,
+        }],
     )
 
     return LaunchDescription([
         mode_arg,
+        lane_target_arg,
+        test_profile_arg,
         show_debug_arg,
         rubbercone_offset_filter_alpha_arg,
         rubbercone_end_missing_frames_arg,
@@ -201,5 +235,6 @@ def generate_launch_description():
         rubbercone_node,
         resize_node,
         lane_node,
+        object_yolo_node,
         object_node,
     ])

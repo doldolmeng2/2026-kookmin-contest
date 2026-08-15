@@ -6,7 +6,7 @@ from typing import Optional
 
 
 class ObjectLane(Enum):
-    """Lane label emitted by the existing ten-field ``/object_info`` topic."""
+    """Lane label emitted in ``/object_info`` field 10 (index 9)."""
 
     # object_detection 의 lane_label 과 같은 값이다 (0=중앙선 근처, 1=왼쪽, 2=오른쪽).
     UNKNOWN = 0
@@ -34,6 +34,14 @@ class RouteTrafficSignal(IntEnum):
     LEFT = 3
 
 
+class ObjectType(IntEnum):
+    """Semantic class carried by ``/object_info`` field 11."""
+
+    UNKNOWN = -1
+    FIXED = 0
+    MOVING = 1
+
+
 def opposite_lane_target(object_lane: ObjectLane) -> Optional[LaneTarget]:
     """Translate an object label to the opposite lane detector target."""
 
@@ -46,7 +54,7 @@ def opposite_lane_target(object_lane: ObjectLane) -> Optional[LaneTarget]:
 
 @dataclass(frozen=True)
 class ObjectSnapshot:
-    """Validated minimum subset of one existing ``/object_info`` message."""
+    """Validated subset of the backward-compatible ``/object_info`` message."""
 
     exists: bool
     distance: Optional[float]
@@ -55,6 +63,8 @@ class ObjectSnapshot:
     # YOLO 바운딩 박스 면적(px^2). exists/distance 는 LiDAR 산출물이지만 이 값과
     # lane 은 카메라 단독으로 나온다. 회피 방향은 이 둘만 보고 정한다.
     box_px: float = 0.0
+    object_type: ObjectType = ObjectType.UNKNOWN
+    confidence: float = 0.0
 
 
 @dataclass(frozen=True)

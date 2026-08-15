@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 import math
 from typing import Any, Callable, Deque, Optional, Sequence
 
@@ -24,6 +25,7 @@ from .mission_types import (
     LaneTarget,
     ObjectLane,
     ObjectSnapshot,
+    ObjectType,
     RouteTrafficEvent,
     RouteTrafficSignal,
 )
@@ -74,6 +76,65 @@ _MOTION_MODES = frozenset(
 )
 
 
+class MissionTestProfile(str, Enum):
+    """Named bag-test entry points backed by existing production Modes."""
+
+    RACE = "race"
+    WAIT_TRAFFIC = "wait_traffic"
+    LANE = "lane"
+    LANE_ONE = "lane_one"
+    LANE_TWO = "lane_two"
+    CONE = "cone"
+    FIXED = "fixed"
+    OVERTAKE = "overtake"
+    SHORTCUT = "shortcut"
+
+
+_TEST_PROFILE_MODES = {
+    MissionTestProfile.WAIT_TRAFFIC: Mode.WAIT_TRAFFIC,
+    MissionTestProfile.LANE: Mode.LANE_DRIVE,
+    MissionTestProfile.LANE_ONE: Mode.LANE_DRIVE,
+    MissionTestProfile.LANE_TWO: Mode.LANE_DRIVE,
+    MissionTestProfile.CONE: Mode.CONE_DRIVE,
+    MissionTestProfile.FIXED: Mode.FIXED_AVOID,
+    MissionTestProfile.OVERTAKE: Mode.OVERTAKE,
+    MissionTestProfile.SHORTCUT: Mode.SHORTCUT,
+}
+
+_NUMERIC_TEST_PROFILES = {
+    0: MissionTestProfile.RACE,
+    1: MissionTestProfile.WAIT_TRAFFIC,
+    2: MissionTestProfile.LANE,
+    3: MissionTestProfile.LANE_ONE,
+    4: MissionTestProfile.LANE_TWO,
+    5: MissionTestProfile.CONE,
+    6: MissionTestProfile.FIXED,
+    7: MissionTestProfile.OVERTAKE,
+    8: MissionTestProfile.SHORTCUT,
+}
+
+
+def parse_test_profile(value: Any) -> MissionTestProfile:
+    """Parse the numeric mission contract, retaining named compatibility."""
+
+    if isinstance(value, MissionTestProfile):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        try:
+            return _NUMERIC_TEST_PROFILES[value]
+        except KeyError as exc:
+            raise ValueError(f"unknown numeric mission test profile: {value}") from exc
+    if not isinstance(value, str):
+        raise ValueError(f"invalid mission test profile: {value!r}")
+    stripped = value.strip().lower()
+    if stripped.isdigit():
+        return parse_test_profile(int(stripped))
+    try:
+        return MissionTestProfile(stripped)
+    except ValueError as exc:
+        raise ValueError(f"unknown mission test profile: {value}") from exc
+
+
 @dataclass(frozen=True)
 class ConeMessageEvent:
     """One validated ``/rubbercone_info`` callback receipt edge."""
@@ -86,7 +147,7 @@ class ConeMessageEvent:
 
 @dataclass(frozen=True)
 class LaneValidityEvent:
-    """One future explicit lane-validity callback receipt edge."""
+    """One explicit lane-validity callback receipt sample."""
 
     valid: bool
     received_at: float
@@ -191,6 +252,13 @@ def runtime_safety_monitor() -> SafetyMonitor:
                     LANE_OFFSET_MAX_AGE_S,
                 ),
             ),
+            Mode.SHORTCUT: (
+                InputRequirement(
+                    InputCategory.PERCEPTION,
+                    "lane_offset",
+                    LANE_OFFSET_MAX_AGE_S,
+                ),
+            ),
             # STOP 복귀 조건. 이 항목이 비어 있으면 SafetyMonitor 가 STOP 에서
             # 검사할 입력이 없어 inputs_ready 가 항상 True 였고, RaceFSM 의
             # 복귀 게이트(STOP_RECOVERY_HOLD_S)가 "입력이 회복됐는지"가 아니라
@@ -271,6 +339,8 @@ class RaceRuntimeAdapter:
         self._mission_events: dict[str, Deque[MissionEdgeEvent]] = {
             "fixed_zone_entry": deque(),
             "fixed_zone_exit": deque(),
+            "fixed_avoid_complete": deque(),
+            "overtake_entry": deque(),
             "overtake_complete": deque(),
             "shortcut_complete": deque(),
         }
@@ -291,6 +361,67 @@ class RaceRuntimeAdapter:
         self.last_avoid_direction: Optional[AvoidDirectionDecision] = None
         # /lane_position 실측 차선 (-1=미확정). main_node 가 콜백에서 갱신한다.
         self.measured_lane: int = -1
+
+    def bootstrap_test_profile(
+        self,
+        profile: MissionTestProfile | str,
+        started_at: float,
+    ) -> None:
+        """Start one bag-test session without changing RaceFSM transitions.
+
+        ``race`` is deliberately a no-op so the production initialization
+        path remains identical. Other profiles replace the FSM and context as
+        one fresh session and discard every pending or cached input edge.
+        """
+
+        typed_profile = parse_test_profile(profile)
+        if typed_profile is MissionTestProfile.RACE:
+            return
+        if not self._valid_timestamp(started_at):
+            raise ValueError("test profile start timestamp must be finite")
+
+        initial_mode = _TEST_PROFILE_MODES[typed_profile]
+        self.fsm = RaceFSM(
+            initial_state=initial_mode,
+            mission_event_max_age_s=self.fsm.mission_event_max_age_s,
+            cone_entry_config=self.fsm.cone_entry_config,
+            lane_validity_config=self.fsm.lane_validity_guard.config,
+        )
+        context_kwargs = {}
+        if typed_profile is MissionTestProfile.CONE:
+            context_kwargs["cone_entered_at"] = float(started_at)
+        elif typed_profile is MissionTestProfile.SHORTCUT:
+            context_kwargs.update(completed_laps=1, shortcut_lap=2)
+        if typed_profile is MissionTestProfile.LANE_ONE:
+            context_kwargs["lane_target"] = LaneTarget.LANE_ONE
+        elif typed_profile is MissionTestProfile.LANE_TWO:
+            context_kwargs["lane_target"] = LaneTarget.LANE_TWO
+        self.context = RaceContext(
+            state_entered_at=float(started_at),
+            **context_kwargs,
+        )
+
+        self._cone_events.clear()
+        self._lane_validity_events.clear()
+        self._traffic_events.clear()
+        self._lane_change_events.clear()
+        self._route_traffic_events.clear()
+        for queue in self._mission_events.values():
+            queue.clear()
+        self._last_internal_event_at.clear()
+        self.cone_queue_overflow_count = 0
+
+        self.sensor_received_at.clear()
+        self.perception_received_at.clear()
+        self.green_detected = False
+        self.latest_lane_offset = None
+        self.latest_lane_received_at = None
+        self.latest_cone_event = None
+        self.latest_object_snapshot = None
+        self._last_lane_change_received_at = None
+        self._lane_change_success_active = False
+        self.traffic_stop_override = False
+        self.lane_action = LaneActionStatus()
 
     @property
     def pending_cone_event_count(self) -> int:
@@ -323,7 +454,7 @@ class RaceRuntimeAdapter:
         return True
 
     def record_lane_validity(self, valid: bool, received_at: float) -> bool:
-        """Queue one explicit validity edge for the future lane publisher."""
+        """Queue one explicit lane-validity sample."""
 
         if not isinstance(valid, bool) or not self._valid_timestamp(received_at):
             return False
@@ -342,10 +473,9 @@ class RaceRuntimeAdapter:
     ) -> InputRecordResult:
         """Validate the object_info payload and retain its typed subset.
 
-        앞 10필드는 고정 계약이고, 그 뒤는 추가 필드다. object_detection이
-        측면 LiDAR 거리(side_left, side_right)를 11·12번째로 붙였으므로
-        길이를 '정확히 10'이 아니라 '10 이상'으로 본다. 이 어댑터가 쓰는 것은
-        앞 10필드뿐이고, 추가 필드는 main_node가 직접 읽는다.
+        앞 10필드는 기존 계약이다. 새 publisher는 object_type과 confidence를
+        11·12번째에 붙인다. 잠깐 사용했던 side_left/side_right 2필드 layout과
+        옛 10필드 bag도 계속 읽을 수 있도록 길이는 10 이상으로 받는다.
         """
 
         try:
@@ -357,9 +487,41 @@ class RaceRuntimeAdapter:
         if not self._valid_timestamp(received_at):
             return InputRecordResult(False, "invalid object_info receipt timestamp")
 
-        # 검증은 계약된 앞 10필드에만 적용한다. 뒤에 붙는 측면 LiDAR 거리는
-        # 옆에 아무것도 없으면 정당하게 inf라, 여기서 함께 검사하면 정상
-        # 메시지가 통째로 거부된다.
+        # 앞 10필드는 기존 계약이다. 11번째 object_type과 12번째 confidence는
+        # 새 YOLO 분류 계약이며, 예전 10필드 bag도 계속 읽을 수 있게 선택값이다.
+        object_type = ObjectType.UNKNOWN
+        object_confidence = 0.0
+        if len(values) >= 11:
+            raw_type = values[10]
+            looks_like_type = not (
+                isinstance(raw_type, bool)
+                or not isinstance(raw_type, (int, float))
+                or not math.isfinite(float(raw_type))
+                or not float(raw_type).is_integer()
+            )
+            if looks_like_type:
+                try:
+                    object_type = ObjectType(int(raw_type))
+                except ValueError:
+                    return InputRecordResult(False, "object_info type must be -1, 0, or 1")
+            elif len(values) < 12:
+                return InputRecordResult(False, "object_info type must be an integer")
+            # Two old optional side-LiDAR fields were briefly appended to the
+            # 10-field payload. A non-integral field 11 identifies that layout;
+            # accept and ignore both so recorded bags remain readable.
+        if len(values) >= 12 and looks_like_type:
+            raw_confidence = values[11]
+            if (
+                isinstance(raw_confidence, bool)
+                or not isinstance(raw_confidence, (int, float))
+                or not math.isfinite(float(raw_confidence))
+                or not 0.0 <= float(raw_confidence) <= 1.0
+            ):
+                return InputRecordResult(False, "object_info confidence must be within 0..1")
+            object_confidence = float(raw_confidence)
+
+        # 검증은 계약된 앞 10필드에만 적용한다. 뒤에 붙는 선택 필드는 위에서
+        # 별도 검증했다.
         values = values[:10]
         if any(
             not isinstance(value, (int, float)) or isinstance(value, bool)
@@ -432,6 +594,8 @@ class RaceRuntimeAdapter:
             box_px=box_px,
             lane=snapshot_lane,
             received_at=received_at,
+            object_type=object_type,
+            confidence=object_confidence,
         )
         self.perception_received_at["object_info"] = received_at
         return InputRecordResult(True)
@@ -521,6 +685,14 @@ class RaceRuntimeAdapter:
     def record_fixed_zone_exit(self, received_at: float) -> InputRecordResult:
         return self._record_mission_edge("fixed_zone_exit", received_at)
 
+    def record_fixed_avoid_complete(self, received_at: float) -> InputRecordResult:
+        """Deprecated compatibility seam; new code must record fixed_zone_exit."""
+
+        return self._record_mission_edge("fixed_avoid_complete", received_at)
+
+    def record_overtake_entry(self, received_at: float) -> InputRecordResult:
+        return self._record_mission_edge("overtake_entry", received_at)
+
     def record_overtake_complete(self, received_at: float) -> InputRecordResult:
         return self._record_mission_edge("overtake_complete", received_at)
 
@@ -532,6 +704,8 @@ class RaceRuntimeAdapter:
         name: str,
         received_at: float,
     ) -> InputRecordResult:
+        """Record a one-shot completion event, never a sticky boolean level."""
+
         if not self._valid_timestamp(received_at):
             return InputRecordResult(False, f"invalid {name} timestamp")
         previous = self._last_internal_event_at.get(name)
@@ -666,7 +840,7 @@ class RaceRuntimeAdapter:
             traffic_message_received_at=(
                 traffic_event.received_at if traffic_event is not None else None
             ),
-            # There is no dedicated lane-validity input in the current graph.
+            # Consume only the explicit current-frame lane-validity sample.
             lane_valid=(
                 lane_validity_event.valid
                 if lane_validity_event is not None
@@ -709,6 +883,14 @@ class RaceRuntimeAdapter:
             object_box_px=(
                 object_snapshot.box_px if object_snapshot is not None else 0.0
             ),
+            object_type=(
+                object_snapshot.object_type
+                if object_snapshot is not None
+                else ObjectType.UNKNOWN
+            ),
+            object_confidence=(
+                object_snapshot.confidence if object_snapshot is not None else 0.0
+            ),
             object_received_at=(
                 object_snapshot.received_at if object_snapshot is not None else None
             ),
@@ -732,16 +914,34 @@ class RaceRuntimeAdapter:
                 if lane_change_event is not None
                 else None
             ),
-            fixed_zone_entered=mission_events["fixed_zone_entry"] is not None,
+            fixed_zone_entered=(
+                mission_events["fixed_zone_entry"] is not None
+            ),
             fixed_zone_entry_received_at=(
                 mission_events["fixed_zone_entry"].received_at
                 if mission_events["fixed_zone_entry"] is not None
                 else None
             ),
-            fixed_zone_exited=mission_events["fixed_zone_exit"] is not None,
+            fixed_zone_exited=(
+                mission_events["fixed_zone_exit"] is not None
+            ),
             fixed_zone_exit_received_at=(
                 mission_events["fixed_zone_exit"].received_at
                 if mission_events["fixed_zone_exit"] is not None
+                else None
+            ),
+            fixed_avoid_complete=(
+                mission_events["fixed_avoid_complete"] is not None
+            ),
+            fixed_avoid_completed_at=(
+                mission_events["fixed_avoid_complete"].received_at
+                if mission_events["fixed_avoid_complete"] is not None
+                else None
+            ),
+            overtake_entered=mission_events["overtake_entry"] is not None,
+            overtake_entry_received_at=(
+                mission_events["overtake_entry"].received_at
+                if mission_events["overtake_entry"] is not None
                 else None
             ),
             overtake_complete=mission_events["overtake_complete"] is not None,

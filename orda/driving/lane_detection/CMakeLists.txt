@@ -5,8 +5,6 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# OpenCV 4.5.4 설치 경로
-set(OpenCV_DIR "/usr/lib/x86_64-linux-gnu/cmake/opencv4")
 
 # find dependencies
 find_package(ament_cmake REQUIRED)

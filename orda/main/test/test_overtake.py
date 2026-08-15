@@ -41,11 +41,16 @@ def test_completes_only_after_pass_delay():
     assert seen.complete is False
     assert seen.side_distance == pytest.approx(CAR_SIDE_M)
 
+    cleared = g.update_zone(
+        now=3.0, lane_target=1, side_left=INF, side_right=INF
+    )
+    assert cleared.side_just_cleared is True
+    assert cleared.complete is False
     assert g.update_zone(
-        now=3.9, lane_target=1, side_left=INF, side_right=INF
+        now=4.9, lane_target=1, side_left=INF, side_right=INF
     ).complete is False
     assert g.update_zone(
-        now=4.0, lane_target=1, side_left=INF, side_right=INF
+        now=5.0, lane_target=1, side_left=INF, side_right=INF
     ).complete is True
 
 
@@ -74,20 +79,26 @@ def test_side_just_seen_fires_once():
     assert second.side_just_seen is False
 
 
-def test_zone_timeout_is_the_escape_hatch():
-    """방해차량을 못 만난 바퀴에서도 구간을 빠져나가야 한다 (README)."""
+def test_zone_timeout_reports_but_does_not_blindly_complete():
+    """측면 통과 증거가 없으면 시간 초과도 주행 상태를 바꾸지 않는다."""
     g = guard(zone_timeout_s=12.0)
     g.enter_zone(now=0.0)
     assert g.update_zone(
         now=11.9, lane_target=1, side_left=INF, side_right=INF
     ).complete is False
     late = g.update_zone(now=12.0, lane_target=1, side_left=INF, side_right=INF)
-    assert late.complete is True
+    assert late.complete is False
     assert late.timed_out is True
+    # 경고는 한 번만 보고한다.
+    repeated = g.update_zone(
+        now=12.1, lane_target=1, side_left=INF, side_right=INF
+    )
+    assert repeated.complete is False
+    assert repeated.timed_out is False
 
 
-def test_stuck_side_sensor_cannot_complete_before_the_delay():
-    """고착된 센서가 있어도 지연 시간 자체는 우회할 수 없다.
+def test_stuck_side_sensor_never_completes_without_clearance():
+    """고착된 센서는 사라짐 에지가 없으므로 완료할 수 없다.
 
     초음파가 4cm에 고착되어 차선 변경 직후 곧바로 '추월 완료'가 나던 문제에
     대한 회귀 테스트.
@@ -98,9 +109,23 @@ def test_stuck_side_sensor_cannot_complete_before_the_delay():
         assert g.update_zone(
             now=t, lane_target=1, side_left=INF, side_right=0.04
         ).complete is False
-    # 최초 인식이 t=0.02이므로 완료 시점은 2.02이다
     assert g.update_zone(
         now=2.03, lane_target=1, side_left=INF, side_right=0.04
+    ).complete is False
+
+
+def test_reappearance_resets_continuous_clear_timer():
+    g = guard(pass_delay_s=2.0)
+    g.enter_zone(now=0.0)
+    g.update_zone(now=0.1, lane_target=1, side_left=INF, side_right=CAR_SIDE_M)
+    g.update_zone(now=1.0, lane_target=1, side_left=INF, side_right=INF)
+    g.update_zone(now=2.0, lane_target=1, side_left=INF, side_right=CAR_SIDE_M)
+    g.update_zone(now=3.0, lane_target=1, side_left=INF, side_right=INF)
+    assert g.update_zone(
+        now=4.9, lane_target=1, side_left=INF, side_right=INF
+    ).complete is False
+    assert g.update_zone(
+        now=5.0, lane_target=1, side_left=INF, side_right=INF
     ).complete is True
 
 

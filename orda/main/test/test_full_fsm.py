@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 from main.cone_entry import ConeEntryConfig
@@ -22,8 +24,11 @@ def route_observation(now, signal, *, encounter=True, received_at=None):
     )
 
 
-def edge_observation(now, name, received_at=None):
-    timestamp = now if received_at is None else received_at
+_UNSET = object()
+
+
+def edge_observation(now, name, received_at=_UNSET):
+    timestamp = now if received_at is _UNSET else received_at
     fields = {
         "fixed_entry": {
             "fixed_zone_entered": True,
@@ -32,6 +37,10 @@ def edge_observation(now, name, received_at=None):
         "fixed_exit": {
             "fixed_zone_exited": True,
             "fixed_zone_exit_received_at": timestamp,
+        },
+        "fixed_avoid_complete": {
+            "fixed_avoid_complete": True,
+            "fixed_avoid_completed_at": timestamp,
         },
         "overtake_complete": {
             "overtake_complete": True,
@@ -43,6 +52,18 @@ def edge_observation(now, name, received_at=None):
         },
     }
     return MissionObservation(now=now, **fields[name])
+
+
+def cone_observation(now, *, end_flag=False, confidence=90):
+    return MissionObservation(
+        now=now,
+        cone_detected=not end_flag and confidence > 0,
+        cone_finished=end_flag,
+        cone_confidence=confidence,
+        cone_end_flag=end_flag,
+        cone_message_received_at=now,
+        scan_received_at=now,
+    )
 
 
 def test_initial_green_starts_lap_one_without_incrementing_completed_laps():
@@ -138,8 +159,6 @@ def test_lap_two_shortcut_is_used_once_and_lap_three_guard_is_restored():
     suppressed = fsm.step(
         MissionObservation(
             now=1.3,
-            fixed_zone_entered=True,
-            fixed_zone_entry_received_at=1.3,
             cone_confidence=90,
             cone_end_flag=False,
             cone_message_received_at=1.3,
@@ -156,12 +175,13 @@ def test_lap_two_shortcut_is_used_once_and_lap_three_guard_is_restored():
         context,
         SAFE,
     )
-    fixed = fsm.step(edge_observation(2.1, "fixed_entry"), context, SAFE)
+    for timestamp in (2.1, 2.2, 2.31):
+        cone_entry = fsm.step(cone_observation(timestamp), context, SAFE)
 
     assert next_lap.changed is False
     assert context.current_lap == 3
     assert context.on_shortcut_lap is False
-    assert fixed.target is Mode.FIXED_AVOID
+    assert cone_entry.target is Mode.CONE_DRIVE
 
 
 def test_lap_three_shortcut_is_available_if_lap_two_was_straight():
@@ -253,8 +273,7 @@ def test_fixed_zone_edges_return_straight_to_lane_drive():
 @pytest.mark.parametrize(
     ("state", "edge_name"),
     [
-        (Mode.LANE_DRIVE, "fixed_entry"),
-        (Mode.FIXED_AVOID, "fixed_exit"),
+        (Mode.FIXED_AVOID, "fixed_avoid_complete"),
         (Mode.OVERTAKE, "overtake_complete"),
         (Mode.SHORTCUT, "shortcut_complete"),
     ],
@@ -288,28 +307,80 @@ def test_pre_entry_stale_and_duplicate_mission_edges_are_ignored(
     assert fsm.state is state
 
 
-def test_explicit_fixed_entry_has_priority_over_simultaneous_cone_evidence():
-    fsm = RaceFSM(
-        initial_state=Mode.LANE_DRIVE,
-        cone_entry_config=ConeEntryConfig(min_messages=1, min_duration_s=0.0),
-    )
-    context = RaceContext(state_entered_at=1.0)
+@pytest.mark.parametrize(
+    ("state", "edge_name", "target"),
+    [
+        (Mode.FIXED_AVOID, "fixed_avoid_complete", Mode.OVERTAKE),
+        (Mode.OVERTAKE, "overtake_complete", Mode.LANE_DRIVE),
+        (Mode.SHORTCUT, "shortcut_complete", Mode.LANE_DRIVE),
+    ],
+)
+def test_fresh_completion_is_consumed_once_per_state_session(
+    state,
+    edge_name,
+    target,
+):
+    fsm = RaceFSM(initial_state=state)
+    context = RaceContext(state_entered_at=10.0)
 
-    transition = fsm.step(
-        MissionObservation(
-            now=1.1,
-            fixed_zone_entered=True,
-            fixed_zone_entry_received_at=1.1,
-            cone_confidence=90,
-            cone_end_flag=False,
-            cone_message_received_at=1.1,
-            scan_received_at=1.1,
-        ),
+    first = fsm.step(edge_observation(10.1, edge_name), context, SAFE)
+    assert first.target is target
+
+    fsm.state = state
+    context.state_entered_at = 20.0
+    replayed = fsm.step(
+        edge_observation(20.1, edge_name, received_at=10.1),
+        context,
+        SAFE,
+    )
+    assert replayed.changed is False
+    assert fsm.state is state
+
+    fresh = fsm.step(edge_observation(20.2, edge_name), context, SAFE)
+    assert fresh.target is target
+
+
+@pytest.mark.parametrize(
+    ("state", "edge_name"),
+    [
+        (Mode.FIXED_AVOID, "fixed_avoid_complete"),
+        (Mode.OVERTAKE, "overtake_complete"),
+        (Mode.SHORTCUT, "shortcut_complete"),
+    ],
+)
+def test_regressed_future_and_invalid_completion_timestamps_are_ignored(
+    state,
+    edge_name,
+):
+    fsm = RaceFSM(initial_state=state, mission_event_max_age_s=0.25)
+    context = RaceContext(state_entered_at=10.0)
+
+    stale_seed = fsm.step(
+        edge_observation(11.0, edge_name, received_at=10.6),
+        context,
+        SAFE,
+    )
+    regressed = fsm.step(
+        edge_observation(11.1, edge_name, received_at=10.5),
         context,
         SAFE,
     )
 
-    assert transition.target is Mode.FIXED_AVOID
+    assert stale_seed.changed is False
+    assert regressed.changed is False
+    assert fsm.state is state
+
+    for timestamp in (10.2, None, math.nan, math.inf, -math.inf, True):
+        isolated_fsm = RaceFSM(initial_state=state)
+        isolated_context = RaceContext(state_entered_at=10.0)
+        rejected = isolated_fsm.step(
+            edge_observation(10.1, edge_name, received_at=timestamp),
+            isolated_context,
+            SAFE,
+        )
+
+        assert rejected.changed is False
+        assert isolated_fsm.state is state
 
 
 def test_finish_has_priority_over_other_simultaneous_lane_events():
@@ -326,8 +397,6 @@ def test_finish_has_priority_over_other_simultaneous_lane_events():
             route_traffic_received_at=1.1,
             traffic_encounter_started=True,
             traffic_encounter_received_at=1.1,
-            fixed_zone_entered=True,
-            fixed_zone_entry_received_at=1.1,
             cone_confidence=90,
             cone_end_flag=False,
             cone_message_received_at=1.1,
@@ -342,11 +411,11 @@ def test_finish_has_priority_over_other_simultaneous_lane_events():
 
 
 def test_safety_stop_precedes_all_simultaneous_mission_edges():
-    fsm = RaceFSM(initial_state=Mode.LANE_DRIVE)
+    fsm = RaceFSM(initial_state=Mode.FIXED_AVOID)
     context = RaceContext(state_entered_at=1.0)
 
     transition = fsm.step(
-        edge_observation(1.1, "fixed_entry"),
+        edge_observation(1.1, "fixed_avoid_complete"),
         context,
         SafetyDecision(must_stop=True, reason="synthetic fault"),
     )

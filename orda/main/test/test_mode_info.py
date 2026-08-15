@@ -26,6 +26,7 @@ def test_internal_mode_values_are_not_external_numeric_codes():
         (Mode.LANE_DRIVE, LegacyModeInfoCode.LANE_DRIVE),
         (Mode.CONE_DRIVE, LegacyModeInfoCode.CONE_DRIVE),
         (Mode.REJOIN, LegacyModeInfoCode.REJOIN),
+        (Mode.SHORTCUT, LegacyModeInfoCode.LANE_DRIVE),
         (Mode.FINISH, LegacyModeInfoCode.STOP),
         (Mode.STOP, LegacyModeInfoCode.STOP),
     ],
@@ -36,7 +37,7 @@ def test_confirmed_external_mode_mapping(mode, expected):
 
 @pytest.mark.parametrize(
     "mode",
-    [Mode.FIXED_AVOID, Mode.OVERTAKE, Mode.SHORTCUT],
+    [Mode.FIXED_AVOID, Mode.OVERTAKE],
 )
 def test_unconfirmed_future_modes_publish_stop_instead_of_invented_codes(mode):
     assert external_mode_code(mode) is LegacyModeInfoCode.STOP
@@ -104,7 +105,7 @@ def test_lane_change_code_is_not_emitted_while_action_is_unsafe():
     ) == [3, 0]
 
 
-def test_rejoin_completion_changes_external_mode_to_lane_not_fixed_avoid():
+def test_legacy_rejoin_completion_enters_lane_with_lane_external_mode():
     fsm = RaceFSM(
         initial_state=Mode.REJOIN,
         lane_validity_config=LaneValidityConfig(

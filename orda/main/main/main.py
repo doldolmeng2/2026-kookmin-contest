@@ -25,13 +25,17 @@ from main.control_selector import (
     ControlSource,
     DriveCommand,
 )
+from main.mission_types import LaneTarget, ObjectType, RouteTrafficSignal
 from main.mode_info import mode_info_data
 from main.overtake import OvertakeGuard, side_clearance
 from main.same_lane_brake import SameLaneBrake, SameLaneBrakeDecision
+from main.shortcut_exit import ShortcutExitGuard
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
+    MissionTestProfile,
     RaceRuntimeAdapter,
     dispatch_cone_reset,
+    parse_test_profile,
     runtime_safety_monitor,
 )
 
@@ -48,7 +52,7 @@ CONE_EVENT_WARNING_PERIOD_S = 5.0
 #
 # 이 노드는 예전에 같은 토픽을 std_msgs/Bool 로 구독했다. 발행 타입이 Int32라
 # 타입이 어긋나 연결 자체가 성립하지 않았고, /traffic_detection 은 한 번도
-# 도착하지 않았다. 그 결과 INIT 의 필수 입력이 영영 채워지지 않아 WAIT_GREEN
+# 도착하지 않았다. 그 결과 INIT 의 필수 입력이 영영 채워지지 않아 WAIT_TRAFFIC
 # 으로 넘어가지 못했다 (런치에서 mode:=3 으로 띄우면 가려지는 증상이다).
 TRAFFIC_GREEN_CODES = (2, 3)
 
@@ -77,8 +81,7 @@ STOP_DECEL_STEP = 0.6
 # 역행까지 리셋으로 잡지 않도록 넉넉한 임계값을 둔다.
 BAG_LOOP_BACKJUMP_S = 2.0
 
-# 이 면적을 넘는 박스를 고정장애물로 보고 FIXED_AVOID 구간에 진입한다.
-# is_moving 필드가 아직 없어 검출된 장애물은 전부 고정장애물로 간주한다.
+# 이 면적을 넘는 박스를 object_type에 따라 FIXED_AVOID 또는 OVERTAKE로 보낸다.
 FIXED_ENTRY_BOX_PX = 1900.0
 
 # 추월 완료 판정 임계값은 main.overtake.OvertakeConfig가 갖는다.
@@ -86,11 +89,16 @@ FIXED_ENTRY_BOX_PX = 1900.0
 # Keep the launch file's existing integer ``mode`` parameter usable for the
 # states that have a defined 2026 counterpart. Unsupported legacy mission
 # states are rejected instead of being guessed.
-_LEGACY_INITIAL_MODE = {
+_NUMERIC_INITIAL_MODE = {
     0: Mode.INIT,
-    1: Mode.CONE_DRIVE,
-    2: Mode.REJOIN,
-    3: Mode.LANE_DRIVE,
+    1: Mode.WAIT_TRAFFIC,
+    2: Mode.LANE_DRIVE,
+    3: Mode.CONE_DRIVE,
+    4: Mode.FIXED_AVOID,
+    5: Mode.OVERTAKE,
+    6: Mode.SHORTCUT,
+    7: Mode.FINISH,
+    8: Mode.STOP,
 }
 
 
@@ -100,9 +108,9 @@ def parse_initial_mode(value) -> Mode:
     if isinstance(value, Mode):
         return value
     if isinstance(value, int) and not isinstance(value, bool):
-        if value in _LEGACY_INITIAL_MODE:
-            return _LEGACY_INITIAL_MODE[value]
-        raise ValueError(f"unsupported legacy initial mode: {value}")
+        if value in _NUMERIC_INITIAL_MODE:
+            return _NUMERIC_INITIAL_MODE[value]
+        raise ValueError(f"unsupported numeric initial mode: {value}")
     if isinstance(value, str):
         stripped = value.strip()
         if stripped.lstrip("-").isdigit():
@@ -135,7 +143,7 @@ def sensor_event_qos(*, depth: int = 1) -> QoSProfile:
 
 
 def lane_validity_qos() -> QoSProfile:
-    """Return the required QoS for the currently missing validity publisher."""
+    """Return the required QoS for the explicit lane-validity publisher."""
 
     return sensor_event_qos(depth=10)
 
@@ -147,7 +155,12 @@ class MainNode(Node):
         super().__init__("main_node", context=context)
 
         self.declare_parameter("mode", 0)
+        self.declare_parameter("lane_target", LaneTarget.CENTER.value)
+        self.declare_parameter("test_profile", MissionTestProfile.RACE.value)
         self.declare_parameter("show_debug", False)
+        test_profile = parse_test_profile(
+            self.get_parameter("test_profile").value
+        )
         self._initial_mode = parse_initial_mode(self.get_parameter("mode").value)
         self.show_debug = bool(self.get_parameter("show_debug").value)
 
@@ -161,6 +174,14 @@ class MainNode(Node):
             fsm=RaceFSM(initial_state=self._initial_mode),
             safety_monitor=runtime_safety_monitor(),
         )
+        lane_target_value = int(self.get_parameter("lane_target").value)
+        self._initial_lane_target = LaneTarget(lane_target_value)
+        self.runtime.context.lane_target = self._initial_lane_target
+        if test_profile is not MissionTestProfile.RACE:
+            self.runtime.bootstrap_test_profile(
+                test_profile,
+                self._now_seconds(),
+            )
         self.lane_controller = Controller()
         self.cone_controller = Controller()
 
@@ -175,6 +196,8 @@ class MainNode(Node):
         self.box_cy = float("nan")
         self.box_dx = float("nan")
         self.car_lane = -1
+        self.object_type = ObjectType.UNKNOWN
+        self.object_confidence = 0.0
         self.detected_lane = -1         # 실측 현재 차선 (-1=미확정, 0=중앙, 1=왼쪽, 2=오른쪽)
         self.side_left = float("inf")   # 좌측면 최소 거리 (m, /scan 에서 계산)
         self.side_right = float("inf")  # 우측면 최소 거리 (m, /scan 에서 계산)
@@ -192,11 +215,14 @@ class MainNode(Node):
         self._zone_state: Optional[Mode] = None   # 직전 사이클의 FSM 상태
         self._zone_exit_sent = False              # 현재 구간의 종료 엣지를 이미 냈는지
         self._fixed_entry_sent = False            # 이번 LANE_DRIVE 세션에서 진입 엣지를 냈는지
+        self.shortcut_exit = ShortcutExitGuard()
+        self._shortcut_exit_sent = False
 
         self.now_speed = 0.0
         self.now_angle = 0.0
         self.last_debug_time: Optional[float] = None
         self._warning_times: dict[str, float] = {}
+        self._traffic_encounter_active = False
 
         qos_fast = sensor_event_qos()
         qos_command = QoSProfile(
@@ -270,6 +296,12 @@ class MainNode(Node):
             self.lane_position_callback,
             qos_fast,
         )
+        self.road_surface_sub = self.create_subscription(
+            Int32,
+            "/road_surface",
+            self.road_surface_callback,
+            qos_fast,
+        )
         self.ultrasonic_sub = self.create_subscription(
             Int32MultiArray,
             "xycar_ultrasonic",
@@ -325,16 +357,53 @@ class MainNode(Node):
 
     def traffic_callback(self, msg: Int32) -> None:
         received_at = self._now_seconds()
-        self.traffic_signal = int(msg.data)
-        self.runtime.record_traffic(
-            self.traffic_signal in TRAFFIC_GREEN_CODES,
-            received_at,
+        try:
+            signal = RouteTrafficSignal(msg.data)
+        except (TypeError, ValueError):
+            self._warn_throttled(
+                "malformed_traffic",
+                f"invalid traffic_detection value ignored: {msg.data}",
+                received_at,
+            )
+            return
+
+        # Preserve the start-only WAIT_TRAFFIC contract.
+        is_green = signal in (
+            RouteTrafficSignal.STRAIGHT,
+            RouteTrafficSignal.LEFT,
         )
+        self.runtime.record_traffic(is_green, received_at)
+
+        # One lap encounter edge per visible traffic-light episode.
+        # RED_AMBER does not start an encounter. UNKNOWN rearms the edge.
+        encounter_started = False
+        if signal is RouteTrafficSignal.UNKNOWN:
+            self._traffic_encounter_active = False
+        elif signal in (
+            RouteTrafficSignal.STRAIGHT,
+            RouteTrafficSignal.LEFT,
+        ):
+            encounter_started = not self._traffic_encounter_active
+            self._traffic_encounter_active = True
+
+        result = self.runtime.record_route_traffic(
+            signal,
+            received_at,
+            encounter_started=encounter_started,
+        )
+        if not result.accepted:
+            self._warn_throttled(
+                "malformed_route_traffic",
+                result.warning or "invalid route traffic input ignored",
+                received_at,
+            )
+        self.traffic_signal = int(signal)
 
     def scan_callback(self, msg: LaserScan) -> None:
         self.runtime.record_scan(self._now_seconds())
         # 측면 거리는 /object_info 에 담지 않고 여기서 직접 뽑는다.
-        # premerge 가 초음파를 그대로 읽던 구조와 같다 (README 11필드 계약 유지).
+        # premerge 가 초음파를 그대로 읽던 구조와 같다. /object_info의
+        # 12필드 계약과 별개로 원시 /scan에서 측면 clearance를 계산한다.
         self.side_left, self.side_right = side_clearance(
             msg.ranges,
             msg.angle_min,
@@ -345,7 +414,7 @@ class MainNode(Node):
         )
 
     def lane_validity_callback(self, msg: Bool) -> None:
-        """Record only an explicit future lane-validity publisher edge."""
+        """Record one explicit lane-validity publisher sample."""
 
         received_at = self._now_seconds()
         if not self.runtime.record_lane_validity(msg.data, received_at):
@@ -365,6 +434,22 @@ class MainNode(Node):
         self.detected_lane = value if value in (0, 1, 2) else -1
         # 차선 변경 완료 판정에 쓰인다 (runtime_adapter._update_lane_action).
         self.runtime.measured_lane = self.detected_lane
+
+    def road_surface_callback(self, msg: Int32) -> None:
+        """Consume CNN road labels: 0 unknown, 1 black road, 2 white shortcut."""
+
+        if self.runtime.fsm.state is not Mode.SHORTCUT:
+            return
+        now = self._now_seconds()
+        if (
+            not self._shortcut_exit_sent
+            and self.shortcut_exit.update(msg.data, now)
+        ):
+            self._shortcut_exit_sent = True
+            self.runtime.record_shortcut_complete(now)
+            self.get_logger().info(
+                "지름길 흰 차선 이후 검은 도로 연속 인식 -> 차선 주행 복귀"
+            )
 
     def object_info_callback(self, msg: Float32MultiArray) -> None:
         received_at = self._now_seconds()
@@ -387,6 +472,13 @@ class MainNode(Node):
         self.box_cy = float(data[7])
         self.box_dx = float(data[8])
         self.car_lane = int(data[9])
+        snapshot = self.runtime.latest_object_snapshot
+        self.object_type = (
+            snapshot.object_type if snapshot is not None else ObjectType.UNKNOWN
+        )
+        self.object_confidence = (
+            snapshot.confidence if snapshot is not None else 0.0
+        )
 
     def lane_change_state_callback(self, msg: Int32MultiArray) -> None:
         received_at = self._now_seconds()
@@ -486,6 +578,8 @@ class MainNode(Node):
 
         self.overtake.enter_zone(now)
         self._zone_exit_sent = False
+        self.shortcut_exit.reset()
+        self._shortcut_exit_sent = False
 
     def is_change_end(self) -> bool:
         """차선 변경이 끝났는지.
@@ -509,9 +603,15 @@ class MainNode(Node):
         if decision.side_just_seen:
             self.get_logger().info(
                 f"측면 방해차량 인식 ({decision.side_distance:.2f}m), "
-                f"{self.overtake.config.pass_delay_s:.1f}초 후 추월 완료")
+                "사라질 때까지 추적")
+        if decision.side_just_cleared:
+            self.get_logger().info(
+                f"측면 방해차량 사라짐, {self.overtake.config.pass_delay_s:.1f}초 "
+                "연속 clear 확인 시작")
         if decision.timed_out:
-            self.get_logger().info("방해차량 구간 시간 상한 초과 -> 차선 주행 복귀")
+            self.get_logger().warning(
+                "방해차량 구간 시간 상한 초과: LiDAR clear가 확인되지 않아 "
+                "미션 상태 유지")
         return decision.complete
 
     @staticmethod
@@ -596,6 +696,7 @@ class MainNode(Node):
             fsm=RaceFSM(initial_state=self._initial_mode),
             safety_monitor=runtime_safety_monitor(),
         )
+        self.runtime.context.lane_target = self._initial_lane_target
         self.lane_controller = Controller()
         self.cone_controller = Controller()
 
@@ -606,6 +707,8 @@ class MainNode(Node):
         )
         self._zone_state = None
         self._zone_exit_sent = False
+        self.shortcut_exit.reset()
+        self._shortcut_exit_sent = False
 
         # 인지 캐시도 비운다. 이전 루프의 마지막 프레임이 새 루프 첫 판단에
         # 섞이지 않게 한다.
@@ -613,6 +716,8 @@ class MainNode(Node):
         self.obj_exists = 0.0
         self.box_size = 0.0
         self.car_lane = -1
+        self.object_type = ObjectType.UNKNOWN
+        self.object_confidence = 0.0
         self.detected_lane = -1
         self.side_left = float("inf")
         self.side_right = float("inf")
@@ -620,37 +725,13 @@ class MainNode(Node):
         self.now_angle = 0.0
 
     def _drive_mission_zones(self, now: float) -> None:
-        """구간 체인(LANE_DRIVE → FIXED_AVOID → OVERTAKE → LANE_DRIVE)을 굴린다.
+        """Create typed obstacle-zone edges and CNN shortcut-exit sessions.
 
-        race_fsm은 세 이벤트(fixed_zone_entry / fixed_zone_exit /
-        overtake_complete)로 구간을 넘기도록 이미 만들어져 있는데, 그 이벤트를
-        만들어 주는 쪽이 비어 있어서 체인 전체가 잠들어 있었다. 여기서 채운다.
-
-        진입(fixed_zone_entry)은 **여기서 만들지 않는다.** README:
-          - "REJOIN 성공은 LANE_DRIVE 복귀만 의미하며 FIXED_AVOID 진입 증거가
-             아니다."
-          - "고정장애물 진입 publisher/topic/type 계약이 확정될 때까지
-             FIXED_AVOID 는 runtime에서 도달 불가능한 외부 blocker로 유지한다."
-          - "구간 안에서 실제 회피/추월 동작을 할지는 /object_info 로 판단하며
-             … 구간 진입 조건이 아니다."
-        라바콘 통과나 객체 검출로 진입을 합성하면 세 규칙을 모두 어긴다.
-        진입 계약이 정해지면 그 구독 콜백에서 record_fixed_zone_entry() 를
-        부르면 된다 (API는 이미 있다).
-
-        진입(fixed_zone_entry)은 지금 단계에서 **고정장애물 검출**로 만든다.
-        is_moving 이 없어 방해차량과 구분할 수 없으므로, 검출된 장애물을 전부
-        고정장애물로 간주한다. 진입 publisher/topic 계약이 확정되면 이 블록을
-        지우고 그 구독 콜백에서 record_fixed_zone_entry() 를 부르면 된다.
-
-        구간 종료 엣지도 여기서 만든다:
-          - 고정장애물 통과 : 이동/고정을 구분할 입력(is_moving)이 아직 없어
-                    시간 상한으로 넘긴다. README의 "구간 시간 상한" 규칙.
-          - 고정장애물 추월 : 측면 LiDAR로 옆으로 지나간 것을 확인하고
-                    pass_delay_s 뒤에 확정한다 (main.overtake).
-        OVERTAKE 는 움직이는 방해차량용이라 이 경로에서는 쓰지 않는다.
-
-        회피 방향과 차선 변경 자체는 runtime_adapter._update_lane_action이
-        이미 담당하므로 여기서 중복하지 않는다. 이 메서드는 구간 경계만 만든다.
+        ``object_type`` separates fixed and moving obstacles at entry. Both
+        zones finish only after the side LiDAR has seen the obstacle, then
+        continuously seen clearance for ``pass_delay_s``. The adapter alone
+        owns avoidance direction and ``lane_target`` so the avoided lane is
+        retained after returning to LANE_DRIVE.
         """
 
         state = self.runtime.fsm.state
@@ -665,13 +746,19 @@ class MainNode(Node):
             if (
                 not self._fixed_entry_sent
                 and self.box_size > FIXED_ENTRY_BOX_PX
+                and self.object_type in (ObjectType.FIXED, ObjectType.MOVING)
                 and entered_at is not None
                 and now > entered_at
             ):
                 self._fixed_entry_sent = True
-                self.runtime.record_fixed_zone_entry(now)
+                if self.object_type is ObjectType.MOVING:
+                    self.runtime.record_overtake_entry(now)
+                    label = "방해차량"
+                else:
+                    self.runtime.record_fixed_zone_entry(now)
+                    label = "고정장애물"
                 self.get_logger().info(
-                    f"고정장애물 검출 ({self.box_size:.0f}px^2) -> 고정장애물 구간 진입")
+                    f"{label} 검출 ({self.box_size:.0f}px^2) -> 미션 구간 진입")
             return
 
         if state is Mode.FIXED_AVOID:
@@ -686,7 +773,22 @@ class MainNode(Node):
                 self.get_logger().info("고정장애물 추월 확인 -> 차선 주행 복귀")
             return
 
-        # 그 밖의 상태(INIT/WAIT_GREEN/REJOIN/SHORTCUT 등)에서는 구간 판정을 쉰다.
+        if state is Mode.OVERTAKE:
+            if entered:
+                self._enter_zone(now)
+            if not self._zone_exit_sent and self.is_pass_comp(now):
+                self._zone_exit_sent = True
+                self.runtime.record_overtake_complete(now)
+                self.get_logger().info("방해차량 추월 확인 -> 현재 차선 유지")
+            return
+
+        if state is Mode.SHORTCUT:
+            if entered:
+                self.shortcut_exit.reset()
+                self._shortcut_exit_sent = False
+            return
+
+        # 그 밖의 상태(INIT/WAIT_TRAFFIC/REJOIN 등)에서는 구간 판정을 쉰다.
         if entered:
             self._enter_zone(now)
 
@@ -842,6 +944,7 @@ class MainNode(Node):
             f"Side L/R: {self._fmt_side(self.side_left)}"
             f" / {self._fmt_side(self.side_right)}",
             f"Box: {self.box_size:.0f}px^2  car_lane={self.car_lane}",
+            f"Object: {self.object_type.name} conf={self.object_confidence:.2f}",
             f"Avoid dir: {self._avoid_direction_text()}",
             f"Current lane: {self._lane_label(self.detected_lane)}",
             f"Lane cmd: {self._lane_command_text()}",

@@ -107,7 +107,7 @@ class ControlSelector:
         if traffic_hold:
             return self._stop("recoverable route-traffic hold")
 
-        if mode is Mode.LANE_DRIVE:
+        if mode in (Mode.LANE_DRIVE, Mode.SHORTCUT):
             valid, reason = self._candidate_is_fresh(
                 lane,
                 now,
@@ -118,7 +118,11 @@ class ControlSelector:
                 return ControlDecision(
                     ControlSource.LANE,
                     lane.command,
-                    "fresh lane command selected",
+                    (
+                        "fresh shortcut lane command selected"
+                        if mode is Mode.SHORTCUT
+                        else "fresh lane command selected"
+                    ),
                 )
             return self._stop(reason)
 

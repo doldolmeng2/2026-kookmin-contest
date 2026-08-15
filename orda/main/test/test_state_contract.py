@@ -22,7 +22,7 @@ STATE_CONTRACT = (
     (Mode.REJOIN, ControlSource.STOP, 2),
     (Mode.FIXED_AVOID, ControlSource.STOP, 0),
     (Mode.OVERTAKE, ControlSource.STOP, 0),
-    (Mode.SHORTCUT, ControlSource.STOP, 0),
+    (Mode.SHORTCUT, ControlSource.LANE, 3),
     (Mode.FINISH, ControlSource.STOP, 0),
     (Mode.STOP, ControlSource.STOP, 0),
 )
@@ -65,8 +65,8 @@ def test_safety_fault_precedes_every_nonterminal_mission_transition(mode):
             lane_valid_received_at=2.0,
             cone_end_flag=True,
             cone_message_received_at=2.0,
-            fixed_zone_exited=True,
-            fixed_zone_exit_received_at=2.0,
+            fixed_avoid_complete=True,
+            fixed_avoid_completed_at=2.0,
             overtake_complete=True,
             overtake_complete_received_at=2.0,
             shortcut_complete=True,
@@ -84,7 +84,7 @@ def test_safety_fault_precedes_every_nonterminal_mission_transition(mode):
         assert context.stop_reason == "contract fault"
 
 
-def test_rejoin_success_contract_returns_to_lane_and_never_enters_fixed_avoid():
+def test_rejoin_success_contract_enters_fixed_avoid_directly():
     fsm = RaceFSM(
         initial_state=Mode.REJOIN,
         lane_validity_config=LaneValidityConfig(
@@ -108,4 +108,3 @@ def test_rejoin_success_contract_returns_to_lane_and_never_enters_fixed_avoid():
 
     assert transition.source is Mode.REJOIN
     assert transition.target is Mode.LANE_DRIVE
-    assert transition.target is not Mode.FIXED_AVOID

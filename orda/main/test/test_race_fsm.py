@@ -26,7 +26,7 @@ def cone_observation(timestamp, confidence=90, end_flag=False):
 def test_mode_set_matches_2026_skeleton():
     assert [(mode.name, mode.value) for mode in Mode] == [
         ("INIT", "INIT"),
-        ("WAIT_GREEN", "WAIT_GREEN"),
+        ("WAIT_TRAFFIC", "WAIT_TRAFFIC"),
         ("LANE_DRIVE", "LANE_DRIVE"),
         ("CONE_DRIVE", "CONE_DRIVE"),
         ("REJOIN", "REJOIN"),
@@ -43,7 +43,7 @@ def test_mode_set_matches_2026_skeleton():
 def test_mode_values_are_exact_strings():
     assert [mode.value for mode in Mode] == [
         "INIT",
-        "WAIT_GREEN",
+        "WAIT_TRAFFIC",
         "LANE_DRIVE",
         "CONE_DRIVE",
         "REJOIN",
@@ -261,7 +261,7 @@ def test_lane_self_transition_preserves_state_and_cone_entry_times():
     assert context.cone_entered_at == 1.0
 
 
-def test_fresh_zero_then_separate_one_enters_rejoin_and_updates_entry_time():
+def test_fresh_zero_then_separate_one_returns_to_lane_and_updates_entry_time():
     fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
     context = RaceContext(state_entered_at=1.0, cone_entered_at=0.5)
 
@@ -279,7 +279,7 @@ def test_fresh_zero_then_separate_one_enters_rejoin_and_updates_entry_time():
     assert arming.changed is False
     assert arming.reason == "cone exit session armed"
     assert transition.source is Mode.CONE_DRIVE
-    assert transition.target is Mode.REJOIN
+    assert transition.target is Mode.LANE_DRIVE
     assert transition.reason == "fresh cone end flag"
     assert context.state_entered_at == 1.2
     assert fsm.cone_exit_armed is False
@@ -486,7 +486,7 @@ def test_safety_stop_has_priority_over_cone_session_evidence(end_flag):
     assert fsm.cone_exit_armed is False
 
 
-def test_cone_entry_latch_is_rearmed_after_rejoin_commit():
+def test_cone_entry_latch_is_rearmed_after_direct_lane_return():
     fsm = RaceFSM(initial_state=Mode.LANE_DRIVE)
     context = RaceContext(state_entered_at=0.0)
 
@@ -505,7 +505,7 @@ def test_cone_entry_latch_is_rearmed_after_rejoin_commit():
     )
 
     assert old_latched_one.changed is False
-    assert exit_transition.target is Mode.REJOIN
+    assert exit_transition.target is Mode.LANE_DRIVE
     assert fsm.cone_entry_guard.triggered is False
 
     # Stand in for the later mission chain, which is intentionally outside
@@ -535,7 +535,7 @@ def test_cone_entry_latch_is_rearmed_after_rejoin_commit():
 
     assert second_old_one.changed is False
     assert second_exit.source is Mode.CONE_DRIVE
-    assert second_exit.target is Mode.REJOIN
+    assert second_exit.target is Mode.LANE_DRIVE
     assert context.state_entered_at == 2.5
 
 
