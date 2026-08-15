@@ -851,11 +851,9 @@ private:
         {
             cv::Mat canvas(240, 480, CV_8UC3, cv::Scalar(30, 30, 30));
             float exists, dist, csz;
-            bool ok;
             {
                 std::lock_guard<std::mutex> lk(mtx_);
                 exists = dbg_exists_; dist = dbg_dist_; csz = dbg_csize_;
-                ok = last_rx_ok_;
             }
 
             // 소수점 형식 문자열 변환 헬퍼

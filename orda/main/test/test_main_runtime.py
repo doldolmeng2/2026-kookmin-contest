@@ -59,6 +59,9 @@ class CallbackHarness:
     def _warn_throttled(self, key, message, now):
         self.warnings.append((key, message, now))
 
+    def _record_traffic_signal(self, value, received_at):
+        return MainNode._record_traffic_signal(self, value, received_at)
+
 
 def test_main_cone_callback_records_ros_clock_receipt_once():
     harness = CallbackHarness([1.0])
