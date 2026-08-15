@@ -387,9 +387,14 @@ def test_main_traffic_invalid_value_is_rejected():
     [
         (0, Mode.INIT),
         ("INIT", Mode.INIT),
-        (1, Mode.CONE_DRIVE),
-        ("2", Mode.REJOIN),
-        (3, Mode.LANE_DRIVE),
+        (1, Mode.WAIT_TRAFFIC),
+        ("2", Mode.LANE_DRIVE),
+        (3, Mode.CONE_DRIVE),
+        (4, Mode.FIXED_AVOID),
+        (5, Mode.OVERTAKE),
+        (6, Mode.SHORTCUT),
+        (7, Mode.FINISH),
+        (8, Mode.STOP),
         ("LANE_DRIVE", Mode.LANE_DRIVE),
     ],
 )
@@ -397,7 +402,7 @@ def test_initial_mode_parser_supports_defined_runtime_states(value, expected):
     assert parse_initial_mode(value) is expected
 
 
-@pytest.mark.parametrize("value", [4, 5, "BEFORE", "CHANGE_LANE", True])
+@pytest.mark.parametrize("value", [-1, 9, "BEFORE", "CHANGE_LANE", True])
 def test_initial_mode_parser_rejects_undefined_legacy_state_guesses(value):
     with pytest.raises(ValueError):
         parse_initial_mode(value)
@@ -413,7 +418,7 @@ def test_bag_loop_backjump_resets_the_state_machine():
     from main.main import MainNode, BAG_LOOP_BACKJUMP_S
     from main.race_fsm import Mode
 
-    rclpy.init(args=['--ros-args', '-p', 'mode:=1'])
+    rclpy.init(args=['--ros-args', '-p', 'mode:=3'])
     try:
         node = MainNode()
         assert node._initial_mode is Mode.CONE_DRIVE
@@ -490,7 +495,15 @@ def test_is_pass_comp_delegates_to_the_pure_guard():
         delay = node.overtake.config.pass_delay_s
         assert node.is_pass_comp(1.0) is False
         assert node.overtake.side_seen_at == 1.0
-        assert node.is_pass_comp(1.0 + delay) is True
+
+        # 완료 타이머는 장애물이 감지된 시점이 아니라, 측면에서 사라진
+        # 시점부터 시작한다. 같은 근거리 값이 유지되면 고착 센서로 보고
+        # fail-closed 상태를 유지해야 한다.
+        node.side_right = float("inf")
+        clear_started_at = 1.1
+        assert node.is_pass_comp(clear_started_at) is False
+        assert node.overtake.clear_started_at == clear_started_at
+        assert node.is_pass_comp(clear_started_at + delay) is True
     finally:
         rclpy.shutdown()
 
