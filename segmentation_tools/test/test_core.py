@@ -2,7 +2,8 @@ import cv2
 import numpy as np
 import unittest
 
-from segmentation_tools.core import colorize, generate_label
+from segmentation_tools.core import (DEFAULT_COLORS, colorize, draw_roi, generate_label,
+                                     overlay)
 
 
 class CoreTest(unittest.TestCase):
@@ -25,4 +26,17 @@ class CoreTest(unittest.TestCase):
         label = np.array([[0, 1, 5]], dtype=np.uint8)
         result = colorize(label)
         self.assertEqual(result.shape, (1, 3, 3))
-        self.assertEqual(tuple(result[0, 0]), (0, 0, 0))
+        self.assertEqual(tuple(result[0, 0]), DEFAULT_COLORS[0])
+
+    def test_overlay_keeps_background_pixels_untouched(self):
+        image = np.full((2, 2, 3), 120, dtype=np.uint8)
+        label = np.array([[0, 1], [0, 1]], dtype=np.uint8)
+        result = overlay(image, label)
+        self.assertTrue(np.all(result[:, 0] == 120))
+        self.assertFalse(np.all(result[:, 1] == 120))
+
+    def test_draw_roi_dims_outside_and_keeps_inside(self):
+        canvas = np.full((360, 640, 3), 200, dtype=np.uint8)
+        draw_roi(canvas)
+        self.assertTrue(np.all(canvas[100] < 200))
+        self.assertTrue(np.all(canvas[340, 200:440] == 200))

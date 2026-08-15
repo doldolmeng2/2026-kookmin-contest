@@ -20,10 +20,12 @@ setup(
     license='MIT',
     entry_points={
         'console_scripts': [
+            'apply_roi_mask = segmentation_tools.apply_roi_mask:main',
             'color_filter_tuner = segmentation_tools.color_filter_tuner:main',
             'extract_dataset = segmentation_tools.extract_dataset:main',
             'label_editor = segmentation_tools.label_editor:main',
             'merge_datasets = segmentation_tools.merge_datasets:main',
+            'split_dataset = segmentation_tools.split_dataset:main',
         ],
     },
 )
