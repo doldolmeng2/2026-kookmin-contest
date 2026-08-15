@@ -14,16 +14,17 @@ from rclpy.qos import (
     qos_profile_sensor_data,
 )
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool, Empty, Float32MultiArray, Int32, Int32MultiArray
+from std_msgs.msg import Empty, Float32MultiArray, Int16, Int32MultiArray
 
 from main.main import (
-    LANE_VALIDITY_REQUIRED_RATE_HZ,
-    LANE_VALIDITY_TOPIC,
+    LANE_COMMAND_TOPIC,
     LANE_CHANGE_STATE_TOPIC,
     MainNode,
+    OBJECT_INFO_RAW_TOPIC,
+    OBJECT_INFO_TOPIC,
     RUBBERCONE_INFO_TOPIC,
+    RUBBERCONE_OFFSET_TOPIC,
     RUBBERCONE_RESET_TOPIC,
-    lane_validity_qos,
     parse_initial_mode,
     rubbercone_reset_qos,
     sensor_event_qos,
@@ -44,6 +45,9 @@ class CallbackHarness:
         )
         self.warnings = []
         self._traffic_encounter_active = False
+        self.fixed_vehicle_lane = 0
+        self.moving_vehicle_lane = 0
+        self.traffic_signal = 0
         # scan_callback 이 측면 거리를 계산하므로 실제 노드와 같은 필드를 갖춘다.
         self.overtake = OvertakeGuard()
         self.side_left = float("inf")
@@ -80,6 +84,21 @@ def test_main_malformed_cone_callback_warns_without_queuing_event():
     assert harness.warnings[0][0] == "malformed_cone"
 
 
+def test_main_accepts_ppt_rubbercone_offset_contract():
+    harness = CallbackHarness([2.5])
+    harness.rubbercone_offset = 0
+    harness.rubbercone_end_flag = 0
+
+    MainNode.rubbercone_offset_callback(
+        harness,
+        SimpleNamespace(data=[-12, 1]),
+    )
+
+    assert harness.rubbercone_offset == -12
+    assert harness.rubbercone_end_flag == 1
+    assert harness.warnings == []
+
+
 def test_main_scan_and_cone_callbacks_use_the_same_clock_helper():
     harness = CallbackHarness([3.0, 3.01])
 
@@ -95,13 +114,13 @@ def test_main_scan_and_cone_callbacks_use_the_same_clock_helper():
     assert cycle.observation.now == 3.02
 
 
-def test_main_object_callback_records_validated_ten_field_snapshot():
+def test_main_object_raw_callback_records_validated_ten_field_snapshot():
     harness = CallbackHarness([4.0])
     message = SimpleNamespace(
         data=[1.0, 1.2, 0.1, 0.2, 5.0, 100.0, 20.0, 30.0, 4.0, 2.0],
     )
 
-    MainNode.object_info_callback(harness, message)
+    MainNode.object_info_raw_callback(harness, message)
     cycle = harness.runtime.step(4.02)
 
     assert cycle.observation.object_exists is True
@@ -111,13 +130,29 @@ def test_main_object_callback_records_validated_ten_field_snapshot():
     assert harness.warnings == []
 
 
-def test_main_object_callback_accepts_and_normalizes_no_cluster_heartbeat():
+def test_main_object_info_preserves_signal_fixed_and_moving_simultaneously():
+    harness = CallbackHarness([4.5], mode=Mode.WAIT_GREEN)
+
+    MainNode.object_info_callback(
+        harness,
+        SimpleNamespace(data=[2, 1, 2]),
+    )
+    cycle = harness.runtime.step(4.5)
+
+    assert harness.traffic_signal == 2
+    assert harness.fixed_vehicle_lane == 1
+    assert harness.moving_vehicle_lane == 2
+    assert cycle.observation.green_detected is True
+    assert harness.runtime.perception_received_at["object_info"] == 4.5
+
+
+def test_main_object_raw_callback_accepts_and_normalizes_no_cluster_heartbeat():
     harness = CallbackHarness([4.0], mode=Mode.FIXED_AVOID)
     message = SimpleNamespace(
         data=[0.0, float("inf"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     )
 
-    MainNode.object_info_callback(harness, message)
+    MainNode.object_info_raw_callback(harness, message)
     cycle = harness.runtime.step(4.02)
 
     assert cycle.observation.object_exists is False
@@ -136,13 +171,13 @@ def test_main_object_callback_accepts_and_normalizes_no_cluster_heartbeat():
         [1.0, 1.2, 0.1, 0.2, 5.0, 100.0, 20.0, 30.0, 4.0, 3.0],
     ],
 )
-def test_main_object_callback_warns_on_invalid_payload(data):
+def test_main_object_raw_callback_warns_on_invalid_payload(data):
     harness = CallbackHarness([4.0])
 
-    MainNode.object_info_callback(harness, SimpleNamespace(data=data))
+    MainNode.object_info_raw_callback(harness, SimpleNamespace(data=data))
 
     assert harness.runtime.latest_object_snapshot is None
-    assert harness.warnings[0][0] == "malformed_object_info"
+    assert harness.warnings[0][0] == "malformed_object_info_raw"
 
 
 def test_main_lane_change_callback_records_one_fresh_success_edge():
@@ -189,6 +224,7 @@ def test_rubbercone_topics_and_reset_qos_match_detector_contract():
     qos = rubbercone_reset_qos()
 
     assert RUBBERCONE_INFO_TOPIC == "/rubbercone_info"
+    assert RUBBERCONE_OFFSET_TOPIC == "/rubbercone_offset"
     assert RUBBERCONE_RESET_TOPIC == "/rubbercone_reset"
     assert qos.history is HistoryPolicy.KEEP_LAST
     assert qos.depth == 10
@@ -248,6 +284,10 @@ def test_generated_ros_entities_have_exact_topic_type_and_qos():
         assert cone_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
         assert cone_sub.qos_profile.durability is DurabilityPolicy.VOLATILE
 
+        cone_offset_sub = node.rubbercone_offset_sub
+        assert cone_offset_sub.topic_name == RUBBERCONE_OFFSET_TOPIC
+        assert cone_offset_sub.msg_type is Int32MultiArray
+
         scan_sub = node.scan_sub
         assert scan_sub.topic_name == "/scan"
         assert scan_sub.msg_type is LaserScan
@@ -264,11 +304,6 @@ def test_generated_ros_entities_have_exact_topic_type_and_qos():
         assert reset_pub.qos_profile.reliability is ReliabilityPolicy.RELIABLE
         assert reset_pub.qos_profile.durability is DurabilityPolicy.VOLATILE
 
-        validity_sub = node.lane_validity_sub
-        assert validity_sub.topic_name == LANE_VALIDITY_TOPIC
-        assert validity_sub.msg_type is Bool
-        assert validity_sub.qos_profile == lane_validity_qos()
-
         lane_change_sub = node.lane_change_state_sub
         assert lane_change_sub.topic_name == LANE_CHANGE_STATE_TOPIC
         assert lane_change_sub.msg_type is Int32MultiArray
@@ -277,42 +312,32 @@ def test_generated_ros_entities_have_exact_topic_type_and_qos():
         assert lane_change_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
         assert lane_change_sub.qos_profile.durability is DurabilityPolicy.VOLATILE
 
-        # traffic_node 는 /traffic_detection 을 std_msgs/Int32 로 발행한다.
-        # 여기서 Bool 로 구독하면 타입이 어긋나 연결 자체가 성립하지 않고,
-        # INIT 의 필수 입력이 영영 채워지지 않는다.
-        traffic_sub = node.traffic_sub
-        assert traffic_sub.topic_name == "/traffic_detection"
-        assert traffic_sub.msg_type is Int32
-        assert traffic_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
-
         object_sub = node.object_info_sub
-        assert object_sub.topic_name == "/object_info"
-        assert object_sub.msg_type is Float32MultiArray
+        assert object_sub.topic_name == OBJECT_INFO_TOPIC
+        assert object_sub.msg_type is Int32MultiArray
         assert object_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
 
-        traffic_sub = node.traffic_sub
-        assert traffic_sub.topic_name == "/traffic_detection"
-        assert traffic_sub.msg_type is Int32
-        assert traffic_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
+        object_raw_sub = node.object_info_raw_sub
+        assert object_raw_sub.topic_name == OBJECT_INFO_RAW_TOPIC
+        assert object_raw_sub.msg_type is Float32MultiArray
 
         mode_pub = node.mode_pub
         assert mode_pub.topic_name == "/mode_info"
-        assert mode_pub.msg_type is Int32MultiArray
+        assert mode_pub.msg_type is Int16
         assert mode_pub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
+
+        lane_info_pub = node.lane_info_pub
+        assert lane_info_pub.topic_name == "/lane_info"
+        assert lane_info_pub.msg_type is Int16
+
+        lane_command_pub = node.lane_command_pub
+        assert lane_command_pub.topic_name == LANE_COMMAND_TOPIC
+        assert lane_command_pub.msg_type is Int32MultiArray
+        assert not hasattr(node, "traffic_sub")
+        assert not hasattr(node, "lane_validity_sub")
     finally:
         node.destroy_node()
         rclpy.shutdown(context=context)
-
-
-def test_lane_validity_publisher_contract_is_explicit():
-    qos = lane_validity_qos()
-
-    assert LANE_VALIDITY_TOPIC == "/lane_valid"
-    assert LANE_VALIDITY_REQUIRED_RATE_HZ == 10.0
-    assert qos.history is HistoryPolicy.KEEP_LAST
-    assert qos.depth == 10
-    assert qos.reliability is ReliabilityPolicy.BEST_EFFORT
-    assert qos.durability is DurabilityPolicy.VOLATILE
 
 
 def test_lane_change_feedback_uses_existing_topic_without_new_mission_topics():
@@ -325,10 +350,10 @@ def test_lane_change_feedback_uses_existing_topic_without_new_mission_topics():
     assert "shortcut_complete" not in source
 
 
-def test_main_traffic_int32_maps_straight_to_green_and_route_signal():
+def test_main_object_info_maps_straight_to_green_and_route_signal():
     harness = CallbackHarness([6.0], mode=Mode.WAIT_GREEN)
 
-    MainNode.traffic_callback(harness, SimpleNamespace(data=2))
+    MainNode.object_info_callback(harness, SimpleNamespace(data=[2, 0, 0]))
     cycle = harness.runtime.step(6.0)
 
     assert cycle.observation.green_detected is True
@@ -337,10 +362,10 @@ def test_main_traffic_int32_maps_straight_to_green_and_route_signal():
     assert harness.warnings == []
 
 
-def test_main_traffic_int32_red_sets_route_stop_override():
+def test_main_object_info_red_sets_route_stop_override():
     harness = CallbackHarness([6.0], mode=Mode.LANE_DRIVE)
 
-    MainNode.traffic_callback(harness, SimpleNamespace(data=1))
+    MainNode.object_info_callback(harness, SimpleNamespace(data=[1, 0, 0]))
     cycle = harness.runtime.step(6.0)
 
     assert cycle.observation.green_detected is False
@@ -355,16 +380,16 @@ def test_main_traffic_encounter_is_one_edge_until_unknown_rearms():
         mode=Mode.LANE_DRIVE,
     )
 
-    MainNode.traffic_callback(harness, SimpleNamespace(data=2))
+    MainNode.object_info_callback(harness, SimpleNamespace(data=[2, 0, 0]))
     first = harness.runtime.step(7.0)
 
-    MainNode.traffic_callback(harness, SimpleNamespace(data=2))
+    MainNode.object_info_callback(harness, SimpleNamespace(data=[2, 0, 0]))
     repeated = harness.runtime.step(7.1)
 
-    MainNode.traffic_callback(harness, SimpleNamespace(data=0))
+    MainNode.object_info_callback(harness, SimpleNamespace(data=[0, 0, 0]))
     harness.runtime.step(7.2)
 
-    MainNode.traffic_callback(harness, SimpleNamespace(data=2))
+    MainNode.object_info_callback(harness, SimpleNamespace(data=[2, 0, 0]))
     second = harness.runtime.step(7.3)
 
     assert first.observation.traffic_encounter_started is True
@@ -373,28 +398,47 @@ def test_main_traffic_encounter_is_one_edge_until_unknown_rearms():
     assert harness.runtime.context.completed_laps == 2
 
 
-def test_main_traffic_invalid_value_is_rejected():
+def test_main_object_info_invalid_value_is_rejected():
     harness = CallbackHarness([8.0], mode=Mode.LANE_DRIVE)
 
-    MainNode.traffic_callback(harness, SimpleNamespace(data=9))
+    MainNode.object_info_callback(harness, SimpleNamespace(data=[9, 0, 0]))
 
-    assert "traffic_detection" not in harness.runtime.perception_received_at
-    assert harness.warnings[0][0] == "malformed_traffic"
+    assert "object_info" not in harness.runtime.perception_received_at
+    assert harness.warnings[0][0] == "malformed_object_info"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        [0, 0],
+        [0, 0, 0, 0],
+        [0, 3, 0],
+        [0, 0, -1],
+        [True, 0, 0],
+        [0.0, 0, 0],
+    ],
+)
+def test_main_object_info_rejects_malformed_ppt_payload(data):
+    harness = CallbackHarness([8.0], mode=Mode.LANE_DRIVE)
+
+    MainNode.object_info_callback(harness, SimpleNamespace(data=data))
+
+    assert "object_info" not in harness.runtime.perception_received_at
+    assert harness.warnings[0][0] == "malformed_object_info"
 
 
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (0, Mode.INIT),
-        ("INIT", Mode.INIT),
-        (1, Mode.WAIT_TRAFFIC),
-        ("2", Mode.LANE_DRIVE),
-        (3, Mode.CONE_DRIVE),
-        (4, Mode.FIXED_AVOID),
-        (5, Mode.OVERTAKE),
-        (6, Mode.SHORTCUT),
-        (7, Mode.FINISH),
-        (8, Mode.STOP),
+        (0, Mode.WAIT_GREEN),
+        ("WAIT_TRAFFIC", Mode.WAIT_GREEN),
+        (1, Mode.LANE_DRIVE),
+        ("2", Mode.CONE_DRIVE),
+        (3, Mode.FIXED_AVOID),
+        (4, Mode.OVERTAKE),
+        (5, Mode.SHORTCUT),
+        ("FINISH", Mode.FINISH),
+        ("STOP", Mode.STOP),
         ("LANE_DRIVE", Mode.LANE_DRIVE),
     ],
 )
@@ -402,7 +446,10 @@ def test_initial_mode_parser_supports_defined_runtime_states(value, expected):
     assert parse_initial_mode(value) is expected
 
 
-@pytest.mark.parametrize("value", [-1, 9, "BEFORE", "CHANGE_LANE", True])
+@pytest.mark.parametrize(
+    "value",
+    [-1, 6, 9, "INIT", "REJOIN", "BEFORE", "CHANGE_LANE", True],
+)
 def test_initial_mode_parser_rejects_undefined_legacy_state_guesses(value):
     with pytest.raises(ValueError):
         parse_initial_mode(value)
@@ -418,7 +465,7 @@ def test_bag_loop_backjump_resets_the_state_machine():
     from main.main import MainNode, BAG_LOOP_BACKJUMP_S
     from main.race_fsm import Mode
 
-    rclpy.init(args=['--ros-args', '-p', 'mode:=3'])
+    rclpy.init(args=['--ros-args', '-p', 'mode:=2'])
     try:
         node = MainNode()
         assert node._initial_mode is Mode.CONE_DRIVE
@@ -449,7 +496,7 @@ def test_small_backward_jitter_does_not_reset():
     from main.main import MainNode
     from main.race_fsm import Mode
 
-    rclpy.init(args=['--ros-args', '-p', 'mode:=3'])
+    rclpy.init(args=['--ros-args', '-p', 'mode:=2'])
     try:
         node = MainNode()
         node.runtime.fsm.state = Mode.OVERTAKE
@@ -483,7 +530,7 @@ def test_is_pass_comp_delegates_to_the_pure_guard():
     from main.main import MainNode
     from main.race_fsm import Mode
 
-    rclpy.init(args=['--ros-args', '-p', 'mode:=3'])
+    rclpy.init(args=['--ros-args', '-p', 'mode:=2'])
     try:
         node = MainNode()
         node.runtime.fsm.state = Mode.OVERTAKE
@@ -511,7 +558,7 @@ def test_is_pass_comp_delegates_to_the_pure_guard():
 def test_is_change_end_follows_lane_change_state_feedback():
     import rclpy
 
-    rclpy.init(args=['--ros-args', '-p', 'mode:=3'])
+    rclpy.init(args=['--ros-args', '-p', 'mode:=2'])
     try:
         node = _node_in_overtake()
         assert node.is_change_end() is False
@@ -602,13 +649,13 @@ def test_lane_source_recovers_cruise_speed_in_about_one_second():
     ("code", "green"),
     [(0, False), (1, False), (2, True), (3, True)],
 )
-def test_traffic_callback_maps_int32_signal_codes_to_green(code, green):
-    """0=미검출, 1=적색/주황, 2=녹색, 3=좌회전 녹색 (traffic_node.infer)."""
+def test_object_info_maps_signal_codes_to_green(code, green):
+    """0=미검출, 1=적색/주황, 2=녹색, 3=좌회전 녹색."""
     from main.main import MainNode
 
     harness = CallbackHarness([7.0], mode=Mode.WAIT_GREEN)
 
-    MainNode.traffic_callback(harness, SimpleNamespace(data=code))
+    MainNode.object_info_callback(harness, SimpleNamespace(data=[code, 0, 0]))
     cycle = harness.runtime.step(7.01)
 
     assert harness.traffic_signal == code

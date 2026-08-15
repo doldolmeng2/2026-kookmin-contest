@@ -34,4 +34,7 @@ install(FILES
   best_simplified.onnx
   DESTINATION share/${PROJECT_NAME}/model)
 
+install(DIRECTORY config
+  DESTINATION share/${PROJECT_NAME})
+
 ament_package()

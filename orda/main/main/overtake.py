@@ -95,7 +95,7 @@ def side_clearance(
     """LaserScan 원시 값에서 좌/우 측면 최소 거리(m)를 뽑는다.
 
     premerge 가 초음파(`/xycar_ultrasonic`)를 그대로 읽던 자리에 LiDAR 를
-    넣은 것이다. `/object_info`의 12필드 계약과 별개로,
+    넣은 것이다. 내부 `/object_info_raw`의 12필드 계약과 별개로,
     main_node 가 안전 감시용으로 이미 구독 중인 `/scan` 에서 직접 계산한다.
 
     반환: (side_left, side_right). 해당 섹터에 유효 점이 없으면 inf.

@@ -38,7 +38,8 @@ class AvoidDirectionConfig:
     min_consecutive_frames: int = 3
     # 그 연속 구간이 실제로 이만큼의 시간을 덮어야 한다.
     #
-    # 프레임 수만 세면 안 된다. object_detection 은 50 Hz 타이머로 /object_info
+    # 프레임 수만 세면 안 된다. object_detection 은 50 Hz 타이머로
+    # /object_info_raw
     # 를 내보내면서 YOLO 결과가 갱신되지 않아도 직전 박스를 그대로 재발행한다.
     # 실측(bag 재생): 메시지 1444개 중 85.7%가 바로 앞 메시지와 완전히 동일한
     # 재발행이었고, 실제로 갱신된 YOLO 결과는 300 ms 간격(p10 147 ms)이었다.
@@ -46,7 +47,8 @@ class AvoidDirectionConfig:
     # 실측 t=61.38s 에서 단 한 번의 검출(dx=+254)이 3번 재발행되어 차선 변경
     # 명령 [5, 1] 이 나갔다.
     min_duration_s: float = 0.25
-    # 이보다 오래된 /object_info 스냅샷은 증거로 세지 않는다. bag 실측 주기는
+    # 이보다 오래된 /object_info_raw 스냅샷은 증거로 세지 않는다. bag 실측
+    # 주기는
     # 평균 248 ms, p99 306 ms, 최대 348 ms 였다.
     max_age_s: float = 0.6
     # 이미 확정한 방향을 반대로 뒤집는 최소 간격. 좌우로 번갈아 흔들리는 것을

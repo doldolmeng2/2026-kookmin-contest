@@ -1,3 +1,11 @@
+object_yolo_node:
+  ros__parameters:
+    # 현재 포함된 best.onnx는 고정 객체 단일 클래스 모델이다.
+    fixed_class_ids: [0]
+
+    # 팀 다중 클래스 모델의 정확한 라벨 순서를 받은 뒤에만 추가한다.
+    # 예: moving_class_ids: [1]
+
 object_detector_node:
   ros__parameters:
     camera_topic: "/resized_image"

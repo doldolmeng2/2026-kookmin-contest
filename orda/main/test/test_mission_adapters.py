@@ -9,7 +9,7 @@ from main.mission_types import (
     RouteTrafficSignal,
     opposite_lane_target,
 )
-from main.mode_info import mode_info_data
+from main.mode_info import lane_command_data
 from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import RaceRuntimeAdapter
@@ -111,7 +111,7 @@ def test_object_info_accepts_publisher_no_cluster_payload_as_absent_snapshot():
     assert cycle.observation.object_distance is None
     assert cycle.observation.object_lane is ObjectLane.UNKNOWN
     assert cycle.observation.object_received_at == 1.1
-    assert runtime.perception_received_at["object_info"] == 1.1
+    assert runtime.perception_received_at["object_info_raw"] == 1.1
     assert runtime.lane_action.pending is False
     assert cycle.control.source is ControlSource.LANE
 
@@ -182,7 +182,7 @@ def test_fresh_pre_entry_no_object_holds_the_lane_without_starting_action():
     """구간 진입 직전 표본은 주행을 막지 않지만 회피를 시작하지도 않는다.
 
     예전에는 '진입 이후 표본'이 아니면 safe_to_drive 를 내려 STOP 으로
-    떨어뜨렸다. 그러면 구간에 들어서자마자 다음 /object_info 가 올 때까지
+    떨어뜨렸다. 그러면 구간에 들어서자마자 다음 /object_info_raw가 올 때까지
     (실측 최대 0.35초) 장애물 앞에서 멈춰 섰다.
     """
 
@@ -245,7 +245,7 @@ def test_left_object_starts_lane_two_action_and_success_does_not_exit_fixed():
     assert runtime.lane_action.pending is True
     assert runtime.context.lane_target is LaneTarget.LANE_TWO
     assert started.control.source is ControlSource.LANE
-    assert mode_info_data(
+    assert lane_command_data(
         runtime.fsm.state,
         runtime.context.lane_target.value,
         mission_lane_control_enabled=runtime.lane_action.safe_to_drive,
@@ -260,7 +260,7 @@ def test_left_object_starts_lane_two_action_and_success_does_not_exit_fixed():
     assert runtime.fsm.state is Mode.FIXED_AVOID
     assert runtime.lane_action.pending is False
     assert runtime.lane_action.completed is True
-    assert mode_info_data(
+    assert lane_command_data(
         runtime.fsm.state,
         runtime.context.lane_target.value,
         mission_lane_control_enabled=runtime.lane_action.safe_to_drive,
@@ -499,10 +499,10 @@ def test_route_encounter_seam_is_one_shot_and_updates_lap_context():
     assert runtime.context.completed_laps == 1
 
 
-def test_object_info_accepts_extra_side_lidar_fields():
+def test_object_info_raw_accepts_extra_side_lidar_fields():
     """object_detection이 붙인 측면 LiDAR 2필드(11·12번째)를 받아들여야 한다.
 
-    이 두 필드가 거부되면 /object_info 전체가 버려져 회피 판단 입력이 끊긴다.
+    이 두 필드가 거부되면 /object_info_raw 전체가 버려져 회피 입력이 끊긴다.
     """
 
     runtime = adapter(Mode.FIXED_AVOID)
@@ -591,7 +591,7 @@ def test_wrong_direction_is_corrected_after_the_change_completed():
     assert runtime.lane_action.pending is True
     assert runtime.lane_action.completed is False
     # 명령도 다시 차선 변경(5)으로 나가야 lane_detection 이 기준선을 옮긴다.
-    assert mode_info_data(
+    assert lane_command_data(
         runtime.fsm.state,
         runtime.context.lane_target.value,
         mission_lane_control_enabled=runtime.lane_action.safe_to_drive,

@@ -25,28 +25,25 @@ def cone_observation(timestamp, confidence=90, end_flag=False):
 
 def test_mode_set_matches_2026_skeleton():
     assert [(mode.name, mode.value) for mode in Mode] == [
-        ("INIT", "INIT"),
-        ("WAIT_TRAFFIC", "WAIT_TRAFFIC"),
+        ("WAIT_GREEN", "WAIT_GREEN"),
         ("LANE_DRIVE", "LANE_DRIVE"),
         ("CONE_DRIVE", "CONE_DRIVE"),
-        ("REJOIN", "REJOIN"),
         ("FIXED_AVOID", "FIXED_AVOID"),
         ("OVERTAKE", "OVERTAKE"),
         ("SHORTCUT", "SHORTCUT"),
         ("FINISH", "FINISH"),
         ("STOP", "STOP"),
     ]
-    assert len(Mode) == 10
+    assert len(Mode) == 8
     assert "ROUTE_DECISION" not in Mode.__members__
+    assert Mode.WAIT_TRAFFIC is Mode.WAIT_GREEN
 
 
 def test_mode_values_are_exact_strings():
     assert [mode.value for mode in Mode] == [
-        "INIT",
-        "WAIT_TRAFFIC",
+        "WAIT_GREEN",
         "LANE_DRIVE",
         "CONE_DRIVE",
-        "REJOIN",
         "FIXED_AVOID",
         "OVERTAKE",
         "SHORTCUT",
@@ -55,7 +52,7 @@ def test_mode_values_are_exact_strings():
     ]
 
 
-def test_init_waits_for_inputs_without_changing_entry_time():
+def test_wait_green_absorbs_startup_gate_and_waits_for_inputs():
     fsm = RaceFSM()
     context = RaceContext(state_entered_at=1.0)
 
@@ -66,12 +63,12 @@ def test_init_waits_for_inputs_without_changing_entry_time():
     )
 
     assert transition.changed is False
-    assert fsm.state is Mode.INIT
+    assert fsm.state is Mode.WAIT_GREEN
     assert context.state_entered_at == 1.0
     assert context.race_started_at is None
 
 
-def test_init_ready_enters_wait_green_without_starting_race_clock():
+def test_wait_green_ready_without_traffic_message_does_not_start_race():
     fsm = RaceFSM()
     context = RaceContext(state_entered_at=1.0)
 
@@ -81,9 +78,9 @@ def test_init_ready_enters_wait_green_without_starting_race_clock():
         safe(),
     )
 
-    assert transition.changed is True
+    assert transition.changed is False
     assert transition.target is Mode.WAIT_GREEN
-    assert context.state_entered_at == 2.0
+    assert context.state_entered_at == 1.0
     assert context.race_started_at is None
 
 
@@ -541,7 +538,7 @@ def test_cone_entry_latch_is_rearmed_after_direct_lane_return():
 
 @pytest.mark.parametrize(
     "mode",
-    [Mode.CONE_DRIVE, Mode.REJOIN, Mode.FIXED_AVOID, Mode.OVERTAKE],
+    [Mode.CONE_DRIVE, Mode.FIXED_AVOID, Mode.OVERTAKE],
 )
 def test_cone_entry_sequence_does_not_accumulate_outside_lane_drive(mode):
     fsm = RaceFSM(initial_state=mode)
@@ -600,7 +597,7 @@ def test_terminal_states_ignore_further_events_and_faults(terminal):
 
 @pytest.mark.parametrize(
     "state",
-    [Mode.LANE_DRIVE, Mode.CONE_DRIVE, Mode.REJOIN, Mode.FIXED_AVOID],
+    [Mode.LANE_DRIVE, Mode.CONE_DRIVE, Mode.FIXED_AVOID],
 )
 def test_legacy_unwired_mission_fields_do_not_invent_transitions(state):
     fsm = RaceFSM(initial_state=state)
@@ -611,8 +608,6 @@ def test_legacy_unwired_mission_fields_do_not_invent_transitions(state):
     )
     observation = MissionObservation(
         now=11.0,
-        lane_valid=True,
-        lane_valid_received_at=11.0,
         cone_detected=True,
         cone_finished=True,
         object_exists=True,

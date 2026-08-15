@@ -8,9 +8,12 @@
 //   /resized_image (sensor_msgs/Image, BGR8)          - 디버그 영상(선택)
 //   /object_yolo    (std_msgs/Float32MultiArray)       - ONNX Runtime 검출
 //   /lane_fit      (std_msgs/Float32MultiArray [m,b]) - 차선 회귀 결과
+//   /traffic_detection (std_msgs/Int32)                - 신호등 YOLO 결과
 //
 // 발행:
-//   /object_info (std_msgs/Float32MultiArray, 12개 필드)
+//   /object_info (std_msgs/Int32MultiArray, PPT 공식 계약)
+//   [traffic_signal, fixed_vehicle_lane, moving_vehicle_lane]
+//   /object_info_raw (std_msgs/Float32MultiArray, 내부 상세 12개 필드)
 //   [exists, min_dist, angle, span, cluster_size,
 //    box_size, box_cx, box_cy, dx(cx-x_line), lane_label,
 //    object_type, confidence]
@@ -25,6 +28,8 @@
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
+#include <std_msgs/msg/int32.hpp>
+#include <std_msgs/msg/int32_multi_array.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
 #include <cv_bridge/cv_bridge.h>
@@ -62,9 +67,10 @@ public:
         // OpenCV imshow 디버그 창 활성화 여부.
         //
         // 기본값을 false로 둔다. "OBJECT DEBUG"/"CAMERA VIEW" 두 창을 30 Hz로
-        // 갱신하면 같은 프로세스의 YOLO 추론과 CPU를 다투고, 그만큼 /object_info
-        // 와 /lane_offset 이 늦어진다. 실측(bag): 카메라는 18.8 Hz 로 들어오는데
-        // 인지 결과는 5.9 Hz 로 나왔다. 필요할 때만 enable_gui:=true 로 켠다.
+        // 갱신하면 같은 프로세스의 YOLO 추론과 CPU를 다투고, 그만큼
+        // /object_info_raw 와 /lane_offset 이 늦어진다. 실측(bag): 카메라는
+        // 18.8 Hz 로 들어오는데 인지 결과는 5.9 Hz 로 나왔다. 필요할 때만
+        // enable_gui:=true 로 켠다.
         enable_gui_         = this->declare_parameter<bool>("enable_gui",             false);
         // 박스 중심이 중앙선에서 ±lane_split_margin_px_ 이상 벗어나면 차선 레이블 부여.
         //
@@ -80,12 +86,13 @@ public:
         lane_fit_max_age_s_ = this->declare_parameter<double>("lane_fit_max_age_s",    0.5);
         // YOLO 결과가 이보다 오래되면 박스 필드를 0으로 내보낸다.
         //
-        // /object_info 는 50 Hz 타이머로 나가는데 YOLO 는 그보다 훨씬 느리다.
+        // /object_info_raw 는 50 Hz 타이머로 나가는데 YOLO 는 그보다 훨씬 느리다.
         // 갱신되지 않은 박스를 계속 재발행하면 소비자는 "방금 본 장애물"과
         // "300 ms 전에 본 장애물"을 구분할 수 없고, 카메라가 아예 죽어도
         // 마지막 박스가 영원히 살아 있는 것처럼 보인다. 0을 내보내면 기존
         // 계약 그대로 "이 프레임에는 카메라 증거 없음"으로 읽힌다.
         box_max_age_s_      = this->declare_parameter<double>("box_max_age_s",         0.5);
+        traffic_max_age_s_  = this->declare_parameter<double>("traffic_max_age_s",     0.5);
         // lane_fit이 프레임 좌표계면 true (BEV 좌표계면 false)
         lane_fit_is_frame_  = this->declare_parameter<bool>("lane_fit_is_frame",     true);
         // YOLO 모델(.onnx) 경로. 빈 문자열이면 share 디렉터리를 탐색한다.
@@ -119,8 +126,15 @@ public:
             "/object_yolo", qos_fast,
             std::bind(&ObjectDetectionNode::onYoloDetection, this, _1));
 
-        // 장애물 정보 발행
-        pub_obj_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/object_info", qos_fast);
+        sub_traffic_ = this->create_subscription<std_msgs::msg::Int32>(
+            "/traffic_detection", qos_fast,
+            std::bind(&ObjectDetectionNode::onTrafficDetection, this, _1));
+
+        // PPT 공식 정보와 기존 상세 정보를 같은 계산 주기에서 이중 발행한다.
+        pub_obj_ = this->create_publisher<std_msgs::msg::Int32MultiArray>(
+            "/object_info", qos_fast);
+        pub_obj_raw_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
+            "/object_info_raw", qos_fast);
 
         // ── YOLO 모델 초기화 ────────────────────────────────────────────
         // 모델 경로는 개발 PC / 실차 두 곳을 순서대로 확인한다 (resolveModelPath).
@@ -236,32 +250,40 @@ private:
         fit_stamp_ = now();
     }
 
-    // /object_yolo 계약:
-    // [detected, object_type, confidence, box_area, cx, cy, x, y, w, h]
+    void onTrafficDetection(const std_msgs::msg::Int32::SharedPtr msg) {
+        if (msg->data < 0 || msg->data > 3) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "유효하지 않은 /traffic_detection 값을 무시합니다.");
+            return;
+        }
+        std::lock_guard<std::mutex> lk(mtx_traffic_);
+        last_traffic_signal_ = msg->data;
+        last_traffic_stamp_ = now();
+    }
+
+    // /object_yolo 내부 계약: 고정/이동 슬롯을 각각 10필드로 전달한다.
+    // [fixed_detected, 0, confidence, box_area, cx, cy, x, y, w, h,
+    //  moving_detected, 1, confidence, box_area, cx, cy, x, y, w, h]
+    // 구형 bag 호환을 위해 단일 10필드 메시지도 계속 수용한다.
     void onYoloDetection(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
         if (!use_external_yolo_) return;
-        if (msg->data.size() < 10) {
+        if (msg->data.size() != 10 && msg->data.size() != 20) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                 "/object_yolo 필드가 10개보다 적습니다.");
+                                 "/object_yolo는 정확히 10개 또는 20개 필드가 필요합니다.");
             return;
         }
 
-        const bool detected = msg->data[0] >= 0.5f;
-        const int object_type = static_cast<int>(std::lround(msg->data[1]));
-        const float confidence = msg->data[2];
-        const float box_area = msg->data[3];
-        const float box_cx = msg->data[4];
-        const float box_cy = msg->data[5];
-        if (!std::isfinite(confidence) || !std::isfinite(box_area) ||
-            !std::isfinite(box_cx) || !std::isfinite(box_cy) ||
-            (detected && object_type != 0 && object_type != 1)) {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                 "유효하지 않은 /object_yolo 메시지를 무시합니다.");
-            return;
-        }
+        struct ParsedDetection {
+            bool detected = false;
+            int type = -1;
+            float confidence = 0.0f;
+            float area = 0.0f;
+            float cx = 0.0f;
+            float cy = 0.0f;
+            float dx = 0.0f;
+            int lane = 0;
+        };
 
-        float box_dx = 0.0f;
-        int lane_label = 0;
         float m = 0.0f, b = 0.0f;
         bool lane_ok = false;
         rclcpp::Time fit_stamp{0, 0, RCL_ROS_TIME};
@@ -276,21 +298,82 @@ private:
             const double age_s = (now() - fit_stamp).seconds();
             lane_ok = age_s >= 0.0 && age_s <= lane_fit_max_age_s_;
         }
-        if (detected && lane_ok && lane_fit_is_frame_) {
-            const float x_line = m * box_cy + b;
-            box_dx = box_cx - x_line;
-            if (box_dx <= -static_cast<float>(lane_split_margin_px_)) lane_label = 1;
-            else if (box_dx >= static_cast<float>(lane_split_margin_px_)) lane_label = 2;
+
+        const auto parse_slot = [&](std::size_t offset, int expected_type,
+                                    ParsedDetection& out) -> bool {
+            const float detected_value = msg->data[offset];
+            const float type_value = msg->data[offset + 1];
+            if (!std::isfinite(detected_value) ||
+                !std::isfinite(type_value)) {
+                return false;
+            }
+            out.detected = detected_value >= 0.5f;
+            out.type = static_cast<int>(std::lround(type_value));
+            out.confidence = msg->data[offset + 2];
+            out.area = msg->data[offset + 3];
+            out.cx = msg->data[offset + 4];
+            out.cy = msg->data[offset + 5];
+            const bool valid_type = expected_type >= 0
+                ? out.type == expected_type
+                : (out.type == 0 || out.type == 1 ||
+                   (!out.detected && out.type == -1));
+            if (!std::isfinite(out.confidence) || !std::isfinite(out.area) ||
+                !std::isfinite(out.cx) || !std::isfinite(out.cy) ||
+                out.confidence < 0.0f || out.confidence > 1.0f ||
+                out.area < 0.0f || !valid_type) {
+                return false;
+            }
+            if (!out.detected) {
+                out.confidence = 0.0f;
+                out.area = 0.0f;
+                out.cx = 0.0f;
+                out.cy = 0.0f;
+                return true;
+            }
+            if (lane_ok && lane_fit_is_frame_) {
+                const float x_line = m * out.cy + b;
+                out.dx = out.cx - x_line;
+                if (out.dx <= -static_cast<float>(lane_split_margin_px_)) out.lane = 1;
+                else if (out.dx >= static_cast<float>(lane_split_margin_px_)) out.lane = 2;
+            }
+            return true;
+        };
+
+        ParsedDetection fixed;
+        ParsedDetection moving;
+        if (msg->data.size() >= 20) {
+            if (!parse_slot(0, 0, fixed) || !parse_slot(10, 1, moving)) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "유효하지 않은 2슬롯 /object_yolo를 무시합니다.");
+                return;
+            }
+        } else {
+            ParsedDetection legacy;
+            if (!parse_slot(0, -1, legacy)) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "유효하지 않은 구형 /object_yolo를 무시합니다.");
+                return;
+            }
+            if (legacy.type == 0) fixed = legacy;
+            else moving = legacy;
+        }
+
+        const ParsedDetection* closest = nullptr;
+        if (fixed.detected) closest = &fixed;
+        if (moving.detected && (closest == nullptr || moving.area > closest->area)) {
+            closest = &moving;
         }
 
         std::lock_guard<std::mutex> lk(mtx_box_);
-        last_box_area_pix_ = detected ? box_area : 0.0f;
-        last_box_cx_ = detected ? box_cx : 0.0f;
-        last_box_cy_ = detected ? box_cy : 0.0f;
-        last_box_dx_ = detected ? box_dx : 0.0f;
-        last_lane_label_ = detected ? lane_label : 0;
-        last_object_type_ = detected ? object_type : -1;
-        last_object_confidence_ = detected ? confidence : 0.0f;
+        last_fixed_lane_label_ = fixed.detected ? fixed.lane : 0;
+        last_moving_lane_label_ = moving.detected ? moving.lane : 0;
+        last_box_area_pix_ = closest != nullptr ? closest->area : 0.0f;
+        last_box_cx_ = closest != nullptr ? closest->cx : 0.0f;
+        last_box_cy_ = closest != nullptr ? closest->cy : 0.0f;
+        last_box_dx_ = closest != nullptr ? closest->dx : 0.0f;
+        last_lane_label_ = closest != nullptr ? closest->lane : 0;
+        last_object_type_ = closest != nullptr ? closest->type : -1;
+        last_object_confidence_ = closest != nullptr ? closest->confidence : 0.0f;
         last_box_stamp_ = now();
     }
 
@@ -435,7 +518,8 @@ private:
     // 발행 타이머 콜백 (50Hz)
     //
     // LiDAR 상태와 YOLO 박스 상태를 스냅샷으로 읽고
-    // /object_info를 발행한다. 스레드 안전성을 뮤텍스로 보장한다.
+    // 공식 /object_info와 내부 /object_info_raw를 발행한다.
+    // 스레드 안전성을 뮤텍스로 보장한다.
     // ─────────────────────────────────────────────────────────────────────
     void onPublishTick() {
         bool  lidar_ok;
@@ -444,6 +528,8 @@ private:
         float box_area;
         float cx, cy, dx;
         int   lane_label;
+        int   fixed_lane_label;
+        int   moving_lane_label;
         int   object_type;
         float object_confidence;
 
@@ -463,6 +549,8 @@ private:
             cy         = last_box_cy_;
             dx         = last_box_dx_;
             lane_label = last_lane_label_;
+            fixed_lane_label = last_fixed_lane_label_;
+            moving_lane_label = last_moving_lane_label_;
             object_type = last_object_type_;
             object_confidence = last_object_confidence_;
             box_stamp  = last_box_stamp_;
@@ -477,20 +565,48 @@ private:
             box_area   = 0.0f;
             cx = cy = dx = 0.0f;
             lane_label = 0;
+            fixed_lane_label = 0;
+            moving_lane_label = 0;
             object_type = -1;
             object_confidence = 0.0f;
         }
 
         const float exists = (lidar_ok && (minr <= detect_threshold_m_)) ? 1.0f : 0.0f;
 
-        // /object_info 필드:
+        // 내부 /object_info_raw 필드:
         // [exists, min_dist, angle, span, cluster_size,
         //  box_size, box_cx, box_cy, dx, lane_label, object_type, confidence]
-        std_msgs::msg::Float32MultiArray out;
-        out.data = { exists, minr, ang, spn, static_cast<float>(cnt),
+        std_msgs::msg::Float32MultiArray raw;
+        raw.data = { exists, minr, ang, spn, static_cast<float>(cnt),
                      box_area, cx, cy, dx, static_cast<float>(lane_label),
                      static_cast<float>(object_type), object_confidence };
-        pub_obj_->publish(out);
+        pub_obj_raw_->publish(raw);
+
+        int traffic_signal;
+        rclcpp::Time traffic_stamp{0, 0, RCL_ROS_TIME};
+        {
+            std::lock_guard<std::mutex> lk(mtx_traffic_);
+            traffic_signal = last_traffic_signal_;
+            traffic_stamp = last_traffic_stamp_;
+        }
+        const double traffic_age_s =
+            traffic_stamp.nanoseconds() > 0
+                ? (now() - traffic_stamp).seconds()
+                : std::numeric_limits<double>::infinity();
+        const bool traffic_fresh =
+            traffic_age_s >= 0.0 && traffic_age_s <= traffic_max_age_s_;
+        const bool object_yolo_fresh =
+            box_age_s >= 0.0 && box_age_s <= box_max_age_s_;
+
+        // /object_info is only emitted while both YOLO sources are alive.
+        // A valid "nothing detected" sample is [0,0,0]; a dead source must
+        // instead make the topic stale so WAIT_GREEN cannot mistake it for
+        // completed startup readiness.
+        if (traffic_fresh && object_yolo_fresh) {
+            std_msgs::msg::Int32MultiArray info;
+            info.data = {traffic_signal, fixed_lane_label, moving_lane_label};
+            pub_obj_->publish(info);
+        }
 
         // 디버그 패널 갱신
         if (enable_gui_) {
@@ -718,6 +834,8 @@ private:
             last_lane_label_   = lane_label;
             last_object_type_  = box_area > 0.0f ? 0 : -1;
             last_object_confidence_ = 0.0f;
+            last_fixed_lane_label_ = box_area > 0.0f ? lane_label : 0;
+            last_moving_lane_label_ = 0;
             last_box_stamp_    = now();
         }
     }
@@ -782,6 +900,7 @@ private:
     double lane_split_margin_px_;
     double lane_fit_max_age_s_;
     double box_max_age_s_;
+    double traffic_max_age_s_;
     bool   lane_fit_is_frame_;
     bool   use_external_yolo_;
     std::string model_path_;
@@ -791,7 +910,9 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr           sub_img_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr  sub_lane_fit_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr  sub_yolo_;
-    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr     pub_obj_;
+    rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr              sub_traffic_;
+    rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr       pub_obj_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr     pub_obj_raw_;
     rclcpp::TimerBase::SharedPtr timer_;      // 디버그 창 갱신 타이머
     rclcpp::TimerBase::SharedPtr pub_timer_;  // 발행 타이머
 
@@ -821,9 +942,16 @@ private:
     float last_box_cx_       = 0.f, last_box_cy_ = 0.f;
     float last_box_dx_       = 0.f;
     int   last_lane_label_   = 0;
+    int   last_fixed_lane_label_ = 0;
+    int   last_moving_lane_label_ = 0;
     int   last_object_type_  = -1;
     float last_object_confidence_ = 0.0f;
     rclcpp::Time last_box_stamp_{0, 0, RCL_ROS_TIME};  // 마지막 YOLO 갱신 시각
+
+    // ── 신호등 YOLO 공유 변수 (뮤텍스: mtx_traffic_) ──────────────────
+    std::mutex mtx_traffic_;
+    int last_traffic_signal_ = 0;
+    rclcpp::Time last_traffic_stamp_{0, 0, RCL_ROS_TIME};
 
     // ── 차선 회귀 공유 변수 (뮤텍스: mtx_lane_) ────────────────────────
     std::mutex mtx_lane_;

@@ -168,9 +168,9 @@ class SafetyMonitor:
         # 한 번 받은 뒤 끊긴 입력(stale)은 유예 없이 그대로 정지시킨다. 주행
         # 중 센서 유실은 워밍업과 성격이 다르다.
         #
-        # 유예 중에도 inputs_ready는 False로 유지되므로 INIT은 계속 대기하고,
-        # ControlSelector는 신선한 명령이 없으면 0 명령을 내보낸다. 즉 유예가
-        # 곧 "데이터 없이 주행"을 뜻하지는 않는다.
+        # 유예 중에도 inputs_ready는 False로 유지되므로 WAIT_GREEN은 계속
+        # 대기하고, ControlSelector는 0 명령을 내보낸다. 즉 유예가 곧
+        # "데이터 없이 주행"을 뜻하지는 않는다.
         blocking_missing = missing_inputs
         if self.startup_grace_s > 0.0:
             if self._first_evaluated_at is None:

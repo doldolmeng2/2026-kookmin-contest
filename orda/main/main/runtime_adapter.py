@@ -49,7 +49,7 @@ DEFAULT_CONE_EVENT_QUEUE_CAPACITY = 16
 #   토픽            평균     p90     p99     최대
 #   /image_raw      53 ms    73 ms   91 ms   264 ms
 #   /lane_offset   169 ms   358 ms  721 ms  1243 ms
-#   /object_info   248 ms   280 ms  306 ms   348 ms
+#   /object_info_raw 248 ms 280 ms  306 ms   348 ms
 #
 # 예전 값(0.25 / 0.5초)은 이 실측보다 빠듯해서, 정상 주행 중에도 lane_offset이
 # 19%(0.25초 기준) / 4%(0.5초 기준) 확률로 "끊김"으로 분류됐다. 그때마다
@@ -68,7 +68,6 @@ _MOTION_MODES = frozenset(
     {
         Mode.LANE_DRIVE,
         Mode.CONE_DRIVE,
-        Mode.REJOIN,
         Mode.FIXED_AVOID,
         Mode.OVERTAKE,
         Mode.SHORTCUT,
@@ -80,7 +79,7 @@ class MissionTestProfile(str, Enum):
     """Named bag-test entry points backed by existing production Modes."""
 
     RACE = "race"
-    WAIT_TRAFFIC = "wait_traffic"
+    WAIT_GREEN = "wait_green"
     LANE = "lane"
     LANE_ONE = "lane_one"
     LANE_TWO = "lane_two"
@@ -91,7 +90,7 @@ class MissionTestProfile(str, Enum):
 
 
 _TEST_PROFILE_MODES = {
-    MissionTestProfile.WAIT_TRAFFIC: Mode.WAIT_TRAFFIC,
+    MissionTestProfile.WAIT_GREEN: Mode.WAIT_GREEN,
     MissionTestProfile.LANE: Mode.LANE_DRIVE,
     MissionTestProfile.LANE_ONE: Mode.LANE_DRIVE,
     MissionTestProfile.LANE_TWO: Mode.LANE_DRIVE,
@@ -103,7 +102,7 @@ _TEST_PROFILE_MODES = {
 
 _NUMERIC_TEST_PROFILES = {
     0: MissionTestProfile.RACE,
-    1: MissionTestProfile.WAIT_TRAFFIC,
+    1: MissionTestProfile.WAIT_GREEN,
     2: MissionTestProfile.LANE,
     3: MissionTestProfile.LANE_ONE,
     4: MissionTestProfile.LANE_TWO,
@@ -129,6 +128,8 @@ def parse_test_profile(value: Any) -> MissionTestProfile:
     stripped = value.strip().lower()
     if stripped.isdigit():
         return parse_test_profile(int(stripped))
+    if stripped == "wait_traffic":
+        stripped = MissionTestProfile.WAIT_GREEN.value
     try:
         return MissionTestProfile(stripped)
     except ValueError as exc:
@@ -142,14 +143,6 @@ class ConeMessageEvent:
     offset: int
     end_flag: bool
     confidence: int
-    received_at: float
-
-
-@dataclass(frozen=True)
-class LaneValidityEvent:
-    """One explicit lane-validity callback receipt sample."""
-
-    valid: bool
     received_at: float
 
 
@@ -197,7 +190,6 @@ class RuntimeCycleResult:
     fsm_control: ControlCycleResult
     publish_cone_reset: bool
     discarded_pre_reset_events: int = 0
-    discarded_pre_rejoin_lane_events: int = 0
 
     @property
     def transition(self) -> Transition:
@@ -225,10 +217,13 @@ def runtime_safety_monitor() -> SafetyMonitor:
 
     return SafetyMonitor(
         {
-            Mode.INIT: (
+            # WAIT_GREEN is also the startup readiness gate. The vehicle stays
+            # stopped until the official object contract, lane controller and
+            # LiDAR have each produced a fresh message.
+            Mode.WAIT_GREEN: (
                 InputRequirement(
                     InputCategory.PERCEPTION,
-                    "traffic_detection",
+                    "object_info",
                     TRAFFIC_MAX_AGE_S,
                 ),
                 InputRequirement(
@@ -237,13 +232,6 @@ def runtime_safety_monitor() -> SafetyMonitor:
                     LANE_OFFSET_MAX_AGE_S,
                 ),
                 InputRequirement(InputCategory.SENSOR, "scan", SCAN_MAX_AGE_S),
-            ),
-            Mode.WAIT_GREEN: (
-                InputRequirement(
-                    InputCategory.PERCEPTION,
-                    "traffic_detection",
-                    TRAFFIC_MAX_AGE_S,
-                ),
             ),
             Mode.LANE_DRIVE: (
                 InputRequirement(
@@ -332,7 +320,6 @@ class RaceRuntimeAdapter:
         self.avoid_direction = AvoidDirectionDebouncer(avoid_direction_config)
 
         self._cone_events: Deque[ConeMessageEvent] = deque()
-        self._lane_validity_events: Deque[LaneValidityEvent] = deque()
         self._traffic_events: Deque[TrafficMessageEvent] = deque()
         self._lane_change_events: Deque[LaneChangeStateEvent] = deque()
         self._route_traffic_events: Deque[RouteTrafficEvent] = deque()
@@ -385,7 +372,6 @@ class RaceRuntimeAdapter:
             initial_state=initial_mode,
             mission_event_max_age_s=self.fsm.mission_event_max_age_s,
             cone_entry_config=self.fsm.cone_entry_config,
-            lane_validity_config=self.fsm.lane_validity_guard.config,
         )
         context_kwargs = {}
         if typed_profile is MissionTestProfile.CONE:
@@ -402,7 +388,6 @@ class RaceRuntimeAdapter:
         )
 
         self._cone_events.clear()
-        self._lane_validity_events.clear()
         self._traffic_events.clear()
         self._lane_change_events.clear()
         self._route_traffic_events.clear()
@@ -450,20 +435,7 @@ class RaceRuntimeAdapter:
             TrafficMessageEvent(detected=detected, received_at=received_at),
         )
         self.green_detected = detected
-        self.perception_received_at["traffic_detection"] = received_at
-        return True
-
-    def record_lane_validity(self, valid: bool, received_at: float) -> bool:
-        """Queue one explicit lane-validity sample."""
-
-        if not isinstance(valid, bool) or not self._valid_timestamp(received_at):
-            return False
-        if len(self._lane_validity_events) == self.cone_queue_capacity:
-            self._lane_validity_events.popleft()
-        self._lane_validity_events.append(
-            LaneValidityEvent(valid=valid, received_at=received_at),
-        )
-        self.perception_received_at["lane_validity"] = received_at
+        self.perception_received_at["object_info"] = received_at
         return True
 
     def record_object_info(
@@ -471,7 +443,7 @@ class RaceRuntimeAdapter:
         data: Sequence[Any],
         received_at: float,
     ) -> InputRecordResult:
-        """Validate the object_info payload and retain its typed subset.
+        """Validate the internal object_info_raw payload and retain its subset.
 
         앞 10필드는 기존 계약이다. 새 publisher는 object_type과 confidence를
         11·12번째에 붙인다. 잠깐 사용했던 side_left/side_right 2필드 layout과
@@ -483,9 +455,12 @@ class RaceRuntimeAdapter:
         except TypeError:
             values = []
         if len(values) < 10:
-            return InputRecordResult(False, "object_info requires at least 10 fields")
+            return InputRecordResult(False, "object_info_raw requires at least 10 fields")
         if not self._valid_timestamp(received_at):
-            return InputRecordResult(False, "invalid object_info receipt timestamp")
+            return InputRecordResult(
+                False,
+                "invalid object_info_raw receipt timestamp",
+            )
 
         # 앞 10필드는 기존 계약이다. 11번째 object_type과 12번째 confidence는
         # 새 YOLO 분류 계약이며, 예전 10필드 bag도 계속 읽을 수 있게 선택값이다.
@@ -503,9 +478,15 @@ class RaceRuntimeAdapter:
                 try:
                     object_type = ObjectType(int(raw_type))
                 except ValueError:
-                    return InputRecordResult(False, "object_info type must be -1, 0, or 1")
+                    return InputRecordResult(
+                        False,
+                        "object_info_raw type must be -1, 0, or 1",
+                    )
             elif len(values) < 12:
-                return InputRecordResult(False, "object_info type must be an integer")
+                return InputRecordResult(
+                    False,
+                    "object_info_raw type must be an integer",
+                )
             # Two old optional side-LiDAR fields were briefly appended to the
             # 10-field payload. A non-integral field 11 identifies that layout;
             # accept and ignore both so recorded bags remain readable.
@@ -517,7 +498,10 @@ class RaceRuntimeAdapter:
                 or not math.isfinite(float(raw_confidence))
                 or not 0.0 <= float(raw_confidence) <= 1.0
             ):
-                return InputRecordResult(False, "object_info confidence must be within 0..1")
+                return InputRecordResult(
+                    False,
+                    "object_info_raw confidence must be within 0..1",
+                )
             object_confidence = float(raw_confidence)
 
         # 검증은 계약된 앞 10필드에만 적용한다. 뒤에 붙는 선택 필드는 위에서
@@ -527,29 +511,44 @@ class RaceRuntimeAdapter:
             not isinstance(value, (int, float)) or isinstance(value, bool)
             for value in values
         ):
-            return InputRecordResult(False, "object_info fields must be numbers")
+            return InputRecordResult(
+                False,
+                "object_info_raw fields must be numbers",
+            )
 
         numeric_values = [float(value) for value in values]
         if any(math.isnan(value) for value in numeric_values):
-            return InputRecordResult(False, "object_info fields must not contain NaN")
+            return InputRecordResult(
+                False,
+                "object_info_raw fields must not contain NaN",
+            )
 
         exists_value = numeric_values[0]
         if exists_value not in (0.0, 1.0):
-            return InputRecordResult(False, "object_info exists must be 0 or 1")
+            return InputRecordResult(
+                False,
+                "object_info_raw exists must be 0 or 1",
+            )
         lane_value = numeric_values[9]
         if not math.isfinite(lane_value) or not lane_value.is_integer():
-            return InputRecordResult(False, "object_info lane label must be an integer")
+            return InputRecordResult(
+                False,
+                "object_info_raw lane label must be an integer",
+            )
         try:
             lane = ObjectLane(int(lane_value))
         except ValueError:
-            return InputRecordResult(False, "object_info lane label must be 0, 1, or 2")
+            return InputRecordResult(
+                False,
+                "object_info_raw lane label must be 0, 1, or 2",
+            )
 
         # YOLO 박스 면적. 음수는 검출기가 낼 수 없는 값이므로 거른다.
         box_px = numeric_values[5]
         if not math.isfinite(box_px) or box_px < 0.0:
             return InputRecordResult(
                 False,
-                "object_info box size must be a non-negative number",
+                "object_info_raw box size must be a non-negative number",
             )
 
         distance = numeric_values[1]
@@ -557,12 +556,12 @@ class RaceRuntimeAdapter:
             if any(not math.isfinite(value) for value in numeric_values):
                 return InputRecordResult(
                     False,
-                    "detected object_info fields must be finite numbers",
+                    "detected object_info_raw fields must be finite numbers",
                 )
             if distance < 0.0:
                 return InputRecordResult(
                     False,
-                    "object_info distance must be non-negative",
+                    "object_info_raw distance must be non-negative",
                 )
             snapshot_distance: Optional[float] = distance
             snapshot_lane = lane
@@ -573,12 +572,12 @@ class RaceRuntimeAdapter:
             if distance < 0.0 or distance == -math.inf:
                 return InputRecordResult(
                     False,
-                    "absent object_info distance must be non-negative or +inf",
+                    "absent object_info_raw distance must be non-negative or +inf",
                 )
             if any(not math.isfinite(value) for value in numeric_values[2:9]):
                 return InputRecordResult(
                     False,
-                    "absent object_info metadata must be finite numbers",
+                    "absent object_info_raw metadata must be finite numbers",
                 )
             snapshot_distance = None
             # 차선 라벨은 카메라 산출물이므로 LiDAR 미검출과 무관하게 유지한다.
@@ -597,7 +596,7 @@ class RaceRuntimeAdapter:
             object_type=object_type,
             confidence=object_confidence,
         )
-        self.perception_received_at["object_info"] = received_at
+        self.perception_received_at["object_info_raw"] = received_at
         return InputRecordResult(True)
 
     def record_lane_change_state(
@@ -791,11 +790,6 @@ class RaceRuntimeAdapter:
             self.context.state_entered_at = now
 
         cone_event = self._cone_events.popleft() if self._cone_events else None
-        lane_validity_event = (
-            self._lane_validity_events.popleft()
-            if self._lane_validity_events
-            else None
-        )
         traffic_event = (
             self._traffic_events.popleft()
             if self._traffic_events
@@ -839,17 +833,6 @@ class RaceRuntimeAdapter:
             ),
             traffic_message_received_at=(
                 traffic_event.received_at if traffic_event is not None else None
-            ),
-            # Consume only the explicit current-frame lane-validity sample.
-            lane_valid=(
-                lane_validity_event.valid
-                if lane_validity_event is not None
-                else False
-            ),
-            lane_valid_received_at=(
-                lane_validity_event.received_at
-                if lane_validity_event is not None
-                else None
             ),
             cone_detected=(
                 cone_event is not None
@@ -1011,23 +994,12 @@ class RaceRuntimeAdapter:
             self.latest_cone_event = None
             self.perception_received_at.pop("rubbercone_info", None)
 
-        discarded_lane = 0
-        if (
-            transition.changed
-            and transition.source is Mode.CONE_DRIVE
-            and transition.target is Mode.REJOIN
-        ):
-            discarded_lane = len(self._lane_validity_events)
-            self._lane_validity_events.clear()
-            self.perception_received_at.pop("lane_validity", None)
-
         return RuntimeCycleResult(
             observation=observation,
             safety=safety,
             fsm_control=fsm_control,
             publish_cone_reset=publish_cone_reset,
             discarded_pre_reset_events=discarded,
-            discarded_pre_rejoin_lane_events=discarded_lane,
         )
 
     def _update_lane_action(

@@ -56,6 +56,16 @@ def main_nodes(description):
     ]
 
 
+def lane_nodes(description):
+    return [
+        action
+        for action in description.entities
+        if isinstance(action, Node)
+        and action.node_package == 'lane_detection'
+        and action.node_executable == 'lane_node'
+    ]
+
+
 def substitution_text(substitutions):
     return ''.join(item.text for item in substitutions)
 
@@ -180,6 +190,26 @@ def test_production_and_existing_bag_launch_remain_unmodified_in_scope():
     assert '/mission_test/xycar_motor' not in production_source
     assert "default_value='0'" in bag_source
     assert "('xycar_motor', '/bag_test/xycar_motor')" in bag_source
+
+
+@pytest.mark.parametrize(
+    ('path', 'module_name'),
+    [
+        (PRODUCTION_LAUNCH, '_production_lane_contract'),
+        (BAG_TEST_LAUNCH, '_bag_lane_contract'),
+    ],
+)
+def test_lane_detector_legacy_input_is_remapped_official_mode_info(
+    path,
+    module_name,
+):
+    module = load_launch_module(path, module_name)
+    nodes = lane_nodes(module.generate_launch_description())
+
+    assert len(nodes) == 1
+    assert remapping_text(nodes[0]) == [
+        ('/mode_info', '/internal/lane_command')
+    ]
 
 
 def test_main_parameter_uses_named_profile_launch_configuration():

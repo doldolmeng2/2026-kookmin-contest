@@ -6,11 +6,6 @@ import math
 from typing import Optional
 
 from .cone_entry import ConeEntryConfig, ConeEntryDebouncer, ConeEntryDecision
-from .lane_validity import (
-    LaneValidityConfig,
-    LaneValidityDebouncer,
-    LaneValidityDecision,
-)
 from .mission_observation import MissionObservation
 from .mission_types import RouteTrafficSignal
 from .race_context import RaceContext
@@ -21,12 +16,10 @@ _TIMESTAMP_EPSILON_S = 1e-6
 
 
 class Mode(str, Enum):
-    INIT = "INIT"
-    WAIT_TRAFFIC = "WAIT_TRAFFIC"
-    WAIT_GREEN = "WAIT_TRAFFIC"  # compatibility alias
+    WAIT_GREEN = "WAIT_GREEN"
+    WAIT_TRAFFIC = "WAIT_GREEN"  # compatibility alias for old bags/configs
     LANE_DRIVE = "LANE_DRIVE"
     CONE_DRIVE = "CONE_DRIVE"
-    REJOIN = "REJOIN"
     FIXED_AVOID = "FIXED_AVOID"
     OVERTAKE = "OVERTAKE"
     SHORTCUT = "SHORTCUT"
@@ -85,7 +78,7 @@ class _GreenDebouncer:
 
 
 class RaceFSM:
-    """Apply the complete ten-state orchestration without ROS side effects."""
+    """Apply the race orchestration without ROS side effects."""
 
     # FINISH만 진짜 종료 상태다. STOP은 "복귀 가능한 안전 정지"다.
     #
@@ -104,14 +97,13 @@ class RaceFSM:
 
     def __init__(
         self,
-        initial_state: Mode = Mode.INIT,
+        initial_state: Mode = Mode.WAIT_GREEN,
         *,
         green_min_consecutive_frames: int = 3,
         green_min_duration_s: float = 0.0,
         green_max_age_s: float = 0.5,
         mission_event_max_age_s: float = 0.5,
         cone_entry_config: Optional[ConeEntryConfig] = None,
-        lane_validity_config: Optional[LaneValidityConfig] = None,
     ) -> None:
         self.state = initial_state
         self._green = _GreenDebouncer(
@@ -137,7 +129,6 @@ class RaceFSM:
             )
         self.mission_event_max_age_s = mission_event_max_age_s
         self._cone_entry = ConeEntryDebouncer(cone_entry_config)
-        self._lane_validity = LaneValidityDebouncer(lane_validity_config)
         self._last_cone_drive_message_at: Optional[float] = None
         self._last_traffic_message_at: Optional[float] = None
         self._last_mission_message_at: dict[str, float] = {}
@@ -146,9 +137,6 @@ class RaceFSM:
         self._stop_source: Optional[Mode] = None
         self._stop_healthy_since: Optional[float] = None
         self.last_cone_entry_decision: Optional[ConeEntryDecision] = None
-        self.last_lane_validity_decision: Optional[
-            LaneValidityDecision
-        ] = None
 
     @property
     def cone_entry_config(self) -> ConeEntryConfig:
@@ -162,10 +150,6 @@ class RaceFSM:
     def cone_exit_armed(self) -> bool:
         return self._cone_exit_armed
 
-    @property
-    def lane_validity_guard(self) -> LaneValidityDebouncer:
-        return self._lane_validity
-
     def step(
         self,
         observation: MissionObservation,
@@ -173,7 +157,6 @@ class RaceFSM:
         safety: SafetyDecision,
     ) -> Transition:
         self.last_cone_entry_decision = None
-        self.last_lane_validity_decision = None
 
         if self.state in self.TERMINAL_STATES:
             return self._stay("terminal state")
@@ -183,7 +166,6 @@ class RaceFSM:
             context.stop_reason = reason
             self._green.reset()
             self._cone_entry.deactivate()
-            self._lane_validity.deactivate()
             self._cone_exit_armed = False
             self._stop_healthy_since = None
             # 정지 직전 모드를 기억해 두었다가 회복되면 그 구간으로 돌아간다.
@@ -219,17 +201,6 @@ class RaceFSM:
                 context,
                 observation.now,
             )
-
-        if self.state is Mode.INIT:
-            if safety.inputs_ready:
-                self._green.reset()
-                return self._change(
-                    Mode.WAIT_GREEN,
-                    "required inputs ready",
-                    context,
-                    observation.now,
-                )
-            return self._stay("waiting for required inputs")
 
         if self.state is Mode.WAIT_GREEN:
             if not safety.inputs_ready:
@@ -340,7 +311,6 @@ class RaceFSM:
                 # that episode commits its exit so a later normal lap can
                 # qualify independently.
                 self._cone_entry.deactivate()
-                self._lane_validity.deactivate()
                 self._cone_exit_armed = False
                 return self._change(
                     Mode.LANE_DRIVE,
@@ -350,25 +320,8 @@ class RaceFSM:
                 )
             return self._stay("cone end flag received before session armed")
 
-        if self.state is Mode.REJOIN:
-            decision = self._lane_validity.evaluate(
-                observation,
-                context.state_entered_at,
-            )
-            self.last_lane_validity_decision = decision
-            if decision.triggered:
-                self._lane_validity.deactivate()
-                return self._change(
-                    Mode.LANE_DRIVE,
-                    "fresh lane validity confirmed",
-                    context,
-                    observation.now,
-                )
-            return self._stay(decision.reason)
-
         if self.state is Mode.FIXED_AVOID:
             self._cone_entry.deactivate()
-            self._lane_validity.deactivate()
             if (
                 observation.fixed_zone_exited is True
                 and self._accept_mission_edge(
@@ -406,7 +359,6 @@ class RaceFSM:
 
         if self.state is Mode.OVERTAKE:
             self._cone_entry.deactivate()
-            self._lane_validity.deactivate()
             if (
                 observation.overtake_complete is True
                 and self._accept_mission_edge(
@@ -426,7 +378,6 @@ class RaceFSM:
 
         if self.state is Mode.SHORTCUT:
             self._cone_entry.deactivate()
-            self._lane_validity.deactivate()
             if (
                 observation.shortcut_complete is True
                 and self._accept_mission_edge(
@@ -447,7 +398,6 @@ class RaceFSM:
         # Cone-entry evidence must never accumulate outside LANE_DRIVE. Keep a
         # completed episode rearmed for a future LANE_DRIVE visit.
         self._cone_entry.deactivate()
-        self._lane_validity.deactivate()
 
         return self._stay("transition not implemented in this phase")
 

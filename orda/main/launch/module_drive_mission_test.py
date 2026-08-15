@@ -12,7 +12,7 @@ from launch_ros.actions import Node
 
 
 MISSION_TEST_PROFILES = (
-    '1',  # WAIT_TRAFFIC
+    '1',  # WAIT_GREEN
     '2',  # LANE_CENTER
     '3',  # LANE_ONE
     '4',  # LANE_TWO
@@ -56,7 +56,7 @@ def generate_launch_description():
         default_value='2',
         choices=MISSION_TEST_PROFILES,
         description=(
-            '실차 미션 번호: 1=wait_traffic, 2=lane_center, 3=lane_1, '
+            '실차 미션 번호: 1=wait_green, 2=lane_center, 3=lane_1, '
             '4=lane_2, 5=cone, 6=fixed, 7=overtake, 8=shortcut'
         ),
     )

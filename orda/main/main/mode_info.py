@@ -1,70 +1,97 @@
-"""Explicit adapter from internal RaceFSM state to legacy ROS diagnostics."""
+"""PPT-facing mode/lane contracts and the lane detector compatibility seam."""
 
 from enum import IntEnum
-from typing import Any
+from typing import Any, Optional
 
 from .race_fsm import Mode
 
 
-class LegacyModeInfoCode(IntEnum):
-    """Numeric values consumed by the current lane detector implementation."""
+class ExternalModeInfoCode(IntEnum):
+    """Authoritative values published on ``/mode_info``."""
 
-    STOP = 0
-    CONE_DRIVE = 1
-    REJOIN = 2
-    LANE_DRIVE = 3
-    BEFORE = 4
-    LANE_CHANGE = 5
+    WAIT_GREEN = 0
+    LANE_DRIVE = 1
+    CONE_DRIVE = 2
+    FIXED_AVOID = 3
+    OVERTAKE = 4
+    SHORTCUT = 5
 
 
-_CONFIRMED_MODE_CODES = {
-    Mode.INIT: LegacyModeInfoCode.STOP,
-    Mode.WAIT_GREEN: LegacyModeInfoCode.STOP,
-    Mode.LANE_DRIVE: LegacyModeInfoCode.LANE_DRIVE,
-    Mode.CONE_DRIVE: LegacyModeInfoCode.CONE_DRIVE,
-    Mode.REJOIN: LegacyModeInfoCode.REJOIN,
-    # 지름길에서도 lane_node의 조향 출력을 사용한다. 종료만 CNN의
-    # /road_surface 계약으로 판정하므로 외부 차선 검출기는 주행 모드여야 한다.
-    Mode.SHORTCUT: LegacyModeInfoCode.LANE_DRIVE,
-    Mode.FINISH: LegacyModeInfoCode.STOP,
-    Mode.STOP: LegacyModeInfoCode.STOP,
+_EXTERNAL_MODE_CODES = {
+    Mode.WAIT_GREEN: ExternalModeInfoCode.WAIT_GREEN,
+    Mode.LANE_DRIVE: ExternalModeInfoCode.LANE_DRIVE,
+    Mode.CONE_DRIVE: ExternalModeInfoCode.CONE_DRIVE,
+    Mode.FIXED_AVOID: ExternalModeInfoCode.FIXED_AVOID,
+    Mode.OVERTAKE: ExternalModeInfoCode.OVERTAKE,
+    Mode.SHORTCUT: ExternalModeInfoCode.SHORTCUT,
 }
 
 
-def external_mode_code(mode: Any) -> LegacyModeInfoCode:
-    """Return a confirmed external code or the fail-safe STOP code."""
+def external_mode_code(mode: Any) -> Optional[ExternalModeInfoCode]:
+    """Return the approved external code, or ``None`` for internal states.
+
+    FINISH and STOP deliberately have no external value yet. Main therefore
+    does not publish a fabricated ``/mode_info`` value while either is active.
+    """
 
     if not isinstance(mode, Mode):
-        return LegacyModeInfoCode.STOP
-    return _CONFIRMED_MODE_CODES.get(mode, LegacyModeInfoCode.STOP)
+        return None
+    return _EXTERNAL_MODE_CODES.get(mode)
 
 
-def mode_info_data(
+def lane_info_value(lane: Any) -> int:
+    """Translate the internal target into the PPT ``/lane_info`` contract.
+
+    Internal: 0=center, 1=lane one, 2=lane two.
+    External: 1=lane one, 2=lane two, 3=center.
+    Invalid values fail safe to center.
+    """
+
+    if isinstance(lane, bool) or not isinstance(lane, int):
+        return 3
+    return {0: 3, 1: 1, 2: 2}.get(lane, 3)
+
+
+class LegacyLaneCommandCode(IntEnum):
+    """Values consumed only by the existing lane detector implementation."""
+
+    STOP = 0
+    CONE_DRIVE = 1
+    LANE_DRIVE = 3
+    LANE_CHANGE = 5
+
+
+_LEGACY_LANE_CODES = {
+    Mode.WAIT_GREEN: LegacyLaneCommandCode.STOP,
+    Mode.LANE_DRIVE: LegacyLaneCommandCode.LANE_DRIVE,
+    Mode.CONE_DRIVE: LegacyLaneCommandCode.CONE_DRIVE,
+    # SHORTCUT uses the ordinary lane detector for steering.
+    Mode.SHORTCUT: LegacyLaneCommandCode.LANE_DRIVE,
+    Mode.FINISH: LegacyLaneCommandCode.STOP,
+    Mode.STOP: LegacyLaneCommandCode.STOP,
+}
+
+
+def lane_command_data(
     mode: Any,
     lane: Any,
     *,
     mission_lane_control_enabled: bool = False,
     lane_change_active: bool = False,
 ) -> list[int]:
-    """Build the existing two-field contract with action-level lane control."""
+    """Build the private ``[legacy_mode, internal_lane]`` lane command."""
 
-    # bool은 int의 서브클래스라 별도로 막지 않으면 lane 값으로 새어 들어간다.
     valid_lane = (
         isinstance(lane, int)
         and not isinstance(lane, bool)
         and lane in (0, 1, 2)
     )
     lane_value = lane if valid_lane else 0
-    code = external_mode_code(mode)
+    code = _LEGACY_LANE_CODES.get(mode, LegacyLaneCommandCode.STOP)
     if mode in (Mode.FIXED_AVOID, Mode.OVERTAKE):
-        # 구간 안에서는 정지 코드(0)를 내보내지 않는다. 인지가 잠깐 신선하지
-        # 않다고 해서 "정지"를 지시하면 lane_detection 이 기준선을 갱신하지
-        # 못하고, 구간 진입 직후 [0, 0] 이 한 박자 튀어나온다. 차선 변경 중이
-        # 아니면 차선 주행(3)으로 둔다. 실제 정지 판단은 ControlSelector 가
-        # 따로 하므로 이 코드가 모터를 멈추지는 않는다.
         code = (
-            LegacyModeInfoCode.LANE_CHANGE
+            LegacyLaneCommandCode.LANE_CHANGE
             if lane_change_active and mission_lane_control_enabled
-            else LegacyModeInfoCode.LANE_DRIVE
+            else LegacyLaneCommandCode.LANE_DRIVE
         )
     return [int(code), lane_value]

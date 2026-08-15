@@ -49,9 +49,7 @@ def test_control_source_values_are_exact():
 @pytest.mark.parametrize(
     "mode",
     [
-        Mode.INIT,
         Mode.WAIT_GREEN,
-        Mode.REJOIN,
         Mode.FIXED_AVOID,
         Mode.OVERTAKE,
         Mode.FINISH,

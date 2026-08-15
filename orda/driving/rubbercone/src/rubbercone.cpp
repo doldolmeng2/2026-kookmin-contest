@@ -14,10 +14,11 @@
 //   max_cone_centers     - 사용할 콘 대표점 개수 (기본 6, 가까운 것부터)
 //   boundary_points      - 한쪽 경계 직선 피팅에 쓸 콘 개수 (기본 3)
 //
-// 발행: rubbercone_info (std_msgs/Int32MultiArray)
+// 발행: /rubbercone_offset (std_msgs/Int32MultiArray, PPT 공식 계약)
 //   [0] offset     : 조향 오프셋 (양수=오른쪽 편향)
 //   [1] end_flag   : 0=주행 중, 1=라바콘 구간 종료
-//   [2] confidence : 경로 추정 신뢰도 (0~100)
+// 발행: /rubbercone_info (std_msgs/Int32MultiArray, 내부 상세 계약)
+//   [0] offset, [1] end_flag, [2] confidence (0~100)
 // 구독: /rubbercone_reset (std_msgs/Empty) - 다음 라바콘 세션 준비
 //
 // 디버그 창 (enable_gui:=true, 기본 true):
@@ -164,7 +165,10 @@ public:
             std::bind(&LidarViewer::scanCallback, this, _1));
 
         auto qos_fast = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
-        info_pub_ = create_publisher<std_msgs::msg::Int32MultiArray>("rubbercone_info", qos_fast);
+        offset_pub_ = create_publisher<std_msgs::msg::Int32MultiArray>(
+            "/rubbercone_offset", qos_fast);
+        info_pub_ = create_publisher<std_msgs::msg::Int32MultiArray>(
+            "/rubbercone_info", qos_fast);
 
         offset_filter_alpha_ = clampValue(
             static_cast<float>(declare_parameter<double>("offset_filter_alpha", 0.80)),
@@ -281,12 +285,17 @@ private:
 
     void publishInfo()
     {
-        std_msgs::msg::Int32MultiArray msg;
-        msg.data.resize(3);
-        msg.data[0] = rubber_offset_value_;
-        msg.data[1] = rubber_end_value_;
-        msg.data[2] = rubber_confidence_value_;
-        info_pub_->publish(msg);
+        std_msgs::msg::Int32MultiArray offset_msg;
+        offset_msg.data = {rubber_offset_value_, rubber_end_value_};
+        offset_pub_->publish(offset_msg);
+
+        std_msgs::msg::Int32MultiArray info_msg;
+        info_msg.data = {
+            rubber_offset_value_,
+            rubber_end_value_,
+            rubber_confidence_value_,
+        };
+        info_pub_->publish(info_msg);
     }
 
     // 연속한 LaserScan 반사점 중 실제 콘 하나에 해당하는 대표점을 추출한다.
@@ -870,6 +879,7 @@ private:
 
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr reset_sub_;
+    rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr offset_pub_;
     rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr info_pub_;
     rclcpp::TimerBase::SharedPtr gui_timer_;
 

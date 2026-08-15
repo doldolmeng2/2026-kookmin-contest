@@ -249,9 +249,9 @@ def test_receipt_and_step_values_share_the_supplied_clock_domain():
     assert cycle.observation.now - cycle.observation.cone_message_received_at == pytest.approx(0.02)
 
 
-def test_runtime_init_waits_for_existing_required_inputs():
+def test_runtime_wait_green_absorbs_startup_readiness_gate():
     adapter = RaceRuntimeAdapter(
-        fsm=RaceFSM(initial_state=Mode.INIT),
+        fsm=RaceFSM(initial_state=Mode.WAIT_GREEN),
         context=RaceContext(state_entered_at=0.0),
         safety_monitor=runtime_safety_monitor(),
     )
@@ -264,6 +264,7 @@ def test_runtime_init_waits_for_existing_required_inputs():
 
     assert missing.transition.changed is False
     assert missing.safety.inputs_ready is False
+    assert ready.transition.changed is False
     assert ready.transition.target is Mode.WAIT_GREEN
     assert ready.safety.inputs_ready is True
 

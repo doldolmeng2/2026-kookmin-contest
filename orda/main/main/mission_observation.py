@@ -25,8 +25,6 @@ class MissionObservation:
 
     green_detected: bool = False
     traffic_message_received_at: Optional[float] = None
-    lane_valid: bool = False
-    lane_valid_received_at: Optional[float] = None
     cone_detected: bool = False
     cone_finished: bool = False
     cone_confidence: Optional[int] = None
