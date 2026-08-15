@@ -10,6 +10,9 @@ from .core import (CLASS_NAMES, dataset_items, draw_roi, load_config, overlay,
 
 WINDOW = 'Segmentation label editor'
 HEADER_HEIGHT = 52
+# Diagonal neighbours only, so a flood fill grows one pixel along its staircase
+# edges without also widening the flat horizontal and vertical edges.
+DIAGONAL_KERNEL = np.uint8([[1, 0, 1], [0, 1, 0], [1, 0, 1]])
 
 
 def print_controls(dataset, split, sample_count):
@@ -114,7 +117,10 @@ class LabelEditor:
         # MASK_ONLY 라 self.image 는 바뀌지 않고 mask 에만 255 가 찍힌다.
         cv2.floodFill(self.image, mask, (x, y), 0, difference, difference,
                       4 | cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE | (255 << 8))
-        self.label[mask[1:-1, 1:-1] == 255] = self.class_id
+        # 비스듬한 경계는 채우기가 계단처럼 끊겨 한 화소씩 덜 칠해진다.
+        # 대각선 방향으로만 1px 넓혀서 그 틈을 메운다.
+        region = cv2.dilate(mask, DIAGONAL_KERNEL)[1:-1, 1:-1]
+        self.label[(region == 255) & (self.roi > 0)] = self.class_id
 
     def apply_component(self, x, y):
         old_class = int(self.label[y, x])

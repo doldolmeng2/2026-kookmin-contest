@@ -142,7 +142,16 @@ class LabelEditorTest(unittest.TestCase):
         editor = self.fill_editor()
         editor.apply_fill(100, 300)
         self.assertTrue(np.all(editor.label[216:, :320] == 4))
-        self.assertTrue(np.all(editor.label[216:, 320:] == 0))
+        # 경계는 1px 보정만큼만 넘어간다.
+        self.assertTrue(np.all(editor.label[216:, 321:] == 0))
+
+    def test_fill_grows_one_pixel_diagonally(self):
+        editor = self.fill_editor()
+        editor.image[:] = 40
+        editor.image[300, 100] = 200
+        editor.apply_fill(100, 300)
+        painted = {(int(row), int(column)) for row, column in zip(*np.nonzero(editor.label))}
+        self.assertEqual(painted, {(300, 100), (299, 99), (299, 101), (301, 99), (301, 101)})
 
     def test_fill_stays_inside_label_roi(self):
         editor = self.fill_editor()
