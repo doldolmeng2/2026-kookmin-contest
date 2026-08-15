@@ -30,6 +30,14 @@ _UNSET = object()
 def edge_observation(now, name, received_at=_UNSET):
     timestamp = now if received_at is _UNSET else received_at
     fields = {
+        "fixed_entry": {
+            "fixed_zone_entered": True,
+            "fixed_zone_entry_received_at": timestamp,
+        },
+        "fixed_exit": {
+            "fixed_zone_exited": True,
+            "fixed_zone_exit_received_at": timestamp,
+        },
         "fixed_avoid_complete": {
             "fixed_avoid_complete": True,
             "fixed_avoid_completed_at": timestamp,
@@ -235,85 +243,30 @@ def test_object_detection_alone_never_enters_fixed_avoid():
     assert fsm.state is Mode.LANE_DRIVE
 
 
-def test_normal_route_rejoin_and_completion_edges_form_mission_chain():
-    fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
+def test_fixed_zone_edges_return_straight_to_lane_drive():
+    """고정장애물 구간은 OVERTAKE 를 거치지 않고 LANE_DRIVE 로 돌아온다.
+
+    OVERTAKE 는 움직이는 방해차량 상황용이라 이 경로에서는 쓰지 않는다.
+    """
+    fsm = RaceFSM(initial_state=Mode.LANE_DRIVE)
     context = RaceContext(state_entered_at=1.0)
 
-    armed = fsm.step(cone_observation(1.1), context, SAFE)
-    rejoin = fsm.step(
-        cone_observation(1.2, end_flag=True, confidence=0),
-        context,
-        SAFE,
-    )
-    first_lane_valid = fsm.step(
+    fixed = fsm.step(edge_observation(1.1, "fixed_entry"), context, SAFE)
+    lane_success = fsm.step(
         MissionObservation(
-            now=1.3,
-            lane_valid=True,
-            lane_valid_received_at=1.3,
-        ),
-        context,
-        SAFE,
-    )
-    second_lane_valid = fsm.step(
-        MissionObservation(
-            now=1.4,
-            lane_valid=True,
-            lane_valid_received_at=1.4,
-        ),
-        context,
-        SAFE,
-    )
-    fixed = fsm.step(
-        MissionObservation(
-            now=1.51,
-            lane_valid=True,
-            lane_valid_received_at=1.51,
-        ),
-        context,
-        SAFE,
-    )
-    fixed_lane_success = fsm.step(
-        MissionObservation(
-            now=1.6,
+            now=1.2,
             lane_change_success=True,
             lane_change_success_edge=True,
-            lane_change_received_at=1.6,
+            lane_change_received_at=1.2,
         ),
         context,
         SAFE,
     )
-    overtake = fsm.step(
-        edge_observation(1.7, "fixed_avoid_complete"),
-        context,
-        SAFE,
-    )
-    overtake_lane_success = fsm.step(
-        MissionObservation(
-            now=1.8,
-            lane_change_success=True,
-            lane_change_success_edge=True,
-            lane_change_received_at=1.8,
-        ),
-        context,
-        SAFE,
-    )
-    lane = fsm.step(
-        edge_observation(1.9, "overtake_complete"),
-        context,
-        SAFE,
-    )
+    lane = fsm.step(edge_observation(1.3, "fixed_exit"), context, SAFE)
 
-    assert armed.changed is False
-    assert armed.reason == "cone exit session armed"
-    assert rejoin.target is Mode.REJOIN
-    assert first_lane_valid.changed is False
-    assert second_lane_valid.changed is False
     assert fixed.target is Mode.FIXED_AVOID
-    assert fixed_lane_success.changed is False
-    assert fixed_lane_success.target is Mode.FIXED_AVOID
-    assert overtake.target is Mode.OVERTAKE
-    assert overtake_lane_success.changed is False
-    assert overtake_lane_success.target is Mode.OVERTAKE
+    assert lane_success.changed is False
+    assert lane_success.target is Mode.FIXED_AVOID
     assert lane.target is Mode.LANE_DRIVE
 
 

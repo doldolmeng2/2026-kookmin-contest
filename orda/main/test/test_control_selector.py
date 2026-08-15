@@ -54,7 +54,6 @@ def test_control_source_values_are_exact():
         Mode.REJOIN,
         Mode.FIXED_AVOID,
         Mode.OVERTAKE,
-        Mode.SHORTCUT,
         Mode.FINISH,
         Mode.STOP,
     ],
@@ -74,6 +73,18 @@ def test_non_driving_or_unimplemented_modes_select_zero_stop(mode):
 def test_lane_drive_selects_fresh_lane_and_ignores_fresh_cone():
     decision = ControlSelector().select(
         Mode.LANE_DRIVE,
+        10.0,
+        lane=candidate(LANE_COMMAND, 9.9),
+        cone=candidate(CONE_COMMAND, 10.0),
+    )
+
+    assert decision.source is ControlSource.LANE
+    assert decision.command is LANE_COMMAND
+
+
+def test_shortcut_follows_fresh_lane_until_cnn_exit_edge():
+    decision = ControlSelector().select(
+        Mode.SHORTCUT,
         10.0,
         lane=candidate(LANE_COMMAND, 9.9),
         cone=candidate(CONE_COMMAND, 10.0),
@@ -145,7 +156,13 @@ def test_authorized_action_mode_still_rejects_stale_lane_command():
 
 @pytest.mark.parametrize(
     "mode",
-    [Mode.LANE_DRIVE, Mode.CONE_DRIVE, Mode.FIXED_AVOID, Mode.OVERTAKE],
+    [
+        Mode.LANE_DRIVE,
+        Mode.CONE_DRIVE,
+        Mode.FIXED_AVOID,
+        Mode.OVERTAKE,
+        Mode.SHORTCUT,
+    ],
 )
 def test_route_traffic_hold_overrides_motion_without_changing_mode(mode):
     decision = ControlSelector().select(
@@ -177,7 +194,7 @@ def test_cone_drive_missing_or_stale_cone_stops_without_lane_fallback(cone):
     assert decision.command == DriveCommand(0.0, 0.0)
 
 
-@pytest.mark.parametrize("mode", [Mode.LANE_DRIVE, Mode.CONE_DRIVE])
+@pytest.mark.parametrize("mode", [Mode.LANE_DRIVE, Mode.CONE_DRIVE, Mode.SHORTCUT])
 def test_age_boundary_is_inclusive(mode):
     selected = LANE_COMMAND if mode is Mode.LANE_DRIVE else CONE_COMMAND
     decision = ControlSelector().select(
@@ -187,7 +204,9 @@ def test_age_boundary_is_inclusive(mode):
         cone=candidate(selected, 10.0),
     )
 
-    expected = ControlSource.LANE if mode is Mode.LANE_DRIVE else ControlSource.CONE
+    expected = (
+        ControlSource.CONE if mode is Mode.CONE_DRIVE else ControlSource.LANE
+    )
     assert decision.source is expected
 
 

@@ -18,7 +18,7 @@ from main.race_fsm import Mode
 
 
 TYPE_BY_TOPIC = {
-    "/traffic_detection": "std_msgs/msg/Bool",
+    "/traffic_detection": "std_msgs/msg/Int32",
     "/rubbercone_info": "std_msgs/msg/Int32MultiArray",
     "/lane_offset": "std_msgs/msg/Int16",
     "/mode_info": "std_msgs/msg/Int32MultiArray",
@@ -77,7 +77,7 @@ def test_bag_timestamp_is_the_observation_and_transition_clock():
         {
             "timestamp_s": 103.0,
             "relative_time_s": 3.0,
-            "source_mode": "WAIT_GREEN",
+                "source_mode": "WAIT_TRAFFIC",
             "target_mode": "LANE_DRIVE",
             "reason": "green signal debounced",
         }
@@ -231,7 +231,7 @@ def test_replay_enters_cone_drive_on_unique_cone_edges_only():
     ]
 
 
-def test_replay_enters_rejoin_once_on_new_zero_to_one_session():
+def test_replay_returns_to_lane_once_on_new_zero_to_one_session():
     report = replay(
         [
             event("/scan", 0.9),
@@ -244,7 +244,7 @@ def test_replay_enters_rejoin_once_on_new_zero_to_one_session():
         start_mode=Mode.CONE_DRIVE,
     )
 
-    assert report["fsm"]["final_mode"] == "REJOIN"
+    assert report["fsm"]["final_mode"] == "LANE_DRIVE"
     assert report["fsm"]["state_entered_at_s"] == 1.3
     assert report["fsm"]["transition_count"] == 1
     assert report["fsm"]["transition_timeline"] == [
@@ -252,7 +252,7 @@ def test_replay_enters_rejoin_once_on_new_zero_to_one_session():
             "timestamp_s": 1.3,
             "relative_time_s": 0.4,
             "source_mode": "CONE_DRIVE",
-            "target_mode": "REJOIN",
+            "target_mode": "LANE_DRIVE",
             "reason": "fresh cone end flag",
         }
     ]
@@ -306,7 +306,7 @@ def test_replay_cone_exit_depends_on_relative_freshness_not_absolute_time(shift)
         start_mode=Mode.CONE_DRIVE,
     )
 
-    assert report["fsm"]["final_mode"] == "REJOIN"
+    assert report["fsm"]["final_mode"] == "LANE_DRIVE"
     assert report["fsm"]["transition_count"] == 1
     assert report["fsm"]["transition_timeline"][0][
         "relative_time_s"
@@ -425,7 +425,7 @@ def test_lane_offset_is_reference_only_and_never_infers_lane_validity():
     assert report["lane_reference"]["lane_validity_inferred"] is False
 
 
-def test_replay_rejoin_enters_fixed_avoid_only_on_fresh_lane_validity_edges():
+def test_replay_legacy_rejoin_enters_lane_only_on_fresh_lane_validity_edges():
     report = replay(
         [
             event("/scan", 1.0),
@@ -436,14 +436,14 @@ def test_replay_rejoin_enters_fixed_avoid_only_on_fresh_lane_validity_edges():
         start_mode=Mode.REJOIN,
     )
 
-    assert report["fsm"]["final_mode"] == "FIXED_AVOID"
+    assert report["fsm"]["final_mode"] == "LANE_DRIVE"
     assert report["fsm"]["state_entered_at_s"] == 1.31
     assert report["fsm"]["transition_timeline"] == [
         {
             "timestamp_s": 1.31,
             "relative_time_s": 0.31,
             "source_mode": "REJOIN",
-            "target_mode": "FIXED_AVOID",
+            "target_mode": "LANE_DRIVE",
             "reason": "fresh lane validity confirmed",
         }
     ]
@@ -451,7 +451,7 @@ def test_replay_rejoin_enters_fixed_avoid_only_on_fresh_lane_validity_edges():
         "only_allowed_transitions_observed"
     ] is True
     assert any(
-        "REJOIN to FIXED_AVOID" in item
+        "REJOIN to LANE_DRIVE" in item
         for item in report["validation"]["verifiable_scope"]
     )
 
@@ -508,20 +508,32 @@ def test_only_real_mode_changes_create_transition_logs():
     ] is True
 
 
-def test_terminal_mode_replay_cannot_leave_finish_or_stop():
-    events = [
+def _terminal_probe_events():
+    return [
         event("/traffic_detection", 1.0, True),
         event("/rubbercone_info", 2.0, [0, 1, 0]),
         event("/scan", 3.0),
     ]
 
-    for terminal in (Mode.FINISH, Mode.STOP):
-        report = replay(events, start_mode=terminal)
-        assert report["fsm"]["final_mode"] == terminal.value
-        assert report["fsm"]["transition_count"] == 0
-        assert report["validation"]["invariants"][
-            "terminal_modes_are_sticky"
-        ] is True
+
+def test_finish_is_sticky():
+    report = replay(_terminal_probe_events(), start_mode=Mode.FINISH)
+
+    assert report["fsm"]["final_mode"] == Mode.FINISH.value
+    assert report["fsm"]["transition_count"] == 0
+    assert report["validation"]["invariants"]["terminal_modes_are_sticky"] is True
+
+
+def test_stop_recovers_once_inputs_are_healthy_again():
+    """STOP은 종료 상태가 아니라 복귀 가능한 안전 정지다.
+
+    센서가 잠깐 끊겼다고 주행이 영영 끝나면 안 된다. 규정상 정지 후 1분 내
+    미재개는 실격이다.
+    """
+    report = replay(_terminal_probe_events(), start_mode=Mode.STOP)
+
+    assert report["fsm"]["final_mode"] != Mode.STOP.value
+    assert report["fsm"]["transition_count"] >= 1
 
 
 def test_timestamp_regression_is_rejected_and_reported():

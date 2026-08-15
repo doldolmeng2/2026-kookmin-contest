@@ -9,21 +9,10 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Int32
 from ament_index_python.packages import get_package_share_directory
 
+from traffic_light.image_conversion import imgmsg_to_bgr
+
 NAMES = ['4-traffic', 'green_light', 'left_green_light', 'orange_light', 'red_light']
 GREEN, LEFT, ORANGE, RED = 1, 2, 3, 4
-
-def imgmsg_to_bgr(msg):
-    buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-    enc = msg.encoding.lower()
-    if enc in ('bgr8', 'rgb8'):
-        arr = buf.reshape(msg.height, msg.width, 3)
-        if enc == 'rgb8':
-            arr = arr[:, :, ::-1]
-        return np.ascontiguousarray(arr)
-    if enc == 'mono8':
-        return cv2.cvtColor(buf.reshape(msg.height, msg.width), cv2.COLOR_GRAY2BGR)
-    arr = buf.reshape(msg.height, msg.width, -1)
-    return np.ascontiguousarray(arr[:, :, :3])
 
 class TrafficNode(Node):
     def __init__(self):

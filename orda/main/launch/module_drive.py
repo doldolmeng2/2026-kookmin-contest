@@ -32,6 +32,8 @@
 #   rubbercone_offset_gain (기본값: 150) - 목표점(m)→조향 오프셋 변환 이득
 #   rubbercone_offset_limit (기본값: 45) - LiDAR 오프셋 안전 한계
 #   rubbercone_enable_gui (기본값: true) - 라바콘 LiDAR 인식 디버그 창 표시
+#   object_enable_gui (기본값: true) - 장애물 검출 디버그 창 표시
+#     (성능에 영향. 기록 주행 시 object_enable_gui:=false 권장)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -49,9 +51,19 @@ def generate_launch_description():
     mode_arg = DeclareLaunchArgument(
         'mode',
         default_value='0',
-        description='main_node 초기 주행 모드 (0=TRAFFIC_WAIT)'
+        description=(
+            '초기 모드 번호: 0=INIT, 1=WAIT_TRAFFIC, 2=LANE, 3=CONE, '
+            '4=FIXED, 5=OVERTAKE, 6=SHORTCUT, 7=FINISH, 8=STOP'
+        )
     )
     mode = LaunchConfiguration('mode')
+    lane_target_arg = DeclareLaunchArgument(
+        'lane_target',
+        default_value='0',
+        choices=('0', '1', '2'),
+        description='초기 차선 번호 (0=중앙, 1=1차선, 2=2차선)',
+    )
+    lane_target = LaunchConfiguration('lane_target')
     show_debug_arg = DeclareLaunchArgument(
         'show_debug',
         default_value='false',
@@ -126,10 +138,22 @@ def generate_launch_description():
     rubbercone_offset_limit = LaunchConfiguration('rubbercone_offset_limit')
     rubbercone_enable_gui_arg = DeclareLaunchArgument(
         'rubbercone_enable_gui',
-        default_value='true',
+        default_value='false',
         description='라바콘 LiDAR 인식 디버그 창 표시 여부 (기록 주행 시 false 권장)'
     )
     rubbercone_enable_gui = LaunchConfiguration('rubbercone_enable_gui')
+    object_enable_gui_arg = DeclareLaunchArgument(
+        'object_enable_gui',
+        default_value='false',
+        description=(
+            '장애물 검출 디버그 창(CAMERA VIEW / OBJECT DEBUG) 표시 여부. '
+            '기본 false. 켜두면 영상 표시가 CPU를 사용해 '
+            '/object_info 와 /lane_offset 이 느려지므로(실측: 카메라 18.8 Hz '
+            '입력에 인지 5.9 Hz 출력), 기록 주행·성능 측정 시에는 '
+            'object_enable_gui:=false 로 끌 것.'
+        )
+    )
+    object_enable_gui = LaunchConfiguration('object_enable_gui')
 
     # ── 소프트웨어 노드 ──────────────────────────────────────────────────────
     main_node = Node(
@@ -137,7 +161,11 @@ def generate_launch_description():
         executable='main_node',
         name='main_node',
         output='screen',
-        parameters=[{'mode': mode, 'show_debug': show_debug}],
+        parameters=[{
+            'mode': mode,
+            'lane_target': lane_target,
+            'show_debug': show_debug,
+        }],
     )
     traffic_node = Node(
         package='traffic_light',
@@ -177,11 +205,18 @@ def generate_launch_description():
         name='lane_node',
         output='screen',
     )
+    object_yolo_node = Node(
+        package='object_detection',
+        executable='object_yolo_node.py',
+        name='object_yolo_node',
+        output='screen',
+    )
     object_node = Node(
         package='object_detection',
         executable='object_node',
         name='object_node',
         output='screen',
+        parameters=[{'enable_gui': object_enable_gui}],
     )
     # Xbox 컨트롤러: /dev/input/js0 장치, deadzone 0.05
     joy_node = Node(
@@ -226,6 +261,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         mode_arg,
+        lane_target_arg,
         show_debug_arg,
         rubbercone_offset_filter_alpha_arg,
         rubbercone_end_missing_frames_arg,
@@ -239,11 +275,13 @@ def generate_launch_description():
         rubbercone_offset_gain_arg,
         rubbercone_offset_limit_arg,
         rubbercone_enable_gui_arg,
+        object_enable_gui_arg,
         main_node,
         traffic_node,
         rubbercone_node,
         resize_node,
         lane_node,
+        object_yolo_node,
         object_node,
         joy_node,
         cam_launch,

@@ -13,7 +13,7 @@ def test_context_defaults_before_start():
     assert context.shortcut_used is False
     assert context.shortcut_lap is None
     assert context.on_shortcut_lap is False
-    assert context.lane_target is LaneTarget.LANE_TWO
+    assert context.lane_target is LaneTarget.CENTER
     assert context.race_started_at is None
     assert context.state_entered_at is None
     assert context.cone_entered_at is None

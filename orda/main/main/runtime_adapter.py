@@ -8,6 +8,11 @@ from enum import Enum
 import math
 from typing import Any, Callable, Deque, Optional, Sequence
 
+from .avoid_direction import (
+    AvoidDirectionConfig,
+    AvoidDirectionDebouncer,
+    AvoidDirectionDecision,
+)
 from .control_selector import (
     CommandCandidate,
     ControlDecision,
@@ -20,9 +25,9 @@ from .mission_types import (
     LaneTarget,
     ObjectLane,
     ObjectSnapshot,
+    ObjectType,
     RouteTrafficEvent,
     RouteTrafficSignal,
-    opposite_lane_target,
 )
 from .race_context import RaceContext
 from .race_fsm import Mode, RaceFSM, Transition
@@ -35,6 +40,29 @@ from .safety_monitor import (
 
 
 DEFAULT_CONE_EVENT_QUEUE_CAPACITY = 16
+
+# ── 입력 신선도 예산 ────────────────────────────────────────────────────────
+#
+# 이 값들은 "정상 동작 중 이만큼 늦어질 수 있다"는 실측 기반 예산이지, 목표
+# 주기가 아니다. rosbag2_2026_08_13-09_30_09 (275초) 실측 발행 주기:
+#
+#   토픽            평균     p90     p99     최대
+#   /image_raw      53 ms    73 ms   91 ms   264 ms
+#   /lane_offset   169 ms   358 ms  721 ms  1243 ms
+#   /object_info   248 ms   280 ms  306 ms   348 ms
+#
+# 예전 값(0.25 / 0.5초)은 이 실측보다 빠듯해서, 정상 주행 중에도 lane_offset이
+# 19%(0.25초 기준) / 4%(0.5초 기준) 확률로 "끊김"으로 분류됐다. 그때마다
+# LANE_DRIVE -> STOP 으로 떨어지고 속도가 0으로 리셋돼 차가 앞으로 못 나갔다
+# (기록된 모터 출력: 속도 0인 사이클 24.2%, 평균 속도 2.24).
+#
+# 근본 해결은 인지 파이프라인을 빠르게 하는 것이다(디버그 창 비활성화 등 별도
+# 수정). 예산은 그 위에 두는 안전망이므로, 실측 p99 + 지터를 덮되 무한정
+# 늘리지는 않는다.
+LANE_OFFSET_MAX_AGE_S = 1.0
+SCAN_MAX_AGE_S = 0.5
+TRAFFIC_MAX_AGE_S = 0.5
+OBJECT_MAX_AGE_S = 0.6
 
 _MOTION_MODES = frozenset(
     {
@@ -52,33 +80,57 @@ class MissionTestProfile(str, Enum):
     """Named bag-test entry points backed by existing production Modes."""
 
     RACE = "race"
+    WAIT_TRAFFIC = "wait_traffic"
     LANE = "lane"
+    LANE_ONE = "lane_one"
+    LANE_TWO = "lane_two"
     CONE = "cone"
-    REJOIN = "rejoin"
     FIXED = "fixed"
     OVERTAKE = "overtake"
     SHORTCUT = "shortcut"
 
 
 _TEST_PROFILE_MODES = {
+    MissionTestProfile.WAIT_TRAFFIC: Mode.WAIT_TRAFFIC,
     MissionTestProfile.LANE: Mode.LANE_DRIVE,
+    MissionTestProfile.LANE_ONE: Mode.LANE_DRIVE,
+    MissionTestProfile.LANE_TWO: Mode.LANE_DRIVE,
     MissionTestProfile.CONE: Mode.CONE_DRIVE,
-    MissionTestProfile.REJOIN: Mode.REJOIN,
     MissionTestProfile.FIXED: Mode.FIXED_AVOID,
     MissionTestProfile.OVERTAKE: Mode.OVERTAKE,
     MissionTestProfile.SHORTCUT: Mode.SHORTCUT,
 }
 
+_NUMERIC_TEST_PROFILES = {
+    0: MissionTestProfile.RACE,
+    1: MissionTestProfile.WAIT_TRAFFIC,
+    2: MissionTestProfile.LANE,
+    3: MissionTestProfile.LANE_ONE,
+    4: MissionTestProfile.LANE_TWO,
+    5: MissionTestProfile.CONE,
+    6: MissionTestProfile.FIXED,
+    7: MissionTestProfile.OVERTAKE,
+    8: MissionTestProfile.SHORTCUT,
+}
+
 
 def parse_test_profile(value: Any) -> MissionTestProfile:
-    """Parse a named test profile without accepting integer Mode aliases."""
+    """Parse the numeric mission contract, retaining named compatibility."""
 
     if isinstance(value, MissionTestProfile):
         return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        try:
+            return _NUMERIC_TEST_PROFILES[value]
+        except KeyError as exc:
+            raise ValueError(f"unknown numeric mission test profile: {value}") from exc
     if not isinstance(value, str):
         raise ValueError(f"invalid mission test profile: {value!r}")
+    stripped = value.strip().lower()
+    if stripped.isdigit():
+        return parse_test_profile(int(stripped))
     try:
-        return MissionTestProfile(value.strip().lower())
+        return MissionTestProfile(stripped)
     except ValueError as exc:
         raise ValueError(f"unknown mission test profile: {value}") from exc
 
@@ -177,28 +229,52 @@ def runtime_safety_monitor() -> SafetyMonitor:
                 InputRequirement(
                     InputCategory.PERCEPTION,
                     "traffic_detection",
-                    0.5,
+                    TRAFFIC_MAX_AGE_S,
                 ),
                 InputRequirement(
                     InputCategory.PERCEPTION,
                     "lane_offset",
-                    0.5,
+                    LANE_OFFSET_MAX_AGE_S,
                 ),
-                InputRequirement(InputCategory.SENSOR, "scan", 0.5),
+                InputRequirement(InputCategory.SENSOR, "scan", SCAN_MAX_AGE_S),
             ),
             Mode.WAIT_GREEN: (
                 InputRequirement(
                     InputCategory.PERCEPTION,
                     "traffic_detection",
-                    0.5,
+                    TRAFFIC_MAX_AGE_S,
                 ),
             ),
             Mode.LANE_DRIVE: (
                 InputRequirement(
                     InputCategory.PERCEPTION,
                     "lane_offset",
-                    0.5,
+                    LANE_OFFSET_MAX_AGE_S,
                 ),
+            ),
+            Mode.SHORTCUT: (
+                InputRequirement(
+                    InputCategory.PERCEPTION,
+                    "lane_offset",
+                    LANE_OFFSET_MAX_AGE_S,
+                ),
+            ),
+            # STOP 복귀 조건. 이 항목이 비어 있으면 SafetyMonitor 가 STOP 에서
+            # 검사할 입력이 없어 inputs_ready 가 항상 True 였고, RaceFSM 의
+            # 복귀 게이트(STOP_RECOVERY_HOLD_S)가 "입력이 회복됐는지"가 아니라
+            # 단순 0.5초 타이머로 동작했다. 실측에서 STOP 구간 길이가 전부
+            # 0.50~0.52초로 똑같았던 이유다. 그래서 인지가 죽은 채로 주행을
+            # 재개했다가 곧바로 다시 STOP 으로 떨어지기를 반복했다.
+            #
+            # STOP 은 motion_enabled=False 이므로, 여기 등록해도 must_stop 이
+            # 새로 발생하지는 않는다. 오직 복귀 게이트로만 쓰인다.
+            Mode.STOP: (
+                InputRequirement(
+                    InputCategory.PERCEPTION,
+                    "lane_offset",
+                    LANE_OFFSET_MAX_AGE_S,
+                ),
+                InputRequirement(InputCategory.SENSOR, "scan", SCAN_MAX_AGE_S),
             ),
             # A missing detector reset must leave CONE_DRIVE waiting for a
             # fresh zero, not force an immediate terminal STOP. Scan loss is
@@ -222,8 +298,9 @@ class RaceRuntimeAdapter:
         safety_monitor: Optional[SafetyMonitor] = None,
         selector: Optional[ControlSelector] = None,
         cone_queue_capacity: int = DEFAULT_CONE_EVENT_QUEUE_CAPACITY,
-        object_max_age_s: float = 0.25,
+        object_max_age_s: float = OBJECT_MAX_AGE_S,
         lane_change_max_age_s: float = 0.25,
+        avoid_direction_config: Optional[AvoidDirectionConfig] = None,
     ) -> None:
         if (
             isinstance(cone_queue_capacity, bool)
@@ -252,6 +329,7 @@ class RaceRuntimeAdapter:
         self.cone_queue_capacity = cone_queue_capacity
         self.object_max_age_s = float(object_max_age_s)
         self.lane_change_max_age_s = float(lane_change_max_age_s)
+        self.avoid_direction = AvoidDirectionDebouncer(avoid_direction_config)
 
         self._cone_events: Deque[ConeMessageEvent] = deque()
         self._lane_validity_events: Deque[LaneValidityEvent] = deque()
@@ -259,7 +337,10 @@ class RaceRuntimeAdapter:
         self._lane_change_events: Deque[LaneChangeStateEvent] = deque()
         self._route_traffic_events: Deque[RouteTrafficEvent] = deque()
         self._mission_events: dict[str, Deque[MissionEdgeEvent]] = {
+            "fixed_zone_entry": deque(),
+            "fixed_zone_exit": deque(),
             "fixed_avoid_complete": deque(),
+            "overtake_entry": deque(),
             "overtake_complete": deque(),
             "shortcut_complete": deque(),
         }
@@ -277,6 +358,9 @@ class RaceRuntimeAdapter:
         self._lane_change_success_active = False
         self.traffic_stop_override = False
         self.lane_action = LaneActionStatus()
+        self.last_avoid_direction: Optional[AvoidDirectionDecision] = None
+        # /lane_position 실측 차선 (-1=미확정). main_node 가 콜백에서 갱신한다.
+        self.measured_lane: int = -1
 
     def bootstrap_test_profile(
         self,
@@ -308,6 +392,10 @@ class RaceRuntimeAdapter:
             context_kwargs["cone_entered_at"] = float(started_at)
         elif typed_profile is MissionTestProfile.SHORTCUT:
             context_kwargs.update(completed_laps=1, shortcut_lap=2)
+        if typed_profile is MissionTestProfile.LANE_ONE:
+            context_kwargs["lane_target"] = LaneTarget.LANE_ONE
+        elif typed_profile is MissionTestProfile.LANE_TWO:
+            context_kwargs["lane_target"] = LaneTarget.LANE_TWO
         self.context = RaceContext(
             state_entered_at=float(started_at),
             **context_kwargs,
@@ -383,16 +471,58 @@ class RaceRuntimeAdapter:
         data: Sequence[Any],
         received_at: float,
     ) -> InputRecordResult:
-        """Validate the existing ten-field payload and retain its typed subset."""
+        """Validate the object_info payload and retain its typed subset.
+
+        앞 10필드는 기존 계약이다. 새 publisher는 object_type과 confidence를
+        11·12번째에 붙인다. 잠깐 사용했던 side_left/side_right 2필드 layout과
+        옛 10필드 bag도 계속 읽을 수 있도록 길이는 10 이상으로 받는다.
+        """
 
         try:
             values = list(data)
         except TypeError:
             values = []
-        if len(values) != 10:
-            return InputRecordResult(False, "object_info requires exactly 10 fields")
+        if len(values) < 10:
+            return InputRecordResult(False, "object_info requires at least 10 fields")
         if not self._valid_timestamp(received_at):
             return InputRecordResult(False, "invalid object_info receipt timestamp")
+
+        # 앞 10필드는 기존 계약이다. 11번째 object_type과 12번째 confidence는
+        # 새 YOLO 분류 계약이며, 예전 10필드 bag도 계속 읽을 수 있게 선택값이다.
+        object_type = ObjectType.UNKNOWN
+        object_confidence = 0.0
+        if len(values) >= 11:
+            raw_type = values[10]
+            looks_like_type = not (
+                isinstance(raw_type, bool)
+                or not isinstance(raw_type, (int, float))
+                or not math.isfinite(float(raw_type))
+                or not float(raw_type).is_integer()
+            )
+            if looks_like_type:
+                try:
+                    object_type = ObjectType(int(raw_type))
+                except ValueError:
+                    return InputRecordResult(False, "object_info type must be -1, 0, or 1")
+            elif len(values) < 12:
+                return InputRecordResult(False, "object_info type must be an integer")
+            # Two old optional side-LiDAR fields were briefly appended to the
+            # 10-field payload. A non-integral field 11 identifies that layout;
+            # accept and ignore both so recorded bags remain readable.
+        if len(values) >= 12 and looks_like_type:
+            raw_confidence = values[11]
+            if (
+                isinstance(raw_confidence, bool)
+                or not isinstance(raw_confidence, (int, float))
+                or not math.isfinite(float(raw_confidence))
+                or not 0.0 <= float(raw_confidence) <= 1.0
+            ):
+                return InputRecordResult(False, "object_info confidence must be within 0..1")
+            object_confidence = float(raw_confidence)
+
+        # 검증은 계약된 앞 10필드에만 적용한다. 뒤에 붙는 선택 필드는 위에서
+        # 별도 검증했다.
+        values = values[:10]
         if any(
             not isinstance(value, (int, float)) or isinstance(value, bool)
             for value in values
@@ -413,6 +543,14 @@ class RaceRuntimeAdapter:
             lane = ObjectLane(int(lane_value))
         except ValueError:
             return InputRecordResult(False, "object_info lane label must be 0, 1, or 2")
+
+        # YOLO 박스 면적. 음수는 검출기가 낼 수 없는 값이므로 거른다.
+        box_px = numeric_values[5]
+        if not math.isfinite(box_px) or box_px < 0.0:
+            return InputRecordResult(
+                False,
+                "object_info box size must be a non-negative number",
+            )
 
         distance = numeric_values[1]
         if exists_value == 1.0:
@@ -443,13 +581,21 @@ class RaceRuntimeAdapter:
                     "absent object_info metadata must be finite numbers",
                 )
             snapshot_distance = None
-            snapshot_lane = ObjectLane.UNKNOWN
+            # 차선 라벨은 카메라 산출물이므로 LiDAR 미검출과 무관하게 유지한다.
+            # 예전에는 여기서 UNKNOWN 으로 지웠는데, 그러면 LiDAR 사거리 밖에
+            # 있는 방해차량은 YOLO가 또렷이 보고 있어도 회피 방향을 정할 수
+            # 없었다. 박스가 없을 때 검출기가 lane_label 0(=UNKNOWN)을 내므로
+            # 그대로 두어도 없는 정보를 지어내지 않는다.
+            snapshot_lane = lane
 
         self.latest_object_snapshot = ObjectSnapshot(
             exists=bool(exists_value),
             distance=snapshot_distance,
+            box_px=box_px,
             lane=snapshot_lane,
             received_at=received_at,
+            object_type=object_type,
+            confidence=object_confidence,
         )
         self.perception_received_at["object_info"] = received_at
         return InputRecordResult(True)
@@ -533,11 +679,19 @@ class RaceRuntimeAdapter:
         )
         return InputRecordResult(True)
 
-    def record_fixed_avoid_complete(
-        self,
-        received_at: float,
-    ) -> InputRecordResult:
+    def record_fixed_zone_entry(self, received_at: float) -> InputRecordResult:
+        return self._record_mission_edge("fixed_zone_entry", received_at)
+
+    def record_fixed_zone_exit(self, received_at: float) -> InputRecordResult:
+        return self._record_mission_edge("fixed_zone_exit", received_at)
+
+    def record_fixed_avoid_complete(self, received_at: float) -> InputRecordResult:
+        """Deprecated compatibility seam; new code must record fixed_zone_exit."""
+
         return self._record_mission_edge("fixed_avoid_complete", received_at)
+
+    def record_overtake_entry(self, received_at: float) -> InputRecordResult:
+        return self._record_mission_edge("overtake_entry", received_at)
 
     def record_overtake_complete(self, received_at: float) -> InputRecordResult:
         return self._record_mission_edge("overtake_complete", received_at)
@@ -726,6 +880,17 @@ class RaceRuntimeAdapter:
                 if object_snapshot is not None
                 else ObjectLane.UNKNOWN
             ),
+            object_box_px=(
+                object_snapshot.box_px if object_snapshot is not None else 0.0
+            ),
+            object_type=(
+                object_snapshot.object_type
+                if object_snapshot is not None
+                else ObjectType.UNKNOWN
+            ),
+            object_confidence=(
+                object_snapshot.confidence if object_snapshot is not None else 0.0
+            ),
             object_received_at=(
                 object_snapshot.received_at if object_snapshot is not None else None
             ),
@@ -749,12 +914,34 @@ class RaceRuntimeAdapter:
                 if lane_change_event is not None
                 else None
             ),
+            fixed_zone_entered=(
+                mission_events["fixed_zone_entry"] is not None
+            ),
+            fixed_zone_entry_received_at=(
+                mission_events["fixed_zone_entry"].received_at
+                if mission_events["fixed_zone_entry"] is not None
+                else None
+            ),
+            fixed_zone_exited=(
+                mission_events["fixed_zone_exit"] is not None
+            ),
+            fixed_zone_exit_received_at=(
+                mission_events["fixed_zone_exit"].received_at
+                if mission_events["fixed_zone_exit"] is not None
+                else None
+            ),
             fixed_avoid_complete=(
                 mission_events["fixed_avoid_complete"] is not None
             ),
             fixed_avoid_completed_at=(
                 mission_events["fixed_avoid_complete"].received_at
                 if mission_events["fixed_avoid_complete"] is not None
+                else None
+            ),
+            overtake_entered=mission_events["overtake_entry"] is not None,
+            overtake_entry_received_at=(
+                mission_events["overtake_entry"].received_at
+                if mission_events["overtake_entry"] is not None
                 else None
             ),
             overtake_complete=mission_events["overtake_complete"] is not None,
@@ -848,6 +1035,12 @@ class RaceRuntimeAdapter:
         observation: MissionObservation,
         transition: Transition,
     ) -> None:
+        # 회피 방향 가드는 구간 밖에서도 계속 돌린다. 방향 판단은 카메라만 보는
+        # 인지 필터라 구간 진입을 기다릴 이유가 없고, 미리 데워 두면 진입 직후
+        # 곧바로 회피를 시작할 수 있다.
+        direction = self.avoid_direction.update(observation)
+        self.last_avoid_direction = direction
+
         mode = self.fsm.state
         action_modes = (Mode.FIXED_AVOID, Mode.OVERTAKE)
         if mode not in action_modes:
@@ -857,35 +1050,79 @@ class RaceRuntimeAdapter:
             self.lane_action = LaneActionStatus(mode=mode)
 
         action = self.lane_action
-        snapshot_at = observation.object_received_at
-        object_fresh = (
-            self._event_is_fresh(
-                snapshot_at,
-                observation.now,
-                self.object_max_age_s,
-            )
-            and self.context.state_entered_at is not None
-            and snapshot_at is not None
-            and snapshot_at > self.context.state_entered_at
+        object_fresh = self._event_is_fresh(
+            observation.object_received_at,
+            observation.now,
+            self.object_max_age_s,
         )
-        if not object_fresh:
-            action.safe_to_drive = False
-        elif not observation.object_exists:
-            action.safe_to_drive = True
-        else:
-            target = opposite_lane_target(observation.object_lane)
-            action.safe_to_drive = target is not None
-            if (
-                target is not None
-                and target != self.context.lane_target
-                and not action.pending
-                and not action.completed
-            ):
-                self.context.lane_target = target
-                action.target = target
-                action.pending = True
-                action.started_at = observation.now
 
+        # 인지가 살아 있으면 주행을 인가한다. 회피 방향이 아직 확정되지 않았어도
+        # (박스가 안 보이거나, 좌/우가 미확정이거나, 디바운스가 덜 찼어도)
+        # 지금 차선을 그대로 유지한 채 계속 가는 편이 장애물 앞에서 멈춰 서는
+        # 것보다 안전하다. 예전에는 이 세 경우가 STOP 이라, 방향이 흔들릴 때마다
+        # 구간 한복판에서 속도가 0으로 떨어졌다.
+        #
+        # README: "고정장애물이 2차선에 있으면 1차선으로 회피하고, 그대로
+        # 1차선에서 방해차량 구간을 시작한다. 회피 후 2차선으로 되돌아오지
+        # 않는다." 중앙 주행은 회피 전 기본값일 뿐 복귀 목표가 아니다.
+        action.safe_to_drive = object_fresh
+
+        # 회피 방향은 YOLO만으로 정한다. object_box_px 와 object_lane 은
+        # 카메라 단독 산출물이고, LiDAR는 추월 완료 확인(main.overtake)에만 쓴다.
+        #
+        # 예전에는 LiDAR 기반 object_exists 를 요구했다. 구간 진입은
+        # YOLO(box_size > FIXED_ENTRY_BOX_PX)로 하면서 방향 결정만 LiDAR에
+        # 걸어둔 비대칭이라, 카메라가 방해차량을 또렷이 보는데도 회피를
+        # 시작하지 못했다. rosbag2_fixed_obstacles_overtake_1 실측:
+        # 방해차량이 대부분 2 m 밖이라 range_max_m(2.0)에 걸려 전방 클러스터가
+        # 103 스캔 중 1번만 형성됐고(±10도 최소거리 중앙값 5.08 m),
+        # object_exists 가 1810 샘플 내내 0이었다. 같은 구간에서 YOLO는
+        # 박스 최대 10549 px^2, car_lane=1을 안정적으로 냈다.
+        #
+        # 단, 한 프레임짜리 car_lane 반전으로 방향을 확정하지는 않는다.
+        # AvoidDirectionDebouncer 가 연속 프레임 합의를 요구한다.
+        target = direction.target
+        if (
+            object_fresh
+            and target is not None
+            and target != self.context.lane_target
+            and self.context.state_entered_at is not None
+            and direction.last_sample_at is not None
+            and direction.last_sample_at > self.context.state_entered_at
+        ):
+            # 이미 시작했거나(pending) 끝난(completed) 변경이어도 방향을 고친다.
+            # 예전에는 not pending and not completed 를 요구해서, 잘못된
+            # 방향으로 한 번 들어가면 반대 증거가 아무리 쌓여도 되돌릴 수
+            # 없었다. 실측 bag에서 car_lane=1 이 20프레임 넘게 연속으로
+            # 나왔는데도 목표가 1차선(장애물이 있는 쪽)에 고정된 채 충돌했다.
+            #
+            # 중앙(CENTER) 복귀는 여기서도 일어나지 않는다.
+            # opposite_lane_target() 이 좌/우만 돌려주기 때문이다.
+            self.context.lane_target = target
+            action.target = target
+            action.pending = True
+            action.completed = False
+            action.completed_at = None
+            action.started_at = observation.now
+
+        # 차선 변경 완료 판정 ①: 실측 차선(/lane_position)이 목표와 일치.
+        #
+        # /lane_change_state 의 성공 엣지만 쓰면 완료가 안 잡혔다. 그 판정은
+        # "오프셋이 400px 이상 튄 뒤 50px 이내로 8프레임 연속"인데, bag 실측상
+        # 스파이크 자체가 안 나거나(최대 217~313px) 스파이크 뒤 안정이 1프레임밖에
+        # 이어지지 않아 조건을 못 채웠다. 실측 차선은 5프레임 디바운스를 이미
+        # 거친 값이라 오프셋 거동에 의존하지 않는다.
+        if (
+            action.pending
+            and action.target is not None
+            and self.measured_lane == action.target.value
+        ):
+            action.pending = False
+            action.completed = True
+            action.completed_at = observation.now
+            return
+
+        # 완료 판정 ②: /lane_change_state 성공 엣지 (기존 경로 유지)
         success_at = observation.lane_change_received_at
         if (
             action.pending

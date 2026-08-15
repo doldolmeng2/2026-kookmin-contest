@@ -33,7 +33,7 @@ OPTIONAL_READ_TOPICS = ("/lane_valid",)
 REPLAY_TOPICS = frozenset((*READ_TOPICS, *OPTIONAL_READ_TOPICS))
 
 EXPECTED_TYPES = {
-    "/traffic_detection": "std_msgs/msg/Bool",
+    "/traffic_detection": "std_msgs/msg/Int32",
     "/rubbercone_info": "std_msgs/msg/Int32MultiArray",
     "/lane_offset": "std_msgs/msg/Int16",
     "/mode_info": "std_msgs/msg/Int32MultiArray",
@@ -60,8 +60,11 @@ _ALLOWED_TRANSITIONS = frozenset(
         (Mode.INIT, Mode.WAIT_GREEN),
         (Mode.WAIT_GREEN, Mode.LANE_DRIVE),
         (Mode.LANE_DRIVE, Mode.CONE_DRIVE),
-        (Mode.CONE_DRIVE, Mode.REJOIN),
-        (Mode.REJOIN, Mode.FIXED_AVOID),
+        (Mode.CONE_DRIVE, Mode.LANE_DRIVE),
+        (Mode.REJOIN, Mode.LANE_DRIVE),  # compatibility-only old bag entry
+        (Mode.LANE_DRIVE, Mode.FIXED_AVOID),
+        (Mode.FIXED_AVOID, Mode.LANE_DRIVE),
+        (Mode.LANE_DRIVE, Mode.OVERTAKE),
         (Mode.FIXED_AVOID, Mode.OVERTAKE),
         (Mode.OVERTAKE, Mode.LANE_DRIVE),
         (Mode.LANE_DRIVE, Mode.SHORTCUT),
@@ -211,8 +214,11 @@ def _message_data(message: Any) -> Any:
 def parse_traffic_message(message: Any) -> tuple[Optional[bool], Optional[str]]:
     value = _message_data(message)
     if isinstance(value, bool):
+        # Compatibility with pre-2026 Bool bags.
         return value, None
-    return None, "traffic message does not contain a Bool data field"
+    if isinstance(value, int) and value in (0, 1, 2, 3):
+        return value in (2, 3), None
+    return None, "traffic message must be Bool or Int32 code 0..3"
 
 
 def parse_cone_message(message: Any) -> Dict[str, Any]:
@@ -892,7 +898,7 @@ class OfflineBagReplay:
 
     @staticmethod
     def _should_evaluate(mode: Mode, topic: str) -> bool:
-        # Trace-only topics do not create mission event edges. In WAIT_GREEN,
+        # Trace-only topics do not create mission event edges. In WAIT_TRAFFIC,
         # only a new traffic record may advance/reset the green debouncer; this
         # prevents one cached Bool from being counted again by unrelated data.
         if topic not in _FSM_EVENT_TOPICS:
@@ -950,7 +956,7 @@ class OfflineBagReplay:
             "absence of unsupported Mode transitions",
         ]
         if "/traffic_detection" in topic_types:
-            scope.append("WAIT_GREEN debounce using recorded traffic Bool edges")
+            scope.append("WAIT_TRAFFIC debounce using recorded traffic code edges")
         if "/rubbercone_info" in topic_types:
             scope.append("rubbercone candidate/end event timing")
         if "/rubbercone_info" in topic_types and "/scan" in topic_types:
@@ -959,11 +965,11 @@ class OfflineBagReplay:
             )
         if "/rubbercone_info" in topic_types:
             scope.append(
-                "CONE_DRIVE to REJOIN on a fresh recorded rubbercone 0-to-1 session"
+                "CONE_DRIVE to LANE_DRIVE on a fresh rubbercone 0-to-1 session"
             )
         if "/lane_valid" in topic_types:
             scope.append(
-                "REJOIN to FIXED_AVOID on fresh recorded lane-validity edges"
+                "legacy REJOIN to LANE_DRIVE on fresh lane-validity edges"
             )
         if "/scan" in topic_types:
             scope.append("recorded scan receipt gap statistics")
@@ -979,7 +985,7 @@ class OfflineBagReplay:
             "motor adapter behavior or live vehicle motion",
         ]
         if "/lane_valid" not in topic_types:
-            scope.append("REJOIN to FIXED_AVOID lane-validity debounce")
+            scope.append("legacy REJOIN to LANE_DRIVE lane-validity debounce")
         if "/traffic_detection" not in topic_types:
             scope.append("recorded start-green debounce")
         if "/rubbercone_info" not in topic_types:

@@ -44,7 +44,7 @@ def one_message_entry_runtime():
     )
 
 
-def test_integrated_cone_session_resets_once_and_enters_fixed_avoid():
+def test_integrated_cone_session_resets_once_then_accepts_fixed_entry():
     adapter = one_message_entry_runtime()
     resets = []
     adapter.record_scan(1.0)
@@ -74,7 +74,7 @@ def test_integrated_cone_session_resets_once_and_enters_fixed_avoid():
     rejoined = adapter.step(1.2)
 
     assert armed.transition.reason == "cone exit session armed"
-    assert rejoined.transition.target is Mode.REJOIN
+    assert rejoined.transition.target is Mode.LANE_DRIVE
     assert rejoined.control.source is ControlSource.STOP
 
     for timestamp in (1.3, 1.4):
@@ -84,12 +84,12 @@ def test_integrated_cone_session_resets_once_and_enters_fixed_avoid():
             lane=candidate(1.0, 5.0, timestamp),
         )
         assert waiting.transition.changed is False
-        assert waiting.control.source is ControlSource.STOP
+        assert waiting.control.source is ControlSource.LANE
 
-    adapter.record_lane_validity(True, 1.51)
+    adapter.record_fixed_zone_entry(1.51)
     fixed = adapter.step(1.51, lane=candidate(1.0, 5.0, 1.51))
 
-    assert fixed.transition.source is Mode.REJOIN
+    assert fixed.transition.source is Mode.LANE_DRIVE
     assert fixed.transition.target is Mode.FIXED_AVOID
     assert fixed.control.source is ControlSource.STOP
 

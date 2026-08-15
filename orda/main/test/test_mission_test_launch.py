@@ -18,12 +18,14 @@ PRODUCTION_LAUNCH = ORDA_ROOT / 'main' / 'launch' / 'module_drive.py'
 BAG_TEST_LAUNCH = ORDA_ROOT / 'main' / 'launch' / 'module_drive_bag_test.py'
 
 VALID_PROFILES = (
-    'lane',
-    'cone',
-    'rejoin',
-    'fixed',
-    'overtake',
-    'shortcut',
+    '1',
+    '2',
+    '3',
+    '4',
+    '5',
+    '6',
+    '7',
+    '8',
 )
 
 
@@ -71,7 +73,7 @@ def test_profile_argument_rejects_unknown_values_at_launch_boundary():
     argument = launch_argument(description, 'test_profile')
 
     assert tuple(argument.choices) == VALID_PROFILES
-    assert substitution_text(argument.default_value) == 'lane'
+    assert substitution_text(argument.default_value) == '2'
     assert 'foobar' not in argument.choices
     assert 'race' not in argument.choices
 
@@ -163,6 +165,7 @@ def test_mission_launch_reuses_the_complete_non_main_production_stack():
         'joy',
         'lane_detection',
         'object_detection',
+        'object_detection',
         'rubbercone',
         'traffic_light',
     ]
@@ -175,7 +178,7 @@ def test_production_and_existing_bag_launch_remain_unmodified_in_scope():
 
     assert 'live_drive' not in production_source
     assert '/mission_test/xycar_motor' not in production_source
-    assert "default_value='race'" in bag_source
+    assert "default_value='0'" in bag_source
     assert "('xycar_motor', '/bag_test/xycar_motor')" in bag_source
 
 

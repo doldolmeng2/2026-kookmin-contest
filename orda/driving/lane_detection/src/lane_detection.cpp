@@ -31,6 +31,8 @@
 #include <string>
 #include <iostream>
 #include <vector>
+#include <fstream>
+#include <stdexcept>
 #include <functional>
 #include <algorithm>
 #include <chrono>
@@ -115,6 +117,12 @@ public:
         lane_change_state_pub_ = this->create_publisher<std_msgs::msg::Int32MultiArray>(
             "/lane_change_state", qos_fast);
 
+        // 실측 현재 차선 발행: /lane_position (-1=미확정, 0=중앙, 1=왼쪽, 2=오른쪽)
+        // /lane_change_state 가 "변경이 끝났다"는 이벤트라면, 이쪽은 매 프레임
+        // "지금 어느 차선인가"를 알려주는 연속값이다. 둘은 성격이 달라 공존한다.
+        lane_position_pub_ = this->create_publisher<std_msgs::msg::Int16>(
+            "/lane_position", qos_fast);
+
         // BEV 호모그래피 행렬 계산 (ROI 사다리꼴 → 직사각형)
         buildHomography();
 
@@ -169,8 +177,8 @@ public:
                 Scalar(config_.yellow_ycrcb_max_y,  config_.yellow_ycrcb_max_cr, config_.yellow_ycrcb_max_cb),
                 y_ycc);
 
-        // YCrCb 채널 합산 디버그 시각화 (debug_view 설정 시)
-        if (config_.debug_view) {
+        // YCrCb 채널 합산 디버그 시각화 (debug_lane_view 설정 시)
+        if (config_.debug_view && config_.debug_lane_view) {
             std::vector<cv::Mat> ch;
             split(ycrcb, ch);
             imshow("YCrCb channels", (ch[0] + ch[1] + ch[2]) / 3);
@@ -711,7 +719,8 @@ public:
         dot_x = std::clamp(dot_x, 0, sw - 1);
         circle(slider, Point(dot_x, sh/2), 6, Scalar(0, 0, 255), FILLED);
 
-        string mode_str   = (mode == LaneMode::LANE_ONE) ? "Mode: 1-Lane" : "Mode: 2-Lane";
+        string mode_str   = (mode == LaneMode::CENTER)   ? "Mode: Center"
+                          : (mode == LaneMode::LANE_ONE) ? "Mode: 1-Lane" : "Mode: 2-Lane";
         string offset_str = "Offset(px): " + std::to_string(static_cast<int>(std::round(offset_px)));
         putText(slider, mode_str,   Point(10, 20), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(220,220,220), 1);
         putText(slider, offset_str, Point(10, 42), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(220,220,220), 1);
@@ -765,10 +774,15 @@ public:
         if (debug_view_ && show_dbg && dbg_from_fit && !dbg_from_fit->empty())
             cv::imshow("SlidingWindows", *dbg_from_fit);
 
-        // 오프셋 슬라이더 창 표시
-        if (debug_view_ && show_dbg) {
+        // 오프셋 슬라이더 창 표시 (debug_lane_view 설정 시)
+        // waitKey는 debug_lane_view와 무관하게 호출해야 한다. HighGUI 이벤트 펌프
+        // 역할을 하므로, 이걸 건너뛰면 남아있는 창(SlidingWindows/Mask-Yellow)이
+        // 갱신되지 않는다.
+        if (debug_view_ && show_dbg && debug_lane_view_) {
             cv::Mat vis = drawOffsetSlider(frame, offset, lane_mode_);
             cv::imshow("Lane View + Offset", vis);
+            cv::waitKey(1);
+        } else {
             cv::waitKey(1);
         }
     }
@@ -908,8 +922,14 @@ public:
 
     // 차선 모드에 대응하는 목표 ref 비율(0~1) 반환
     float getTargetRefForMode(LaneMode m) const {
-        float r = (m == LaneMode::LANE_ONE) ? center_reference_lane_one_
-                                            : center_reference_lane_two_;
+        float r;
+        if (m == LaneMode::CENTER) {
+            // 중앙 주행: 두 차선 기준값의 중간. 별도 설정 키가 필요 없다.
+            r = 0.5f * (center_reference_lane_one_ + center_reference_lane_two_);
+        } else {
+            r = (m == LaneMode::LANE_ONE) ? center_reference_lane_one_
+                                          : center_reference_lane_two_;
+        }
         return std::clamp(r, 0.0f, 1.0f);
     }
 
@@ -951,6 +971,14 @@ private:
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr               validity_pub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr  fit_pub_;
     rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr    lane_change_state_pub_;
+    rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr              lane_position_pub_;
+
+    // ── 실측 현재 차선 판정 상태 (인지 기반, 제어 목표와 무관) ──────────
+    int detected_lane_  = -1;  // 확정된 실측 차선 (-1=미확정)
+    int pending_lane_   = -1;  // 디바운스 중인 후보 차선
+    int pending_streak_ = 0;   // 후보 차선 연속 프레임 수
+    static constexpr int   LANE_DETECT_STREAK_NEED_ = 5;           // 확정에 필요한 연속 프레임 수
+    static constexpr float LANE_CLASSIFY_DEADZONE_RATIO_ = 0.05f;  // 애매한 경계 임계값
 
     // ── 조향/속도 명령 시각화 (정성적 근사, 실측 휠베이스/조향각 보정값 아님) ──
     float last_steer_cmd_  = 0.f;  // /xycar_motor에서 수신한 마지막 조향 명령
@@ -981,6 +1009,11 @@ private:
     int  frame_count_  = 0;
     int  debug_stride_ = 1;   // 디버그 출력 주기 (1이면 매 프레임)
     bool debug_view_   = config_.debug_view;
+    // false면 보조 차선 디버그 창을 숨기고 SlidingWindows / Mask-Yellow 만 남긴다.
+    // debug_view_ 가 false면 이 값과 무관하게 모든 창이 꺼진다.
+    bool debug_lane_view_ = config_.debug_lane_view;
+    // "Vehicle Dynamics" 창 마지막 표시 시각 (10 Hz 제한용)
+    rclcpp::Time last_dynamics_draw_{0, 0, RCL_ROS_TIME};
 
     // ── 모드/차선 상태 ──────────────────────────────────────────────────
     int  current_mode_ = 0;
@@ -1022,8 +1055,8 @@ private:
         Mat frame = cv_ptr->image;
         if (frame.empty()) return;
 
-        // ROI 사다리꼴 디버그 시각화
-        if (debug_view_) {
+        // ROI 사다리꼴 디버그 시각화 (debug_lane_view 설정 시)
+        if (debug_view_ && debug_lane_view_) {
             Mat frame_roi_vis = frame.clone();
             drawROIPolygon(frame_roi_vis);
             imshow("ROI Polygon", frame_roi_vis);
@@ -1037,7 +1070,7 @@ private:
         Mat bev_yellow;
         warpPerspective(yellow_edges, bev_yellow, H_, bev_size_,
                         INTER_LINEAR, BORDER_CONSTANT, Scalar(0));
-        if (debug_view_) imshow("BEV-Yellow", bev_yellow);
+        if (debug_view_ && debug_lane_view_) imshow("BEV-Yellow", bev_yellow);
 
         // (3) 노이즈 억제 준비: corridor 범위 및 디버그 캔버스 준비
         const int y_start_chk = (int)std::round(bev_size_.height * 0.0f);
@@ -1079,7 +1112,7 @@ private:
         );
         if (suppressed2) bev_yellow = bev_clean2;
 
-        if (debug_view_)
+        if (debug_view_ && debug_lane_view_)
             cv::imshow("BEV-Yellow (suppressed rows/columns in red)", bev_color);
 
         // (4) 슬라이딩 윈도우 직선 피팅
@@ -1114,6 +1147,68 @@ private:
         // the prior offset for lane control, but it must reset completion
         // progress rather than treating stale geometry as fresh evidence.
         updateLaneChangeState(valid, center_fit, offset);
+
+        // 실측 현재 차선 판정 및 /lane_position 발행 (제어 목표와 무관한 인지값)
+        const LineFit& effective_fit = valid ? center_fit : prev_center_fit_;
+        updateAndPublishDetectedLane(effective_fit, valid || has_prev_center_fit_);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // 노란 중앙선의 BEV 가로 위치 비율로 현재 차선을 분류한다.
+    //
+    // 두 기준값(1차선/2차선 ref)의 정중앙 부근은 노이즈만으로도 쉽게 뒤집히는
+    // 애매한 영역이라, 그 구간에서는 -1(판정 보류)을 반환해 디바운스 카운터에
+    // 아예 반영되지 않게 한다. 애매한 프레임이 우연히 5번 연속 한쪽에 쏠려도
+    // 잘못 확정되지 않도록 하기 위함이다.
+    //
+    // 반환값: 0=Lane1, 1=Lane2, -1=판정 보류
+    // ─────────────────────────────────────────────────────────────────────
+    int classifyLaneFromRatio(float x_ratio) const {
+        // 기본 주행이 중앙이 되면서 중앙도 하나의 상태가 되었다. 세 기준값
+        // (1차선 / 중앙 / 2차선) 중 가장 가까운 것을 고른다.
+        const float mid = 0.5f * (center_reference_lane_one_ + center_reference_lane_two_);
+        // 반환 규약(README): 0=중앙, 1=왼쪽(1차선), 2=오른쪽(2차선)
+        const float d[3] = {
+            std::fabs(x_ratio - mid),                         // 0 = 중앙
+            std::fabs(x_ratio - center_reference_lane_one_),  // 1 = 왼쪽
+            std::fabs(x_ratio - center_reference_lane_two_),  // 2 = 오른쪽
+        };
+
+        int best = 0, second = 1;
+        for (int i = 1; i < 3; ++i) if (d[i] < d[best]) best = i;
+        for (int i = 0; i < 3; ++i)
+            if (i != best && (second == best || d[i] < d[second])) second = i;
+
+        // 1·2등이 비슷하면 경계라 판정을 보류한다. 애매한 프레임이 우연히
+        // 연속으로 한쪽에 쏠려 잘못 확정되는 것을 막는다.
+        if (std::fabs(d[second] - d[best]) < LANE_CLASSIFY_DEADZONE_RATIO_) return -1;
+        return best;
+    }
+
+    // 디바운스(5프레임 연속) 후 detected_lane_ 갱신 및 /lane_position 발행
+    void updateAndPublishDetectedLane(const LineFit& fit_bev, bool fit_ok) {
+        if (fit_ok && bev_size_.width > 0 && bev_size_.height > 0) {
+            const float x_near =
+                fit_bev.m * static_cast<float>(bev_size_.height - 1) + fit_bev.b;
+            const float ratio = x_near / static_cast<float>(bev_size_.width);
+            const int   cls   = classifyLaneFromRatio(ratio);
+
+            if (cls == -1) {
+                // 애매한 프레임: 디바운스 상태를 건드리지 않고 이전 상태 유지
+            } else if (cls == pending_lane_) {
+                ++pending_streak_;
+            } else {
+                pending_lane_   = cls;
+                pending_streak_ = 1;
+            }
+            if (pending_streak_ >= LANE_DETECT_STREAK_NEED_) {
+                detected_lane_ = pending_lane_;
+            }
+        }
+
+        std_msgs::msg::Int16 msg;
+        msg.data = static_cast<int16_t>(detected_lane_);
+        lane_position_pub_->publish(msg);
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1132,7 +1227,7 @@ private:
         const int new_mode  = msg->data[0];
         const int new_lane  = msg->data[1];
         const int prev_mode = current_mode_;
-        const bool valid_lane_target = new_lane == 0 || new_lane == 1;
+        const bool valid_lane_target = new_lane >= 0 && new_lane <= 2;
 
         lane_change_tracker_.handleCommand(new_mode, new_lane);
 
@@ -1143,7 +1238,9 @@ private:
         LaneMode old_lane_mode = lane_mode_;
         if (valid_lane_target &&
             (new_mode == 5 || (prev_mode != 3 && new_mode == 3))) {
-            lane_mode_ = (new_lane == 0) ? LaneMode::LANE_ONE : LaneMode::LANE_TWO;
+            lane_mode_ = (new_lane == 1) ? LaneMode::LANE_ONE
+                       : (new_lane == 2) ? LaneMode::LANE_TWO
+                                         : LaneMode::CENTER;
         }
 
         // 차선 모드가 실제로 변경되었으면 ref 전환 시작
@@ -1162,27 +1259,89 @@ private:
         last_steer_cmd_ = msg->data[0];
         if (msg->data.size() >= 2) last_speed_cmd_ = msg->data[1];
 
-        // /xycar_motor가 도착할 때마다 즉시 갱신: main.py의 "Status" 창과 같은
-        // 주기(제어 루프 주기)로 표시되도록, 카메라 프레임 콜백을 기다리지 않는다.
+        // 카메라 프레임 콜백을 기다리지 않고 /xycar_motor 수신마다 갱신하되,
+        // 표시 주기는 10 Hz 로 제한한다. /xycar_motor 는 제어 주기(50 Hz)로
+        // 들어오는데, 그때마다 imshow + waitKey 를 부르면 같은 스레드에서 도는
+        // 차선 인지가 그만큼 밀린다. 실측(bag): 카메라 18.8 Hz 입력에
+        // /lane_offset 은 5.9 Hz 출력. 눈으로 보는 창은 10 Hz 면 충분하다.
         if (debug_view_) {
-            cv::imshow("Vehicle Dynamics", drawVehicleDynamicsView());
-            cv::waitKey(1);
+            const rclcpp::Time stamp = this->get_clock()->now();
+            if (last_dynamics_draw_.nanoseconds() == 0 ||
+                (stamp - last_dynamics_draw_).seconds() >= 0.1 ||
+                (stamp - last_dynamics_draw_).seconds() < 0.0) {
+                last_dynamics_draw_ = stamp;
+                cv::imshow("Vehicle Dynamics", drawVehicleDynamicsView());
+                cv::waitKey(1);
+            }
         }
     }
 };
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 파라미터 JSON 경로 결정
+//
+// 1) `--config <경로>` 명령행 인수가 있으면 그 경로를 사용
+// 2) 없으면 아래 후보 경로를 순서대로 확인한다
+//
+// 소스 트리를 직접 가리키므로 JSON을 고치면 재빌드 없이 바로 반영된다.
+// 예전에는 실차 경로 하나만 하드코딩되어 있었는데, 개발 PC에는 그 파일이
+// 없어서 lane_node가 시작하자마자 parse_error로 죽었다.
+//
+// ★ 새 PC에서 쓰려면 CONFIG_PATH_CANDIDATES에 그 PC의 경로를 추가해야 한다.
+//   임시로는 --config <경로> 로 넘겨도 된다.
+// ─────────────────────────────────────────────────────────────────────────────
+static std::string resolve_config_path(int argc, char** argv) {
+    static const std::vector<std::string> CONFIG_PATH_CANDIDATES = {
+        // 개발 PC
+        "/home/dxer0/xycar_ws/src/orda/driving/lane_detection/lane_detection_parameter.json",
+        // 실차 (Xycar)
+        "/home/xytron/xycar_ws/src/orda/driving/lane_detection/lane_detection_parameter.json",
+    };
+
+    auto readable = [](const std::string& p) {
+        if (p.empty()) return false;
+        std::ifstream f(p);
+        return f.is_open();
+    };
+
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == "--config") {
+            const std::string p = argv[i + 1];
+            if (readable(p)) return p;
+            throw std::runtime_error("--config로 지정된 파일을 열 수 없습니다: " + p);
+        }
+    }
+
+    for (const auto& candidate : CONFIG_PATH_CANDIDATES)
+        if (readable(candidate)) return candidate;
+
+    std::string msg = "lane_detection_parameter.json을 찾지 못했습니다. 확인한 경로:";
+    for (const auto& candidate : CONFIG_PATH_CANDIDATES) msg += "\n  - " + candidate;
+    msg += "\n--config <경로> 로 직접 지정할 수 있습니다.";
+    throw std::runtime_error(msg);
+}
 
 
 int main(int argc, char** argv) {
     std::cout << "OpenCV 버전: " << CV_VERSION << std::endl;
     rclcpp::init(argc, argv);
 
-    Config config = load_config(
-        "/home/xytron/xycar_ws/src/orda/driving/lane_detection/lane_detection_parameter.json"
-    );
+    Config config;
+    try {
+        const std::string config_path = resolve_config_path(argc, argv);
+        std::cout << "[lane_detection] 파라미터 파일: " << config_path << std::endl;
+        config = load_config(config_path);
+    } catch (const std::exception& e) {
+        std::cerr << "[lane_detection] 설정 로드 실패: " << e.what() << std::endl;
+        rclcpp::shutdown();
+        return 1;
+    }
 
     // 로드된 설정값 확인용 로그 (config 수정이 실제로 반영됐는지 디버깅용)
     std::cout << "===== [lane_detection] 로드된 Config 값 =====" << std::endl;
     std::cout << "[Config] debug_view = " << config.debug_view << std::endl;
+    std::cout << "[Config] debug_lane_view = " << config.debug_lane_view << std::endl;
     std::cout << "[Config] roi_top_width_coefficient = " << config.roi_top_width_coefficient << std::endl;
     std::cout << "[Config] roi_bottom_width_coefficient = " << config.roi_bottom_width_coefficient << std::endl;
     std::cout << "[Config] sliding_window_num_windows = " << config.sliding_window_num_windows << std::endl;

@@ -84,7 +84,7 @@ def test_consecutive_zero_then_one_callbacks_preserve_order():
     assert adapter.fsm.cone_exit_armed is False
     assert one.observation.cone_message_received_at == 1.1
     assert one.observation.cone_end_flag is True
-    assert one.transition.target is Mode.REJOIN
+    assert one.transition.target is Mode.LANE_DRIVE
 
 
 def test_malformed_short_array_is_ignored_without_reusing_normal_event():
@@ -148,7 +148,7 @@ def test_pre_reset_queue_is_discarded_and_latched_one_cannot_exit():
     assert adapter.fsm.cone_exit_armed is False
 
 
-def test_reset_then_fresh_zero_and_separate_one_enters_rejoin():
+def test_reset_then_fresh_zero_and_separate_one_returns_to_lane():
     adapter = runtime(Mode.LANE_DRIVE, one_message_entry=True)
     enter_cone(adapter)
 
@@ -162,7 +162,7 @@ def test_reset_then_fresh_zero_and_separate_one_enters_rejoin():
     assert old_one.transition.changed is False
     assert fresh_zero.transition.changed is False
     assert fresh_zero.transition.reason == "cone exit session armed"
-    assert fresh_one.transition.target is Mode.REJOIN
+    assert fresh_one.transition.target is Mode.LANE_DRIVE
 
 
 def test_stop_transition_never_dispatches_cone_reset():
@@ -188,46 +188,14 @@ def test_second_normal_cone_session_dispatches_one_new_reset():
     adapter.record_cone_message([0, 0, 80], 1.1)
     adapter.step(1.1)
     adapter.record_cone_message([0, 1, 0], 1.2)
-    assert adapter.step(1.2).transition.target is Mode.REJOIN
-
-    for timestamp in (1.3, 1.4):
-        adapter.record_lane_validity(True, timestamp)
-        waiting = adapter.step(
-            timestamp,
-            lane=candidate(1.0, 5.0, timestamp),
-        )
-        assert waiting.transition.changed is False
-        assert waiting.control.source is ControlSource.STOP
-    adapter.record_lane_validity(True, 1.51)
-    first_rejoin = adapter.step(
-        1.51,
-        lane=candidate(1.0, 5.0, 1.51),
-    )
-    assert first_rejoin.transition.target is Mode.FIXED_AVOID
-    assert first_rejoin.control.source is ControlSource.STOP
-
-    adapter.record_fixed_avoid_complete(1.6)
-    assert adapter.step(1.6).transition.target is Mode.OVERTAKE
-    adapter.record_overtake_complete(1.7)
-    assert adapter.step(1.7).transition.target is Mode.LANE_DRIVE
+    assert adapter.step(1.2).transition.target is Mode.LANE_DRIVE
 
     second_entry = enter_cone(adapter, 2.1)
     dispatch_cone_reset(second_entry, lambda: resets.append(2))
     adapter.record_cone_message([0, 0, 80], 2.2)
     adapter.step(2.2)
     adapter.record_cone_message([0, 1, 0], 2.3)
-    assert adapter.step(2.3).transition.target is Mode.REJOIN
-
-    for timestamp in (2.4, 2.5):
-        adapter.record_lane_validity(True, timestamp)
-        assert adapter.step(timestamp).transition.changed is False
-    adapter.record_lane_validity(True, 2.61)
-    second_rejoin = adapter.step(
-        2.61,
-        lane=candidate(1.0, 5.0, 2.61),
-    )
-    assert second_rejoin.transition.target is Mode.FIXED_AVOID
-    assert second_rejoin.control.source is ControlSource.STOP
+    assert adapter.step(2.3).transition.target is Mode.LANE_DRIVE
 
     stayed = adapter.step(2.63)
     dispatch_cone_reset(stayed, lambda: resets.append(99))
@@ -354,14 +322,51 @@ def test_stale_lane_input_commits_safety_stop_and_zero_control():
     )
     adapter.record_lane_offset(0, 1.0)
 
+    # 1.2초 공백. LANE_OFFSET_MAX_AGE_S(1.0)를 넘어 진짜 인지 유실로 본다.
     cycle = adapter.step(
-        1.6,
+        2.2,
         lane=candidate(1.0, 5.0, 1.0),
     )
 
     assert cycle.transition.target is Mode.STOP
     assert cycle.safety.must_stop is True
     assert cycle.control.source is ControlSource.STOP
+
+
+def test_stop_recovery_waits_for_real_inputs_not_just_the_hold_timer():
+    """STOP 복귀는 타이머가 아니라 입력 회복을 봐야 한다.
+
+    예전에는 runtime_safety_monitor() 에 STOP 상태의 필수 입력이 등록돼 있지
+    않아 inputs_ready 가 항상 True 였고, 복귀가 사실상 0.5초 타이머였다.
+    실측 bag 에서 STOP 구간 길이가 전부 0.50~0.52초로 똑같고, 복귀 직후 다시
+    STOP 으로 떨어지기를 28번 반복한 이유다.
+    """
+
+    adapter = RaceRuntimeAdapter(
+        fsm=RaceFSM(initial_state=Mode.LANE_DRIVE),
+        context=RaceContext(state_entered_at=0.0),
+        safety_monitor=runtime_safety_monitor(),
+    )
+    adapter.record_lane_offset(0, 1.0)
+    adapter.record_scan(1.0)
+
+    # 인지 유실 -> STOP
+    stopped = adapter.step(2.2, lane=candidate(1.0, 5.0, 2.2))
+    assert stopped.transition.target is Mode.STOP
+
+    # 입력이 안 돌아오는 동안에는 아무리 기다려도 복귀하지 않는다.
+    for now in (3.0, 4.0, 5.0):
+        held = adapter.step(now, lane=candidate(1.0, 5.0, now))
+        assert held.safety.inputs_ready is False
+        assert adapter.fsm.state is Mode.STOP
+
+    # 입력이 돌아오면 유지 시간(0.5초)을 채운 뒤 복귀한다.
+    for now in (5.2, 5.4, 5.6, 5.8):
+        adapter.record_lane_offset(0, now)
+        adapter.record_scan(now)
+        cycle = adapter.step(now, lane=candidate(1.0, 5.0, now))
+    assert cycle.transition.target is Mode.LANE_DRIVE
+    assert adapter.fsm.state is Mode.LANE_DRIVE
 
 
 def test_stale_cone_command_stops_motor_without_bypassing_exit_handshake():
@@ -385,7 +390,7 @@ def test_stale_cone_command_stops_motor_without_bypassing_exit_handshake():
 
 @pytest.mark.parametrize(
     "mode",
-    [Mode.FIXED_AVOID, Mode.OVERTAKE, Mode.SHORTCUT],
+    [Mode.FIXED_AVOID, Mode.OVERTAKE],
 )
 def test_unwired_future_states_ignore_typed_events_and_select_stop(mode):
     adapter = RaceRuntimeAdapter(
@@ -403,3 +408,21 @@ def test_unwired_future_states_ignore_typed_events_and_select_stop(mode):
     assert cycle.transition.changed is False
     assert adapter.fsm.state is mode
     assert cycle.control.source is ControlSource.STOP
+
+
+def test_shortcut_uses_fresh_lane_control_while_waiting_for_cnn_exit():
+    adapter = RaceRuntimeAdapter(
+        fsm=RaceFSM(initial_state=Mode.SHORTCUT),
+        context=RaceContext(
+            completed_laps=1,
+            shortcut_lap=2,
+            state_entered_at=1.0,
+        ),
+        safety_monitor=runtime_safety_monitor(),
+    )
+    adapter.record_lane_offset(0, 1.1)
+
+    cycle = adapter.step(1.1, lane=candidate(1.0, 5.0, 1.1))
+
+    assert cycle.transition.changed is False
+    assert cycle.control.source is ControlSource.LANE

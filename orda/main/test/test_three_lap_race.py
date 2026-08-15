@@ -85,6 +85,36 @@ class SyntheticRace:
             )
         )
 
+    def fixed_entry(self):
+        timestamp = self._next_time()
+        return self._step(
+            MissionObservation(
+                now=timestamp,
+                fixed_zone_entered=True,
+                fixed_zone_entry_received_at=timestamp,
+            )
+        )
+
+    def fixed_exit(self):
+        timestamp = self._next_time()
+        return self._step(
+            MissionObservation(
+                now=timestamp,
+                fixed_zone_exited=True,
+                fixed_zone_exit_received_at=timestamp,
+            )
+        )
+
+    def overtake_entry(self):
+        timestamp = self._next_time()
+        return self._step(
+            MissionObservation(
+                now=timestamp,
+                overtake_entered=True,
+                overtake_entry_received_at=timestamp,
+            )
+        )
+
     def completion(self, name):
         timestamp = self._next_time()
         fields = {
@@ -123,24 +153,19 @@ def run_normal_lap(race):
     assert race.cone().changed is False
     assert race.cone().target is Mode.CONE_DRIVE
     assert race.cone().changed is False
-    assert race.cone(end_flag=True).target is Mode.REJOIN
+    assert race.cone(end_flag=True).target is Mode.LANE_DRIVE
 
-    assert race.lane_valid().changed is False
-    assert race.lane_valid().changed is False
-    assert race.lane_valid().target is Mode.FIXED_AVOID
+    assert race.fixed_entry().target is Mode.FIXED_AVOID
+    assert race.fixed_exit().target is Mode.LANE_DRIVE
 
-    assert race.lane_change_success().changed is False
-    assert race.fsm.state is Mode.FIXED_AVOID
-    assert race.completion("fixed_avoid_complete").target is Mode.OVERTAKE
-
-    assert race.lane_change_success().changed is False
-    assert race.fsm.state is Mode.OVERTAKE
+    assert race.overtake_entry().target is Mode.OVERTAKE
     assert race.completion("overtake_complete").target is Mode.LANE_DRIVE
 
     assert race.trace[trace_start:] == [
         Mode.CONE_DRIVE,
-        Mode.REJOIN,
+        Mode.LANE_DRIVE,
         Mode.FIXED_AVOID,
+        Mode.LANE_DRIVE,
         Mode.OVERTAKE,
         Mode.LANE_DRIVE,
     ]
@@ -205,15 +230,17 @@ def test_full_three_lap_race_uses_shortcut_on_lap_two():
         Mode.WAIT_GREEN,
         Mode.LANE_DRIVE,
         Mode.CONE_DRIVE,
-        Mode.REJOIN,
+        Mode.LANE_DRIVE,
         Mode.FIXED_AVOID,
+        Mode.LANE_DRIVE,
         Mode.OVERTAKE,
         Mode.LANE_DRIVE,
         Mode.SHORTCUT,
         Mode.LANE_DRIVE,
         Mode.CONE_DRIVE,
-        Mode.REJOIN,
+        Mode.LANE_DRIVE,
         Mode.FIXED_AVOID,
+        Mode.LANE_DRIVE,
         Mode.OVERTAKE,
         Mode.LANE_DRIVE,
         Mode.FINISH,
@@ -245,13 +272,15 @@ def test_full_three_lap_race_uses_shortcut_on_lap_three():
         Mode.WAIT_GREEN,
         Mode.LANE_DRIVE,
         Mode.CONE_DRIVE,
-        Mode.REJOIN,
+        Mode.LANE_DRIVE,
         Mode.FIXED_AVOID,
+        Mode.LANE_DRIVE,
         Mode.OVERTAKE,
         Mode.LANE_DRIVE,
         Mode.CONE_DRIVE,
-        Mode.REJOIN,
+        Mode.LANE_DRIVE,
         Mode.FIXED_AVOID,
+        Mode.LANE_DRIVE,
         Mode.OVERTAKE,
         Mode.LANE_DRIVE,
         Mode.SHORTCUT,

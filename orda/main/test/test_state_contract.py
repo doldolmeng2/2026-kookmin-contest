@@ -22,7 +22,7 @@ STATE_CONTRACT = (
     (Mode.REJOIN, ControlSource.STOP, 2),
     (Mode.FIXED_AVOID, ControlSource.STOP, 0),
     (Mode.OVERTAKE, ControlSource.STOP, 0),
-    (Mode.SHORTCUT, ControlSource.STOP, 0),
+    (Mode.SHORTCUT, ControlSource.LANE, 3),
     (Mode.FINISH, ControlSource.STOP, 0),
     (Mode.STOP, ControlSource.STOP, 0),
 )
@@ -107,4 +107,4 @@ def test_rejoin_success_contract_enters_fixed_avoid_directly():
     )
 
     assert transition.source is Mode.REJOIN
-    assert transition.target is Mode.FIXED_AVOID
+    assert transition.target is Mode.LANE_DRIVE

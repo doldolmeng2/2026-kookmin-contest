@@ -28,6 +28,7 @@ from main.main import (
     rubbercone_reset_qos,
     sensor_event_qos,
 )
+from main.overtake import OvertakeGuard
 from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import RaceRuntimeAdapter
@@ -43,6 +44,10 @@ class CallbackHarness:
         )
         self.warnings = []
         self._traffic_encounter_active = False
+        # scan_callback 이 측면 거리를 계산하므로 실제 노드와 같은 필드를 갖춘다.
+        self.overtake = OvertakeGuard()
+        self.side_left = float("inf")
+        self.side_right = float("inf")
 
     def _now_seconds(self):
         return next(self._times)
@@ -78,7 +83,7 @@ def test_main_malformed_cone_callback_warns_without_queuing_event():
 def test_main_scan_and_cone_callbacks_use_the_same_clock_helper():
     harness = CallbackHarness([3.0, 3.01])
 
-    MainNode.scan_callback(harness, SimpleNamespace())
+    MainNode.scan_callback(harness, LaserScan())
     MainNode.rubbercone_callback(
         harness,
         SimpleNamespace(data=[0, 0, 80]),
@@ -272,6 +277,14 @@ def test_generated_ros_entities_have_exact_topic_type_and_qos():
         assert lane_change_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
         assert lane_change_sub.qos_profile.durability is DurabilityPolicy.VOLATILE
 
+        # traffic_node 는 /traffic_detection 을 std_msgs/Int32 로 발행한다.
+        # 여기서 Bool 로 구독하면 타입이 어긋나 연결 자체가 성립하지 않고,
+        # INIT 의 필수 입력이 영영 채워지지 않는다.
+        traffic_sub = node.traffic_sub
+        assert traffic_sub.topic_name == "/traffic_detection"
+        assert traffic_sub.msg_type is Int32
+        assert traffic_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
+
         object_sub = node.object_info_sub
         assert object_sub.topic_name == "/object_info"
         assert object_sub.msg_type is Float32MultiArray
@@ -388,3 +401,203 @@ def test_initial_mode_parser_supports_defined_runtime_states(value, expected):
 def test_initial_mode_parser_rejects_undefined_legacy_state_guesses(value):
     with pytest.raises(ValueError):
         parse_initial_mode(value)
+
+
+def test_bag_loop_backjump_resets_the_state_machine():
+    """bag이 처음부터 재생되면 상태머신을 시작 모드로 되돌린다.
+
+    시각이 뒤로 튀면 이전 루프의 수신 시각이 전부 '미래'가 되어 신선도 검사가
+    음수로 나온다. 끊긴 입력이 신선한 것처럼 보이므로 상태를 버려야 한다.
+    """
+    import rclpy
+    from main.main import MainNode, BAG_LOOP_BACKJUMP_S
+    from main.race_fsm import Mode
+
+    rclpy.init(args=['--ros-args', '-p', 'mode:=1'])
+    try:
+        node = MainNode()
+        assert node._initial_mode is Mode.CONE_DRIVE
+
+        node.runtime.fsm.state = Mode.OVERTAKE
+        node.box_size = 5000.0
+        node.side_right = 0.3
+        before = node.runtime
+
+        node._now_seconds = lambda: 100.0
+        node.control_cycle()
+        # 시각이 크게 역행 → 리셋
+        node._now_seconds = lambda: 100.0 - (BAG_LOOP_BACKJUMP_S + 1.0)
+        node.control_cycle()
+
+        assert node.runtime is not before          # 어댑터를 새로 만들었다
+        assert node.runtime.fsm.state is Mode.CONE_DRIVE
+        assert node.box_size == 0.0
+        assert node.side_right == float("inf")
+        assert node._zone_exit_sent is False
+    finally:
+        rclpy.shutdown()
+
+
+def test_small_backward_jitter_does_not_reset():
+    """실차 wall clock의 미세 역행(NTP 보정)은 리셋 트리거가 아니다."""
+    import rclpy
+    from main.main import MainNode
+    from main.race_fsm import Mode
+
+    rclpy.init(args=['--ros-args', '-p', 'mode:=3'])
+    try:
+        node = MainNode()
+        node.runtime.fsm.state = Mode.OVERTAKE
+        before = node.runtime
+
+        node._now_seconds = lambda: 100.0
+        node.control_cycle()
+        node._now_seconds = lambda: 99.9      # 0.1초 역행
+        node.control_cycle()
+
+        assert node.runtime is before
+    finally:
+        rclpy.shutdown()
+
+
+def _node_in_overtake(**overrides):
+    import rclpy
+    from main.main import MainNode
+    from main.race_fsm import Mode
+    node = MainNode()
+    node.runtime.fsm.state = Mode.OVERTAKE
+    node._enter_zone(0.0)
+    for k, v in overrides.items():
+        setattr(node, k, v)
+    return node
+
+
+def test_is_pass_comp_delegates_to_the_pure_guard():
+    """판정 로직은 main.overtake가 갖고, 노드는 배선만 한다."""
+    import rclpy
+    from main.main import MainNode
+    from main.race_fsm import Mode
+
+    rclpy.init(args=['--ros-args', '-p', 'mode:=3'])
+    try:
+        node = MainNode()
+        node.runtime.fsm.state = Mode.OVERTAKE
+        node._enter_zone(0.0)
+        node.detected_lane = 1            # 1차선(왼쪽) 주행 → 오른쪽을 본다
+        # bag 실측 통과 거리(0.26~0.34 m) 안쪽 값. side_detect_m 미만이어야 한다.
+        node.side_right = 0.30
+
+        delay = node.overtake.config.pass_delay_s
+        assert node.is_pass_comp(1.0) is False
+        assert node.overtake.side_seen_at == 1.0
+        assert node.is_pass_comp(1.0 + delay) is True
+    finally:
+        rclpy.shutdown()
+
+
+def test_is_change_end_follows_lane_change_state_feedback():
+    import rclpy
+
+    rclpy.init(args=['--ros-args', '-p', 'mode:=3'])
+    try:
+        node = _node_in_overtake()
+        assert node.is_change_end() is False
+        node.runtime.lane_action.completed = True
+        assert node.is_change_end() is True
+    finally:
+        rclpy.shutdown()
+
+
+class ShapeHarness:
+    """_shape_selected_control 만 떼어 보기 위한 최소 상태."""
+
+    def __init__(self, *, now_speed=0.0, now_angle=0.0, race_started_at=None):
+        self.runtime = SimpleNamespace(
+            context=RaceContext(race_started_at=race_started_at),
+        )
+        self.now_speed = now_speed
+        self.now_angle = now_angle
+
+
+def test_stop_source_ramps_speed_down_and_holds_the_steering_angle():
+    """인지 한 프레임 공백이 완전 정지로 번지지 않게 램프로 감속한다.
+
+    예전에는 ControlSource.STOP 이면 속도를 즉시 0으로, 조향을 0으로 꺾었다.
+    재가속이 사이클당 +0.1(=5/초)이라 21.5까지 4초 넘게 걸렸고, 그 전에 다음
+    stale 이 와서 차가 앞으로 못 나갔다 (실측 평균 속도 2.24).
+    """
+    from main.control_selector import ControlSource, DriveCommand
+    from main.main import MainNode, STOP_DECEL_STEP
+
+    harness = ShapeHarness(now_speed=21.5, now_angle=12.0)
+
+    angle, speed = MainNode._shape_selected_control(
+        harness,
+        ControlSource.STOP,
+        DriveCommand(0.0, 0.0),
+        1.0,
+    )
+
+    assert speed == pytest.approx(21.5 - STOP_DECEL_STEP)
+    # 곡선 주행 중 앞바퀴를 펴면 감속하는 동안 코스 밖으로 밀려난다.
+    assert angle == pytest.approx(12.0)
+
+
+def test_stop_source_still_reaches_a_full_stop_quickly():
+    from main.control_selector import ControlSource, DriveCommand
+    from main.main import MainNode
+
+    harness = ShapeHarness(now_speed=21.5)
+
+    speed = 21.5
+    cycles = 0
+    while speed > 0.0 and cycles < 200:
+        _, speed = MainNode._shape_selected_control(
+            harness,
+            ControlSource.STOP,
+            DriveCommand(0.0, 0.0),
+            1.0,
+        )
+        cycles += 1
+
+    assert speed == 0.0
+    assert cycles <= 40          # 50 Hz 기준 0.8초 이내
+
+
+def test_lane_source_recovers_cruise_speed_in_about_one_second():
+    from main.control_selector import ControlSource, DriveCommand
+    from main.main import MainNode
+
+    harness = ShapeHarness()
+
+    speed = 0.0
+    cycles = 0
+    while speed < 21.5 and cycles < 500:
+        _, speed = MainNode._shape_selected_control(
+            harness,
+            ControlSource.LANE,
+            DriveCommand(3.0, 21.5),
+            1.0,
+        )
+        cycles += 1
+
+    assert speed == pytest.approx(21.5)
+    assert cycles <= 60          # 50 Hz 기준 1.2초 이내
+
+
+@pytest.mark.parametrize(
+    ("code", "green"),
+    [(0, False), (1, False), (2, True), (3, True)],
+)
+def test_traffic_callback_maps_int32_signal_codes_to_green(code, green):
+    """0=미검출, 1=적색/주황, 2=녹색, 3=좌회전 녹색 (traffic_node.infer)."""
+    from main.main import MainNode
+
+    harness = CallbackHarness([7.0], mode=Mode.WAIT_GREEN)
+
+    MainNode.traffic_callback(harness, SimpleNamespace(data=code))
+    cycle = harness.runtime.step(7.01)
+
+    assert harness.traffic_signal == code
+    assert cycle.observation.green_detected is green
+    assert cycle.observation.traffic_message_received_at == 7.0

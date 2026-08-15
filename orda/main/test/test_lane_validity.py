@@ -44,7 +44,7 @@ def test_rejoin_requires_three_fresh_validity_edges_and_duration():
     assert first.changed is False
     assert second.changed is False
     assert third.source is Mode.REJOIN
-    assert third.target is Mode.FIXED_AVOID
+    assert third.target is Mode.LANE_DRIVE
     assert third.reason == "fresh lane validity confirmed"
     assert context.state_entered_at == 1.31
 
@@ -68,7 +68,7 @@ def test_no_lane_validity_publisher_keeps_rejoin_and_selects_stop():
     assert result.control.command == DriveCommand(0.0, 0.0)
 
 
-def test_rejoin_stops_until_commit_then_enters_fixed_avoid():
+def test_legacy_rejoin_stops_until_commit_then_enters_lane():
     fsm = RaceFSM(initial_state=Mode.REJOIN)
     context = RaceContext(state_entered_at=1.0)
     selector = ControlSelector()
@@ -93,13 +93,14 @@ def test_rejoin_stops_until_commit_then_enters_fixed_avoid():
         lane=lane_candidate(1.31),
     )
 
-    assert committed.transition.target is Mode.FIXED_AVOID
-    assert committed.control.source is ControlSource.STOP
-    assert committed.control.command == DriveCommand(0.0, 0.0)
+    assert committed.transition.target is Mode.LANE_DRIVE
+    assert committed.control.source is ControlSource.LANE
+    assert committed.control.command == DriveCommand(2.0, 5.0)
 
 
-@pytest.mark.parametrize("candidate", [None, lane_candidate(1.0)])
-def test_rejoin_to_fixed_avoid_without_authorization_selects_stop(candidate):
+# 0.4초 수신은 now=1.31 기준 0.91초 전이라 max_lane_age_s(0.8)를 넘는다.
+@pytest.mark.parametrize("candidate", [None, lane_candidate(0.4)])
+def test_rejoin_to_lane_without_fresh_lane_command_selects_stop(candidate):
     config = LaneValidityConfig(min_messages=1, min_duration_s=0.0)
     fsm = RaceFSM(
         initial_state=Mode.REJOIN,
@@ -116,7 +117,7 @@ def test_rejoin_to_fixed_avoid_without_authorization_selects_stop(candidate):
         lane=candidate,
     )
 
-    assert committed.transition.target is Mode.FIXED_AVOID
+    assert committed.transition.target is Mode.LANE_DRIVE
     assert committed.control.source is ControlSource.STOP
     assert committed.control.command == DriveCommand(0.0, 0.0)
 
@@ -220,7 +221,7 @@ def test_rejoin_guard_rearms_for_a_later_normal_lap():
     context = RaceContext(state_entered_at=1.0)
     for timestamp in (1.1, 1.2, 1.31):
         first = fsm.step(observation(timestamp, True, timestamp), context, safe())
-    assert first.target is Mode.FIXED_AVOID
+    assert first.target is Mode.LANE_DRIVE
 
     fsm.state = Mode.REJOIN
     context.state_entered_at = 2.0
@@ -229,7 +230,7 @@ def test_rejoin_guard_rearms_for_a_later_normal_lap():
         assert second.changed is False
     second = fsm.step(observation(2.31, True, 2.31), context, safe())
 
-    assert second.target is Mode.FIXED_AVOID
+    assert second.target is Mode.LANE_DRIVE
     assert context.state_entered_at == 2.31
 
 

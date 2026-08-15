@@ -34,7 +34,7 @@ git clone https://github.com/doldolmeng2/2026-kookmin-contest.git .
 ```
 
 - **2·3바퀴에서도 신호등이 정지 신호(`1`)면 정지한다.** 신호 준수는 바퀴와 무관하다.
-  다만 `WAIT_GREEN` 모드는 **출발 시 한 번만 사용하고 재진입하지 않는다.**
+  다만 `WAIT_TRAFFIC` 모드는 **출발 시 한 번만 사용하고 재진입하지 않는다.**
   2·3바퀴의 정지는 모드 전환 없이 **제어 계층의 정지 오버라이드**로 처리한다
   (`/traffic_detection == 1` → `speed = 0`, 신호가 `2`/`3` 으로 바뀌면 즉시 해제).
 - **S커브 구간은 모든 바퀴가 통과한다.** 지름길을 타든 안 타든 결승선 직전에 반드시 지난다.
@@ -177,18 +177,25 @@ main/main/
          /lane_change_state             (std_msgs/Int32MultiArray)        [유지]
          [변경중, 성공여부]
 
-  object_node
-    sub: /scan, /resized_image, /lane_fit
-    pub: /object_info                   (std_msgs/Float32MultiArray, 11 필드) [변경]
+  object_yolo_node (Python ONNX Runtime)
+    sub: /resized_image
+    pub: /object_yolo                  (std_msgs/Float32MultiArray, 10 필드)
+         [detected, object_type, confidence, box_size, box_cx, box_cy,
+          box_x, box_y, box_w, box_h]
+
+  object_node (C++ LiDAR/차선 융합)
+    sub: /scan, /resized_image, /lane_fit, /object_yolo
+    pub: /object_info                   (std_msgs/Float32MultiArray, 12 필드) [변경]
          [exists, min_dist, angle, span, cluster_size,
-          box_size, box_cx, box_cy, dx, car_lane, is_moving]
+          box_size, box_cx, box_cy, dx, car_lane, object_type, confidence]
          car_lane : 0=중앙, 1=왼쪽, 2=오른쪽
-         is_moving: 0=고정장애물, 1=방해차량      ← 11번째 필드 신설
+         object_type: -1=미확정, 0=고정장애물, 1=방해차량
 
 [제어]
   main_node
     sub: /rubbercone_info, /lane_offset, /lane_change_state, /object_info,
-         /traffic_detection, /imu, /joy, /xycar_ultrasonic
+         /traffic_detection, /road_surface, /scan, /imu, /joy,
+         /xycar_ultrasonic
     pub: /xycar_motor                   (std_msgs/Float32MultiArray)      [유지]
          [angle, speed]
          /mode_info                     (std_msgs/Int32MultiArray)        [현재 호환]
@@ -200,14 +207,35 @@ main/main/
 | 토픽 | 변경 내용 | 사유 |
 |---|---|---|
 | `/traffic_detection` | `Bool` → `Int32` (4상태) | 4구 신호등의 좌회전 화살표를 구분해야 지름길 판단이 가능 |
-| `/object_info` | `is_moving` 필드 추가 | 고정장애물 회피와 방해차량 추월은 **규칙이 다른 별개 미션** (추월 중에는 차선 이탈이 허용됨) |
+| `/object_info` | `object_type`, `confidence` 필드 추가 | 고정장애물 회피와 방해차량 추월을 별개 미션으로 진입시킴 |
+| `/road_surface` | `Int32` 신설 (`0` 미확정, `1` 기본 검은 도로, `2` 흰 지름길) | 지름길을 실제로 본 뒤 기본 도로가 연속 인식될 때만 종료 |
 | `/mode_info` | 현재 `[legacy_mode_code, lane]` 유지 | 실제 소비자인 `lane_detection.cpp`가 아직 3=차선주행, 5=차선변경 계약을 사용한다. 4필드 신규 계약은 소비자 변경 전까지 발행하지 않는다. |
 
-`car_lane` 과 `lane_target` 은 **같은 정수 규약(0=중앙, 1=왼쪽, 2=오른쪽)** 을 쓴다.
+`car_lane` · `lane_target` · `/lane_position` 은 **같은 정수 규약(0=중앙, 1=왼쪽, 2=오른쪽)** 을
+쓴다. `/lane_position` 만 미확정을 뜻하는 `-1` 을 추가로 쓴다.
 방해차량이 있는 쪽의 반대편을 추월 방향으로 그대로 뒤집어 쓸 수 있게 하기 위함이다.
 
 > `Int32MultiArray` 의 인덱스 의미는 이 문서뿐 아니라 **코드 내 상수로도 정의한다.**
 > 문서에만 존재하는 인덱스 규약은 배선 실수의 주된 원인이 된다.
+
+#### 고정장애물 YOLO 모델 (`best.onnx`)
+
+고정장애물(빨간 차량)을 검출하도록 재학습했다. 학습 데이터는 `rosbag2_fixed_obstacles_*`
+6개에서 뽑은 658장(박스 463개 + 차량이 없는 프레임 200장)이다. 차량이 없는 프레임의
+빈 라벨은 배경 오검출을 줄이는 negative 샘플이므로 반드시 포함한다.
+
+- 현재 포함 모델은 단일 클래스 `obstacle_car`, 입력 640 고정 → 출력 `(1, 5, 8400)`이다.
+  후처리는 Python ONNX Runtime으로 옮겼고 `(1,C,N)`/`(1,N,C)` 및 동적 클래스 수를
+  처리한다. 다중 클래스 모델을 넣을 때는 런치 파라미터 `fixed_class_ids`와
+  `moving_class_ids`만 실제 학습 라벨 순서에 맞춘다.
+- 검증 성능 mAP50 0.995 / precision 0.999 / recall 1.000
+- 전처리는 **레터박스**(비율 유지 + 회색 114 패딩)를 쓴다. 640×360 원본을 640×640으로
+  늘리면 세로가 1.78배 왜곡되는데 YOLOv8 은 레터박스로 학습되므로 어긋난다.
+  검증용 bag 기준 conf ≥ 0.5 검출률이 82.3% → 98.1% 로 올랐다.
+- `conf_threshold_ = 0.50`. 검출 가능한 프레임의 99%를 잡고, 차량이 없는 프레임의
+  오검출은 conf 0.05 에서도 0이었다.
+
+재학습 절차와 도구는 `object_detection/tools/TRAINING.md` 에 있다.
 
 #### 정지 신호(`1`) 오검출 주의
 
@@ -240,18 +268,54 @@ main/main/
 |---|---|---|---|
 | 신호등 → 라바콘 진입 | `LANE_DRIVE` | 0 (중앙) | 실선 이탈 위험 최소화 |
 | 라바콘 | `CONE_DRIVE` | — | 라이다 경로를 따름 |
-| 라바콘 종료 → 차선 재합류 | `REJOIN` → `LANE_DRIVE` | 0 (중앙) | fresh 차선 유효성 확인 뒤 정상 차선 주행 복귀 |
-| 고정장애물 구간 | `FIXED_AVOID` | 미확정 | 별도의 고정장애물 진입 event 계약이 아직 없음 |
-| 고정장애물 통과 → 추월 완료 | `OVERTAKE` | **직전 차선 유지** | 불필요한 차선 변경을 줄임. 방해차량 차선은 어차피 랜덤 |
-| 추월 완료 → 결승선 (S커브 포함) | `LANE_DRIVE` | 0 (중앙) | S커브 코너링에 유리 |
+| 라바콘 종료 | `CONE_DRIVE` → `LANE_DRIVE` | 진입 전 차선 유지 | `REJOIN`은 production 경로에서 사용하지 않음 |
+| 고정장애물 구간 | `FIXED_AVOID` | 장애물 **반대 차선** | 통과 후에도 그 차선을 유지한다 (되돌아오지 않음) |
+| 고정장애물 통과 → 결승선 | `LANE_DRIVE` | 회피한 차선 유지 | 측면 LiDAR clear 뒤 복귀 |
+| 방해차량 구간 | `OVERTAKE` | 방해차량 **반대 차선** | `object_type=1`로 독립 진입 |
+| 추월 완료 → 결승선 | `LANE_DRIVE` | 추월한 차선 유지 | 임의 중앙 복귀 없음 |
+| 지름길 | `SHORTCUT` | 진입 당시 차선 유지 | 차선 조향을 계속 사용하고 CNN 도로 라벨로 종료 |
 
-- 고정장애물이 2차선에 있으면 1차선으로 회피하고, **그대로 1차선에서 방해차량 구간을 시작한다.**
-  회피 후 2차선으로 되돌아오지 않는다.
+- 고정장애물이 2차선에 있으면 1차선으로 회피하고, **그대로 1차선을 유지한다.**
+  회피 후 2차선으로 되돌아오지 않는다. (방해차량 구간이 구현되면 그 차선에서 이어간다.)
 - 추월 방향은 시작 차선과 무관하게 **방해차량이 있는 차선의 반대편**으로 결정한다
   (같은 쪽으로 추월하면 차선 이탈로 간주됨, 규정 p.33).
 
 `main_node` 가 `/mode_info` 의 `lane_target` 으로 목표를 지시하고,
 `lane_node` 가 `/lane_change_state` 로 이동 진행·완료를 보고한다.
+
+#### 센서 역할 분담 (고정장애물 구간)
+
+| 판단 | 사용 센서 | 근거 |
+|---|---|---|
+| 구간 진입 | 카메라 (`box_size` > 1900px²) | — |
+| 회피 방향 | 카메라 (`car_lane`) | 아래 참조 |
+| 추월 완료 | 측면 LiDAR (`side_left`/`side_right`) | 옆을 지나간 사실은 카메라로 볼 수 없다 |
+
+회피 방향은 예전에 LiDAR 기반 `exists` 를 먼저 요구했다. 구간 진입은 카메라로 하면서
+방향 결정만 LiDAR에 걸어둔 비대칭이라, 카메라가 방해차량을 또렷이 보는데도 회피가
+시작되지 않았다. `rosbag2_fixed_obstacles_overtake_1` 실측에서 방해차량이 대부분 2 m
+밖이라 `range_max_m`(2.0)에 걸려 전방 클러스터가 103 스캔 중 1번만 형성됐고,
+`exists` 가 1810 샘플 내내 0이었다. 같은 구간에서 카메라는 박스 최대 10,549 px²,
+`car_lane=1` 을 안정적으로 냈다. 지금은 카메라 산출물(`box_size`, `car_lane`)만으로
+방향을 정한다.
+
+박스는 있는데 좌/우가 미확정(`car_lane=0`)이면 현재 차선을 유지하며 다음 fresh
+카메라 증거를 기다린다. 한 프레임의 반전으로 방향을 바꾸지 않고 연속 합의를 통과한
+`car_lane`만 목표 차선에 반영한다.
+
+**추월 완료 판정** (`main/overtake.py`)
+
+- 회피로 옮겨간 차선의 **반대편**만 감시한다 (1차선 주행 → 오른쪽, 2차선 주행 → 왼쪽).
+  기준은 실측 차선(`/lane_position`) 우선, 미확정이면 `lane_target` 으로 폴백.
+- 측면 60~100° 섹터의 최소 거리가 `side_detect_m`(0.40 m) 미만인 것을 먼저 확인한다.
+  그 장애물이 **사라진 뒤** `pass_delay_s`(2.0초) 동안 연속으로 비어 있어야 완료한다.
+  중간에 다시 잡히면 clear 타이머를 초기화한다.
+- `zone_timeout_s`(12초)는 이상 경고용이다. 측면 통과 증거가 없는데 시간만 지났다는
+  이유로 `LANE_DRIVE`로 복귀하지 않는 fail-closed 정책이다.
+
+`side_detect_m` 은 고정장애물 bag 6개 실측으로 정했다. 통과 순간 감시 측면의 최소거리가
+**0.26~0.34 m**, 벽·빈 차선은 **0.60 m 이상**이다. 0.60 이었을 때는 구간 진입 1초 만에
+0.59 m로 걸려 회피 차선 변경이 끝나기 전에 완료 카운트다운이 시작됐다.
 
 > ⚠️ 방해차량은 **1차선과 2차선을 오가며 주행한다**(규정 p.32). `car_lane` 은 한 번 읽고
 > 마는 값이 아니라 추월 직전까지 계속 갱신해야 하며, 접근 중에 방해차량이 차선을 바꾸면
@@ -261,54 +325,48 @@ main/main/
 
 ## 주행 상태 머신 (main_node)
 
-내부 상태는 문자열 값의 `race_fsm.Mode` 로 정의하며 외부 숫자와 직접 동일시하지
-않는다. 현재 `/mode_info`의 유일한 실제 subscriber인 `lane_detection.cpp`가 legacy
-숫자를 사용하므로 `main.mode_info`의 명시적 adapter를 거쳐 아래처럼 발행한다.
-미확정 상태는 새 숫자를 만들지 않고 외부 STOP 코드 0을 발행한다.
+내부 상태는 `race_fsm.Mode`로 유지하지만 런치 입력은 번호를 우선 사용한다.
+`mode`: `0=INIT, 1=WAIT_TRAFFIC, 2=LANE_DRIVE, 3=CONE_DRIVE,
+4=FIXED_AVOID, 5=OVERTAKE, 6=SHORTCUT, 7=FINISH, 8=STOP`.
+`/mode_info`는 `lane_detection.cpp`의 기존 숫자 계약으로 별도 변환한다.
 
 | 내부 모드 | 현재 외부 값 | 설명 | 전이 조건 |
 |---|---:|---|---|
 | `INIT` | 0 (STOP) | 입력 대기 | 필수 입력 수신 |
-| `WAIT_GREEN` | 0 (STOP) | 신호등 앞 정지, 출발 대기 | `/traffic_detection` Bool 디바운스 |
+| `WAIT_TRAFFIC` | 0 (STOP) | 신호등 앞 정지, 출발 대기 | `/traffic_detection` Int32 디바운스 |
 | `LANE_DRIVE` | 3 | 차선 주행 (기본 중앙 주행) | 아래 분기 참조 |
 | `CONE_DRIVE` | 1 | 라바콘 구간 주행 | fresh `end_flag` 0→1 |
-| `REJOIN` | 2 | 라바콘 종료 후 차선 복귀 대기 | 명시적 차선 유효성 입력 |
-| `FIXED_AVOID` | 기본 0, action 중 5→3 | 고정장애물 구간 | typed zone-exit edge |
-| `OVERTAKE` | 기본 0, action 중 5→3 | 방해차량 구간 | typed overtake-complete edge |
-| `SHORTCUT` | 0 (STOP) | 지름길, production controller 없음 | typed shortcut-complete edge |
+| `REJOIN` | 2 | 옛 bag 호환용이며 production 미사용 | fresh lane-validity → `LANE_DRIVE` |
+| `FIXED_AVOID` | action 중 5, 유지 시 3 | 고정장애물 구간 | 측면 LiDAR seen→clear→hold |
+| `OVERTAKE` | action 중 5, 유지 시 3 | 방해차량 구간 | 측면 LiDAR seen→clear→hold |
+| `SHORTCUT` | 3 | 지름길 차선 주행 | 흰 도로 확인 후 검은 도로 연속 인식 |
 | `FINISH` | 0 (STOP) | 3바퀴 완료 | — |
 | `STOP` | 0 (STOP) | 안전 정지 | — |
 
 ```
-INIT ──(입력 준비)──▶ WAIT_GREEN ──(신호 2 = 직진)──▶ LANE_DRIVE   [시간 측정 시작]
+INIT ──(입력 준비)──▶ WAIT_TRAFFIC ──(신호 2/3)──▶ LANE_DRIVE   [시간 측정 시작]
 
 [확정된 라바콘 흐름]
-LANE_DRIVE ─(라바콘 진입 확정)─▶ CONE_DRIVE ─(end_flag)─▶ REJOIN
-REJOIN      ─(fresh 차선 유효성)▶ LANE_DRIVE               [lane_target = 0]
+LANE_DRIVE ─(라바콘 진입 확정)─▶ CONE_DRIVE ─(end_flag)─▶ LANE_DRIVE
 
-[외부 event 계약 미확정]
-LANE_DRIVE ─(별도 고정장애물 진입 event)─▶ FIXED_AVOID
-FIXED_AVOID ─(고정장애물 통과)───────────▶ OVERTAKE
-OVERTAKE    ─(추월 완료)────────────────▶ LANE_DRIVE
+[장애물 — object_type으로 분리]
+LANE_DRIVE ─(YOLO fixed, 박스 ≥ 1900px²)──▶ FIXED_AVOID ─(LiDAR clear)─▶ LANE_DRIVE
+LANE_DRIVE ─(YOLO moving, 박스 ≥ 1900px²)─▶ OVERTAKE    ─(LiDAR clear)─▶ LANE_DRIVE
 
 [지름길 / 종료]
-LANE_DRIVE ─(신호 3 & lap∈{2,3} & !shortcut_used)─▶ SHORTCUT ─▶ LANE_DRIVE
+LANE_DRIVE ─(신호 3 & lap∈{2,3} & !shortcut_used)─▶ SHORTCUT
+SHORTCUT ─(흰 지름길 확인 후 검은 도로 연속 인식)─▶ LANE_DRIVE
 LANE_DRIVE ─(3바퀴 완료)─▶ FINISH
 
 (모든 상태) ─(안전 조건 위반)─▶ STOP
 ```
 
-- `FIXED_AVOID` 와 `OVERTAKE` 는 **순간적인 회피 동작이 아니라 구간(zone)** 이다.
-  다만 `REJOIN` 성공은 `LANE_DRIVE` 복귀만 의미하며 `FIXED_AVOID` 진입 증거가 아니다.
-  고정장애물 진입 publisher/topic/type 계약이 확정될 때까지 `FIXED_AVOID` 는 runtime에서
-  도달 불가능한 외부 blocker로 유지한다.
-- 구간 안에서 실제 회피/추월 동작을 할지는 `/object_info` 로 판단하며,
-  `is_moving` 은 **회피 규칙을 고르는 데 쓴다** (추월 중에는 차선 이탈이 허용되지만
-  고정장애물 회피는 그렇지 않다). 구간 진입 조건이 아니다.
-- **구간이 끝나지 않을 때의 탈출 경로가 필요하다.** 고정장애물이 미검출되거나 방해차량을
-  그 바퀴에 만나지 못하면 이벤트가 오지 않아 다음 구간으로 넘어가지 못한다.
-  각 구간에 시간 상한을 두고, 초과하면 다음 구간으로 진행한다.
-  랩 경계(결승선 통과)에서는 조건 없이 `LANE_DRIVE` + `lane_target = 0` 으로 초기화한다.
+- `FIXED_AVOID`와 `OVERTAKE`는 순간 동작이 아니라 독립 구간이다. 둘 다 완료 후
+  피한 차선을 그대로 유지하며, 서로를 자동으로 연쇄하지 않는다.
+- 장애물 타입은 `/object_info[10]`으로 결정한다. 실제 다중 클래스 모델을 교체할 때
+  `fixed_class_ids`/`moving_class_ids` 매핑을 학습 라벨 순서와 맞춰야 한다.
+- 시간 초과는 경고만 남긴다. 측면에서 장애물을 본 뒤 사라졌다는 증거가 없으면
+  상태를 유지해 장애물 앞에서 일반 차선 주행으로 잘못 복귀하지 않는다.
 
 - 좌회전 신호(`3`)를 인식하면 **조건 없이 즉시 `SHORTCUT` 으로 전이한다.**
   신호가 나오는 바퀴는 랜덤이고 기회는 한 번뿐이므로, 직진을 선택하는 분기는 두지 않는다.
@@ -347,6 +405,11 @@ LANE_DRIVE ─(3바퀴 완료)─▶ FINISH
 # 전체 시스템 (실차)
 ros2 launch main module_drive.py
 
+# 번호 기반 구간 테스트 (기본값은 motor 격리)
+# 1=wait, 2=lane_center, 3=lane_1, 4=lane_2,
+# 5=cone, 6=fixed, 7=overtake, 8=shortcut
+ros2 launch main module_drive_mission_test.py test_profile:=2 live_drive:=false
+
 # bag 파일 테스트
 ros2 launch main module_drive_bag_test.py
 
@@ -368,6 +431,16 @@ colcon test --packages-select main
 python3 -m main.tools.replay_fsm_bag <bag_path>
 ```
 
+`object_detection/tools/` 에 YOLO 재학습 파이프라인이 있다. 절차는
+`object_detection/tools/TRAINING.md` 참조.
+
+```bash
+# 노드와 동일한 전처리로 모델의 프레임별 신뢰도 분포를 측정
+g++ -O2 -std=c++17 measure_conf.cpp -o /tmp/measure_conf \
+    -I/usr/local/include/opencv4 -L/usr/local/lib -Wl,-rpath,/usr/local/lib \
+    -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_dnn
+```
+
 ---
 
 ## 작업 현황
@@ -375,25 +448,30 @@ python3 -m main.tools.replay_fsm_bag <bag_path>
 | 패키지 / 모듈 | 상태 | 비고 |
 |---|---|---|
 | `image_resize` | 유지 | 카메라 동일, 변경 없음 |
-| `lane_detection` | 유지 | 코스 동일. `lane_detection_parameter.json` 그대로 사용 |
+| `lane_detection` | 수정 | 차선 위치/변경 상태 계약 및 파라미터 병합 |
 | `rubbercone` | 수정중 | 라바콘 시작 지점 다름 |
-| `object_detection` | 수정 | YOLO 모델(`best.onnx`) 유지, `is_moving` 분류 추가 |
+| `object_detection` | 수정 | ONNX Runtime, 동적 클래스 디코더, `object_type`/confidence 계약 |
 | `traffic_light` | 재작성 | 초록 Bool → 4구 신호등 4상태 |
 | `main/main.py` | 재작성 | 옛 정수 FSM 폐기, 순수 모듈 계층 배선으로 교체 |
-| `main` 로직 모듈 | 진행 중 | FSM 전이 일부 미구현 (아래 참조) |
+| `main` 로직 모듈 | 구현 | WAIT/차선 3종/fixed/overtake/shortcut/lap/FINISH 및 단위 테스트 |
 | `manual_drive`, `sensors_viewer` | 유지 | 하드웨어 동일 |
 
 ### 미해결 항목
 
-- 10상태 순수 FSM 전이는 구현됨. fixed-zone, route traffic, overtake-complete,
-  shortcut-complete는 typed internal contract와 test injection만 있고 production publisher는 없음
-- `shortcut_turn.py` 미작성 (지름길 좌회전 궤적)
-- `completed_laps`/`shortcut_lap` 랩 정책은 구현됨. 실제 traffic encounter publisher는 없음
+- 현재 포함된 장애물 `best.onnx`는 단일 클래스다. 방해차량 자동 진입까지 쓰려면 팀의
+  다중 클래스 모델과 정확한 `fixed_class_ids`/`moving_class_ids` 매핑을 넣어야 한다.
+- 지름길 종료 가드와 `/road_surface` 구독 계약은 구현됐지만, 학습 중인 CNN publisher와
+  모델은 이 저장소에 아직 없다. publisher가 `2(흰 지름길) → 1(검은 기본 도로)`을
+  내야 자동 복귀가 완성된다.
 - 시간 제한 감시는 현재 `SafetyMonitor` 기본값(라바콘 60초 / 전체 240초)으로 동작한다.
   이는 2026-07-29 「제9회 경주 진행 방법」 p.25와 p.37의 공식 제한이다. 전체 주행시간은
   p.17에 따라 파란불의 첫 fresh 관측 시각부터 계산하며, debounce 완료 시각으로 늦추지 않는다.
-- `STOP` 이 종료 상태로만 정의되어 있어, 복귀 가능한 감속 정책 필요
-- YOLO 모델이 고정장애물(고장난 차량)까지 검출하는지 미확인 —
-  미검출 시 LiDAR 클러스터 보완 또는 재학습 필요
+- `STOP`은 입력이 0.5초 연속 회복되면 정지 직전 모드로 복귀한다. `FINISH`만 종료 상태다.
+- **`rubbercone_node` 가 라바콘이 없는 구간에서 벽·장비를 콘으로 오인한다.**
+  고정장애물 bag 실측에서 `confidence ≥ 75` 가 7회, 그중 5회 연속으로 나와
+  진입 조건(75 이상 3회 연속, 0.2초)을 통과했고 FSM 이 `LANE_DRIVE → CONE_DRIVE`
+  로 새버렸다. `cone_entry.py` 주석대로 네거티브 bag 으로 임계값 재검증이 필요하다.
+  고정장애물 bag 6개가 그 네거티브 데이터가 된다. 그때까지 고정장애물 시나리오를
+  검증할 때는 `rubbercone_node` 를 띄우지 않는다 (아래 실행 방법 참조).
 
 ---

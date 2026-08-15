@@ -26,7 +26,7 @@ def cone_observation(timestamp, confidence=90, end_flag=False):
 def test_mode_set_matches_2026_skeleton():
     assert [(mode.name, mode.value) for mode in Mode] == [
         ("INIT", "INIT"),
-        ("WAIT_GREEN", "WAIT_GREEN"),
+        ("WAIT_TRAFFIC", "WAIT_TRAFFIC"),
         ("LANE_DRIVE", "LANE_DRIVE"),
         ("CONE_DRIVE", "CONE_DRIVE"),
         ("REJOIN", "REJOIN"),
@@ -43,7 +43,7 @@ def test_mode_set_matches_2026_skeleton():
 def test_mode_values_are_exact_strings():
     assert [mode.value for mode in Mode] == [
         "INIT",
-        "WAIT_GREEN",
+        "WAIT_TRAFFIC",
         "LANE_DRIVE",
         "CONE_DRIVE",
         "REJOIN",
@@ -261,7 +261,7 @@ def test_lane_self_transition_preserves_state_and_cone_entry_times():
     assert context.cone_entered_at == 1.0
 
 
-def test_fresh_zero_then_separate_one_enters_rejoin_and_updates_entry_time():
+def test_fresh_zero_then_separate_one_returns_to_lane_and_updates_entry_time():
     fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
     context = RaceContext(state_entered_at=1.0, cone_entered_at=0.5)
 
@@ -279,7 +279,7 @@ def test_fresh_zero_then_separate_one_enters_rejoin_and_updates_entry_time():
     assert arming.changed is False
     assert arming.reason == "cone exit session armed"
     assert transition.source is Mode.CONE_DRIVE
-    assert transition.target is Mode.REJOIN
+    assert transition.target is Mode.LANE_DRIVE
     assert transition.reason == "fresh cone end flag"
     assert context.state_entered_at == 1.2
     assert fsm.cone_exit_armed is False
@@ -486,7 +486,7 @@ def test_safety_stop_has_priority_over_cone_session_evidence(end_flag):
     assert fsm.cone_exit_armed is False
 
 
-def test_cone_entry_latch_is_rearmed_after_rejoin_commit():
+def test_cone_entry_latch_is_rearmed_after_direct_lane_return():
     fsm = RaceFSM(initial_state=Mode.LANE_DRIVE)
     context = RaceContext(state_entered_at=0.0)
 
@@ -505,7 +505,7 @@ def test_cone_entry_latch_is_rearmed_after_rejoin_commit():
     )
 
     assert old_latched_one.changed is False
-    assert exit_transition.target is Mode.REJOIN
+    assert exit_transition.target is Mode.LANE_DRIVE
     assert fsm.cone_entry_guard.triggered is False
 
     # Stand in for the later mission chain, which is intentionally outside
@@ -535,7 +535,7 @@ def test_cone_entry_latch_is_rearmed_after_rejoin_commit():
 
     assert second_old_one.changed is False
     assert second_exit.source is Mode.CONE_DRIVE
-    assert second_exit.target is Mode.REJOIN
+    assert second_exit.target is Mode.LANE_DRIVE
     assert context.state_entered_at == 2.5
 
 
@@ -630,3 +630,68 @@ def test_legacy_unwired_mission_fields_do_not_invent_transitions(state):
     assert context.state_entered_at == 10.0
     assert context.finish_gate_passes == 1
     assert context.last_gate_event_at == 9.0
+
+
+def test_stop_returns_to_the_mode_it_stopped_from_after_hold():
+    """센서가 회복되면 정지 직전 구간으로 복귀한다."""
+    fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
+    context = RaceContext(state_entered_at=0.0)
+
+    stop = fsm.step(
+        MissionObservation(now=1.0),
+        context,
+        SafetyDecision(must_stop=True, reason="stale required inputs: sensor:scan"),
+    )
+    assert stop.target is Mode.STOP
+
+    healthy = SafetyDecision(must_stop=False, inputs_ready=True)
+    # 안정화 대기 시간(0.5s) 전에는 아직 복귀하지 않는다
+    assert fsm.step(MissionObservation(now=1.1), context, healthy).changed is False
+    assert fsm.step(MissionObservation(now=1.4), context, healthy).changed is False
+
+    resumed = fsm.step(MissionObservation(now=1.7), context, healthy)
+    assert resumed.target is Mode.CONE_DRIVE
+    assert context.stop_reason is None
+
+
+def test_stop_does_not_recover_while_inputs_are_still_missing():
+    fsm = RaceFSM(initial_state=Mode.LANE_DRIVE)
+    context = RaceContext(state_entered_at=0.0)
+    fsm.step(
+        MissionObservation(now=1.0),
+        context,
+        SafetyDecision(must_stop=True, reason="fault"),
+    )
+
+    unhealthy = SafetyDecision(must_stop=False, inputs_ready=False)
+    for now in (1.2, 2.0, 5.0):
+        assert fsm.step(MissionObservation(now=now), context, unhealthy).changed is False
+    assert fsm.state is Mode.STOP
+
+
+def test_flapping_inputs_do_not_bounce_out_of_stop():
+    """입력이 깜빡이면 안정화 타이머가 다시 시작되어 진동하지 않는다."""
+    fsm = RaceFSM(initial_state=Mode.LANE_DRIVE)
+    context = RaceContext(state_entered_at=0.0)
+    fsm.step(
+        MissionObservation(now=0.0),
+        context,
+        SafetyDecision(must_stop=True, reason="fault"),
+    )
+
+    healthy = SafetyDecision(must_stop=False, inputs_ready=True)
+    unhealthy = SafetyDecision(must_stop=False, inputs_ready=False)
+
+    fsm.step(MissionObservation(now=0.1), context, healthy)
+    fsm.step(MissionObservation(now=0.3), context, unhealthy)   # 타이머 리셋
+    assert fsm.step(MissionObservation(now=0.5), context, healthy).changed is False
+    assert fsm.state is Mode.STOP
+
+
+def test_finish_stays_terminal():
+    fsm = RaceFSM(initial_state=Mode.FINISH)
+    context = RaceContext(state_entered_at=0.0)
+    healthy = SafetyDecision(must_stop=False, inputs_ready=True)
+
+    assert fsm.step(MissionObservation(now=5.0), context, healthy).changed is False
+    assert fsm.state is Mode.FINISH

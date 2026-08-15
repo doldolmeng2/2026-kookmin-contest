@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from main.control_selector import ControlSource
-from main.mission_types import RouteTrafficSignal
+from main.mission_types import LaneTarget, RouteTrafficSignal
 from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
@@ -18,9 +18,11 @@ BAG_TEST_LAUNCH = ORDA_ROOT / "main" / "launch" / "module_drive_bag_test.py"
 PRODUCTION_LAUNCH = ORDA_ROOT / "main" / "launch" / "module_drive.py"
 
 PROFILE_MODES = {
+    "wait_traffic": Mode.WAIT_TRAFFIC,
     "lane": Mode.LANE_DRIVE,
+    "lane_one": Mode.LANE_DRIVE,
+    "lane_two": Mode.LANE_DRIVE,
     "cone": Mode.CONE_DRIVE,
-    "rejoin": Mode.REJOIN,
     "fixed": Mode.FIXED_AVOID,
     "overtake": Mode.OVERTAKE,
     "shortcut": Mode.SHORTCUT,
@@ -29,9 +31,9 @@ PROFILE_MODES = {
 COMPLETION_PROFILES = [
     (
         "fixed",
-        "record_fixed_avoid_complete",
+        "record_fixed_zone_exit",
         Mode.FIXED_AVOID,
-        Mode.OVERTAKE,
+        Mode.LANE_DRIVE,
     ),
     (
         "overtake",
@@ -70,7 +72,11 @@ def test_each_named_profile_starts_in_exact_existing_mode(profile):
 
     assert runtime.fsm.state is PROFILE_MODES[profile]
     assert runtime.context.state_entered_at == 10.0
-    assert runtime.context.lane_target == RaceContext().lane_target
+    expected_lane = {
+        "lane_one": LaneTarget.LANE_ONE,
+        "lane_two": LaneTarget.LANE_TWO,
+    }.get(profile, LaneTarget.CENTER)
+    assert runtime.context.lane_target is expected_lane
 
 
 def test_shortcut_profile_bootstraps_self_consistent_lap_context():
@@ -130,7 +136,7 @@ def test_bootstrap_discards_cached_sensor_perception_and_action_state():
         encounter_started=True,
     )
     runtime.record_lane_change_state([1, 1], 9.0)
-    runtime.record_fixed_avoid_complete(9.0)
+    runtime.record_fixed_zone_exit(9.0)
 
     runtime.bootstrap_test_profile("lane", started_at=10.0)
     cycle = runtime.step(10.1)
@@ -142,7 +148,7 @@ def test_bootstrap_discards_cached_sensor_perception_and_action_state():
     assert cycle.observation.traffic_message_received_at is None
     assert cycle.observation.route_traffic_received_at is None
     assert cycle.observation.lane_change_received_at is None
-    assert cycle.observation.fixed_avoid_completed_at is None
+    assert cycle.observation.fixed_zone_exit_received_at is None
     assert runtime.latest_lane_offset is None
     assert runtime.latest_cone_event is None
     assert runtime.latest_object_snapshot is None
@@ -163,35 +169,17 @@ def test_cone_profile_starts_a_new_exit_handshake_session():
     runtime.record_cone_message([0, 0, 90], 10.3)
     armed = runtime.step(10.3)
     runtime.record_cone_message([0, 1, 0], 10.4)
-    rejoin = runtime.step(10.4)
+    lane = runtime.step(10.4)
 
     assert unarmed_end.transition.changed is False
     assert armed.transition.reason == "cone exit session armed"
-    assert rejoin.transition.target is Mode.REJOIN
-
-
-def test_rejoin_profile_requires_a_new_lane_validity_debounce_session():
-    runtime = RaceRuntimeAdapter()
-    runtime.record_lane_validity(True, 9.8)
-    runtime.record_lane_validity(True, 9.9)
-
-    runtime.bootstrap_test_profile("rejoin", started_at=10.0)
-    assert runtime.step(10.0).transition.changed is False
-
-    transitions = []
-    for timestamp in (10.1, 10.2, 10.31):
-        runtime.record_lane_validity(True, timestamp)
-        transitions.append(runtime.step(timestamp).transition)
-
-    assert transitions[0].changed is False
-    assert transitions[1].changed is False
-    assert transitions[2].target is Mode.FIXED_AVOID
+    assert lane.transition.target is Mode.LANE_DRIVE
 
 
 def test_profile_start_does_not_weaken_safety_stop_priority():
     runtime = RaceRuntimeAdapter()
     runtime.bootstrap_test_profile("fixed", started_at=10.0)
-    runtime.record_fixed_avoid_complete(10.1)
+    runtime.record_fixed_zone_exit(10.1)
 
     cycle = runtime.step(10.1, fault_reason="synthetic profile fault")
 
@@ -202,7 +190,7 @@ def test_profile_start_does_not_weaken_safety_stop_priority():
 
 @pytest.mark.parametrize(
     "value",
-    ["", "foobar", "FIXED_AVOID", 0, 4, True, None],
+    ["", "foobar", "FIXED_AVOID", -1, 9, True, None],
 )
 def test_invalid_or_magic_integer_profile_is_rejected(value):
     with pytest.raises(ValueError):
@@ -214,12 +202,14 @@ def test_bag_launch_exposes_profile_without_weakening_motor_isolation():
     production_source = PRODUCTION_LAUNCH.read_text(encoding="utf-8")
 
     assert "DeclareLaunchArgument(\n        'test_profile'" in bag_source
-    assert "default_value='race'" in bag_source
+    assert "default_value='0'" in bag_source
     assert "'test_profile': test_profile" in bag_source
     assert "('xycar_motor', '/bag_test/xycar_motor')" in bag_source
     assert "test_profile" not in production_source
 
 
-def test_profile_parser_accepts_only_named_string_contract():
+def test_profile_parser_accepts_numeric_contract_and_named_compatibility():
     assert parse_test_profile("fixed") is MissionTestProfile.FIXED
     assert parse_test_profile(" OVERTAKE ") is MissionTestProfile.OVERTAKE
+    assert parse_test_profile(3) is MissionTestProfile.LANE_ONE
+    assert parse_test_profile("8") is MissionTestProfile.SHORTCUT

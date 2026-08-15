@@ -22,7 +22,8 @@ _TIMESTAMP_EPSILON_S = 1e-6
 
 class Mode(str, Enum):
     INIT = "INIT"
-    WAIT_GREEN = "WAIT_GREEN"
+    WAIT_TRAFFIC = "WAIT_TRAFFIC"
+    WAIT_GREEN = "WAIT_TRAFFIC"  # compatibility alias
     LANE_DRIVE = "LANE_DRIVE"
     CONE_DRIVE = "CONE_DRIVE"
     REJOIN = "REJOIN"
@@ -86,7 +87,20 @@ class _GreenDebouncer:
 class RaceFSM:
     """Apply the complete ten-state orchestration without ROS side effects."""
 
-    TERMINAL_STATES = frozenset({Mode.FINISH, Mode.STOP})
+    # FINISH만 진짜 종료 상태다. STOP은 "복귀 가능한 안전 정지"다.
+    #
+    # STOP을 종료 상태로 두었더니, 센서가 잠깐만 끊겨도 그대로 주행이 끝났다.
+    # 실제로 세 가지 상황에서 같은 증상이 나왔다:
+    #   - 실차 기동 시 LiDAR 워밍업 (첫 스캔까지 1~2초)
+    #   - bag --loop 재시작 사이의 /scan 공백
+    #   - bag 없이 런치했을 때
+    # 규정상 "정지 후 1분 내 미재개 시 실격"이라 복귀 경로가 반드시 필요하다
+    # (README: 안전 정지는 복귀 가능한 감속을 우선한다).
+    TERMINAL_STATES = frozenset({Mode.FINISH})
+
+    # 입력이 회복된 뒤 이만큼 계속 정상이어야 주행을 재개한다. 입력이 깜빡일 때
+    # STOP과 주행을 오가며 진동하는 것을 막는다.
+    STOP_RECOVERY_HOLD_S = 0.5
 
     def __init__(
         self,
@@ -128,6 +142,9 @@ class RaceFSM:
         self._last_traffic_message_at: Optional[float] = None
         self._last_mission_message_at: dict[str, float] = {}
         self._cone_exit_armed = False
+        # STOP 복귀용: 어느 모드에서 정지했는지, 입력이 언제부터 정상인지
+        self._stop_source: Optional[Mode] = None
+        self._stop_healthy_since: Optional[float] = None
         self.last_cone_entry_decision: Optional[ConeEntryDecision] = None
         self.last_lane_validity_decision: Optional[
             LaneValidityDecision
@@ -168,9 +185,37 @@ class RaceFSM:
             self._cone_entry.deactivate()
             self._lane_validity.deactivate()
             self._cone_exit_armed = False
+            self._stop_healthy_since = None
+            # 정지 직전 모드를 기억해 두었다가 회복되면 그 구간으로 돌아간다.
+            if self.state is not Mode.STOP:
+                self._stop_source = self.state
             return self._change(
                 Mode.STOP,
                 reason,
+                context,
+                observation.now,
+            )
+
+        if self.state is Mode.STOP:
+            # 여기까지 왔다면 must_stop이 풀린 상태다. 다만 입력이 깜빡이는
+            # 동안 곧바로 재개하면 진동하므로, 연속으로 정상인 시간을 요구한다.
+            if not safety.inputs_ready:
+                self._stop_healthy_since = None
+                return self._stay("waiting for safety inputs to recover")
+
+            if self._stop_healthy_since is None:
+                self._stop_healthy_since = observation.now
+            held_s = observation.now - self._stop_healthy_since
+            if held_s < self.STOP_RECOVERY_HOLD_S:
+                return self._stay("holding until safety inputs prove stable")
+
+            target = self._stop_source or Mode.LANE_DRIVE
+            self._stop_source = None
+            self._stop_healthy_since = None
+            context.stop_reason = None
+            return self._change(
+                target,
+                "safety inputs recovered",
                 context,
                 observation.now,
             )
@@ -224,6 +269,44 @@ class RaceFSM:
             if route_transition is not None:
                 return route_transition
 
+            if (
+                not context.on_shortcut_lap
+                and observation.overtake_entered is True
+                and self._accept_mission_edge(
+                    "overtake_entry",
+                    observation.overtake_entry_received_at,
+                    observation,
+                    context,
+                )
+            ):
+                self._cone_entry.deactivate()
+                return self._change(
+                    Mode.OVERTAKE,
+                    "fresh moving-obstacle entry",
+                    context,
+                    observation.now,
+                )
+
+            # Explicit course-zone evidence outranks opportunistic cone
+            # perception. Object detection is deliberately not an entry guard.
+            if (
+                not context.on_shortcut_lap
+                and observation.fixed_zone_entered is True
+                and self._accept_mission_edge(
+                    "fixed_zone_entry",
+                    observation.fixed_zone_entry_received_at,
+                    observation,
+                    context,
+                )
+            ):
+                self._cone_entry.deactivate()
+                return self._change(
+                    Mode.FIXED_AVOID,
+                    "fresh fixed-zone entry",
+                    context,
+                    observation.now,
+                )
+
             if context.on_shortcut_lap:
                 self._cone_entry.deactivate()
                 return self._stay("normal-route missions suppressed on shortcut lap")
@@ -260,7 +343,7 @@ class RaceFSM:
                 self._lane_validity.deactivate()
                 self._cone_exit_armed = False
                 return self._change(
-                    Mode.REJOIN,
+                    Mode.LANE_DRIVE,
                     "fresh cone end flag",
                     context,
                     observation.now,
@@ -276,7 +359,7 @@ class RaceFSM:
             if decision.triggered:
                 self._lane_validity.deactivate()
                 return self._change(
-                    Mode.FIXED_AVOID,
+                    Mode.LANE_DRIVE,
                     "fresh lane validity confirmed",
                     context,
                     observation.now,
@@ -286,6 +369,24 @@ class RaceFSM:
         if self.state is Mode.FIXED_AVOID:
             self._cone_entry.deactivate()
             self._lane_validity.deactivate()
+            if (
+                observation.fixed_zone_exited is True
+                and self._accept_mission_edge(
+                    "fixed_zone_exit",
+                    observation.fixed_zone_exit_received_at,
+                    observation,
+                    context,
+                )
+            ):
+                # 고정장애물 구간이 끝나면 곧바로 차선 주행으로 돌아간다.
+                # OVERTAKE 는 "움직이는 방해차량" 상황용이라 이 경로에서는
+                # 거치지 않는다. 진입 계약이 생기면 그때 연결한다.
+                return self._change(
+                    Mode.LANE_DRIVE,
+                    "fresh fixed-zone exit",
+                    context,
+                    observation.now,
+                )
             if (
                 observation.fixed_avoid_complete is True
                 and self._accept_mission_edge(
@@ -297,11 +398,11 @@ class RaceFSM:
             ):
                 return self._change(
                     Mode.OVERTAKE,
-                    "fresh fixed avoid complete",
+                    "legacy fixed completion chain",
                     context,
                     observation.now,
                 )
-            return self._stay("waiting for fresh fixed avoid complete")
+            return self._stay("waiting for fresh fixed-zone exit")
 
         if self.state is Mode.OVERTAKE:
             self._cone_entry.deactivate()

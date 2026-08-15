@@ -12,12 +12,14 @@ from launch_ros.actions import Node
 
 
 MISSION_TEST_PROFILES = (
-    'lane',
-    'cone',
-    'rejoin',
-    'fixed',
-    'overtake',
-    'shortcut',
+    '1',  # WAIT_TRAFFIC
+    '2',  # LANE_CENTER
+    '3',  # LANE_ONE
+    '4',  # LANE_TWO
+    '5',  # CONE
+    '6',  # FIXED
+    '7',  # OVERTAKE
+    '8',  # SHORTCUT
 )
 
 
@@ -51,9 +53,12 @@ def _is_production_main_node(action):
 def generate_launch_description():
     test_profile_arg = DeclareLaunchArgument(
         'test_profile',
-        default_value='lane',
+        default_value='2',
         choices=MISSION_TEST_PROFILES,
-        description='실차 센서를 사용하는 mission/section 시작 지점',
+        description=(
+            '실차 미션 번호: 1=wait_traffic, 2=lane_center, 3=lane_1, '
+            '4=lane_2, 5=cone, 6=fixed, 7=overtake, 8=shortcut'
+        ),
     )
     live_drive_arg = DeclareLaunchArgument(
         'live_drive',
