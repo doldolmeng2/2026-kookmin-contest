@@ -14,7 +14,7 @@ from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
     RaceRuntimeAdapter,
-    dispatch_cone_reset,
+    dispatch_cone_session_state,
     runtime_safety_monitor,
 )
 
@@ -22,6 +22,10 @@ from main.runtime_adapter import (
 ORDA_ROOT = Path(__file__).resolve().parents[2]
 RUBBERCONE_SOURCE = (
     ORDA_ROOT / "driving" / "rubbercone" / "src" / "rubbercone.cpp"
+)
+RUBBERCONE_SESSION_HEADER = (
+    ORDA_ROOT / "driving" / "rubbercone" / "include" / "rubbercone"
+    / "session_lifecycle.hpp"
 )
 OBJECT_SOURCE = (
     ORDA_ROOT / "perception" / "object_detection" / "src"
@@ -54,9 +58,9 @@ def one_message_entry_runtime():
     )
 
 
-def test_integrated_cone_session_resets_once_then_accepts_fixed_entry():
+def test_integrated_cone_session_activates_once_then_accepts_fixed_entry():
     adapter = one_message_entry_runtime()
-    resets = []
+    phases = []
     adapter.record_scan(1.0)
     adapter.record_cone_message([4, 0, 90], 1.0)
     adapter.record_cone_message([99, 1, 0], 1.01)
@@ -66,17 +70,17 @@ def test_integrated_cone_session_resets_once_then_accepts_fixed_entry():
         lane=candidate(1.0, 5.0, 1.0),
         cone=candidate(-2.0, 8.0, 1.0),
     )
-    dispatch_cone_reset(entered, lambda: resets.append("reset"))
+    dispatch_cone_session_state(entered, phases.append)
     stayed = adapter.step(1.04)
-    dispatch_cone_reset(stayed, lambda: resets.append("duplicate"))
+    dispatch_cone_session_state(stayed, phases.append)
 
     assert entered.transition.target is Mode.CONE_DRIVE
-    assert entered.publish_cone_reset is True
-    assert entered.discarded_pre_reset_events == 1
+    assert entered.cone_session_active_command is True
+    assert entered.discarded_pre_phase_events == 1
     assert adapter.latest_cone_event is None
     assert adapter.pending_cone_event_count == 0
     assert adapter.fsm.cone_exit_armed is False
-    assert resets == ["reset"]
+    assert phases == [True]
 
     adapter.record_cone_message([0, 0, 80], 1.1)
     armed = adapter.step(1.1, cone=candidate(0.0, 8.0, 1.1))
@@ -164,15 +168,15 @@ def test_controller_accepts_only_current_fsm_drive_modes_and_keeps_tuning():
 
 def test_detector_reset_clears_detection_debounce_filter_and_debug_state():
     source = RUBBERCONE_SOURCE.read_text(encoding="utf-8")
+    lifecycle = RUBBERCONE_SESSION_HEADER.read_text(encoding="utf-8")
     reset_body = source.split("void resetSessionState()", 1)[1].split(
-        "void resetCallback", 1
+        "void sessionActiveCallback", 1
+    )[0]
+    tracking_body = source.split("void resetTrackingState()", 1)[1].split(
+        "void resetSessionState", 1
     )[0]
 
     expected_resets = (
-        "valid_frame_count_ = 0;",
-        "missing_frame_count_ = 0;",
-        "cone_section_armed_ = false;",
-        "end_latched_ = false;",
         "adaptive_half_width_ = nominal_half_width_;",
         "filtered_target_y_ = 0.0f;",
         "has_filtered_target_y_ = false;",
@@ -181,10 +185,21 @@ def test_detector_reset_clears_detection_debounce_filter_and_debug_state():
         "rubber_offset_value_ = 0;",
         "rubber_end_value_ = 0;",
         "rubber_confidence_value_ = 0;",
+        "rubber_entry_ready_value_ = 0;",
         "debug_ = DebugSnapshot{};",
     )
     for reset in expected_resets:
-        assert reset in reset_body
+        assert reset in tracking_body
+    assert "session_lifecycle_.manualResetToSearch();" in reset_body
+    assert "resetTrackingState();" in reset_body
+    for reset in (
+        "valid_frame_count_ = 0;",
+        "missing_frame_count_ = 0;",
+        "exit_armed_ = false;",
+        "end_latched_ = false;",
+        "entry_readiness_.reset();",
+    ):
+        assert reset in lifecycle
 
     publish_body = source.split("void publishInfo()", 1)[1].split(
         "extractConeCenters", 1
@@ -192,6 +207,7 @@ def test_detector_reset_clears_detection_debounce_filter_and_debug_state():
     assert "offset_msg.data = {rubber_offset_value_, rubber_end_value_};" in publish_body
     assert "offset_pub_->publish(offset_msg);" in publish_body
     assert "rubber_confidence_value_," in publish_body
+    assert "rubber_entry_ready_value_," in publish_body
     assert "info_pub_->publish(info_msg);" in publish_body
 
 
@@ -213,6 +229,8 @@ def test_object_detector_dual_publishes_official_and_internal_contracts():
     assert "msg->data.size() != 10 && msg->data.size() != 20" in source
     assert "parse_slot(0, 0, fixed)" in source
     assert "parse_slot(10, 1, moving)" in source
+    assert "fixed_lane_stabilizer_.update" in source
+    assert "moving_lane_stabilizer_.update" in source
 
 
 def test_object_class_mapping_is_loaded_from_installed_yaml():

@@ -60,6 +60,12 @@ if(BUILD_TESTING)
   ament_add_gtest(test_lane_change_state_tracker
     test/test_lane_change_state_tracker.cpp)
   target_include_directories(test_lane_change_state_tracker PRIVATE include)
+
+  ament_add_gtest(test_lane_measurement_publication_policy
+    test/test_lane_measurement_publication_policy.cpp)
+  target_include_directories(test_lane_measurement_publication_policy PRIVATE include)
 endif()
+
+install(DIRECTORY include/ DESTINATION include)
 
 ament_package()

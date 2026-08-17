@@ -8,11 +8,6 @@ from enum import Enum
 import math
 from typing import Any, Callable, Deque, Optional, Sequence
 
-from .avoid_direction import (
-    AvoidDirectionConfig,
-    AvoidDirectionDebouncer,
-    AvoidDirectionDecision,
-)
 from .control_selector import (
     CommandCandidate,
     ControlDecision,
@@ -28,6 +23,7 @@ from .mission_types import (
     ObjectType,
     RouteTrafficEvent,
     RouteTrafficSignal,
+    opposite_lane_target,
 )
 from .race_context import RaceContext
 from .race_fsm import Mode, RaceFSM, Transition
@@ -60,7 +56,9 @@ DEFAULT_CONE_EVENT_QUEUE_CAPACITY = 16
 # 수정). 예산은 그 위에 두는 안전망이므로, 실측 p99 + 지터를 덮되 무한정
 # 늘리지는 않는다.
 LANE_OFFSET_MAX_AGE_S = 1.0
+LANE_POSITION_MAX_AGE_S = LANE_OFFSET_MAX_AGE_S
 SCAN_MAX_AGE_S = 0.5
+SIDE_CLEARANCE_MAX_AGE_S = SCAN_MAX_AGE_S
 TRAFFIC_MAX_AGE_S = 0.5
 OBJECT_MAX_AGE_S = 0.6
 
@@ -143,6 +141,7 @@ class ConeMessageEvent:
     offset: int
     end_flag: bool
     confidence: int
+    entry_ready: Optional[bool]
     received_at: float
 
 
@@ -170,6 +169,16 @@ class MissionEdgeEvent:
     received_at: float
 
 
+@dataclass(frozen=True)
+class ObjectEntryEvidence:
+    """Stable lane carried by the exact snapshot that requested a mission."""
+
+    expected_state: Mode
+    lane: ObjectLane
+    object_received_at: float
+    mission_edge_received_at: float
+
+
 @dataclass
 class LaneActionStatus:
     """Action-level state; it deliberately does not add an FSM mode."""
@@ -188,8 +197,8 @@ class RuntimeCycleResult:
     observation: MissionObservation
     safety: SafetyDecision
     fsm_control: ControlCycleResult
-    publish_cone_reset: bool
-    discarded_pre_reset_events: int = 0
+    cone_session_active_command: Optional[bool]
+    discarded_pre_phase_events: int = 0
 
     @property
     def transition(self) -> Transition:
@@ -200,15 +209,15 @@ class RuntimeCycleResult:
         return self.fsm_control.control
 
 
-def dispatch_cone_reset(
+def dispatch_cone_session_state(
     cycle: RuntimeCycleResult,
-    publish_reset: Callable[[], None],
+    publish_state: Callable[[bool], None],
 ) -> bool:
-    """Dispatch one reset command only for a committed cone-entry edge."""
+    """Dispatch one state command for a committed cone-session boundary."""
 
-    if not cycle.publish_cone_reset:
+    if cycle.cone_session_active_command is None:
         return False
-    publish_reset()
+    publish_state(cycle.cone_session_active_command)
     return True
 
 
@@ -288,7 +297,7 @@ class RaceRuntimeAdapter:
         cone_queue_capacity: int = DEFAULT_CONE_EVENT_QUEUE_CAPACITY,
         object_max_age_s: float = OBJECT_MAX_AGE_S,
         lane_change_max_age_s: float = 0.25,
-        avoid_direction_config: Optional[AvoidDirectionConfig] = None,
+        lane_position_max_age_s: float = LANE_POSITION_MAX_AGE_S,
     ) -> None:
         if (
             isinstance(cone_queue_capacity, bool)
@@ -299,6 +308,7 @@ class RaceRuntimeAdapter:
         for name, value in (
             ("object_max_age_s", object_max_age_s),
             ("lane_change_max_age_s", lane_change_max_age_s),
+            ("lane_position_max_age_s", lane_position_max_age_s),
         ):
             if (
                 isinstance(value, bool)
@@ -317,7 +327,7 @@ class RaceRuntimeAdapter:
         self.cone_queue_capacity = cone_queue_capacity
         self.object_max_age_s = float(object_max_age_s)
         self.lane_change_max_age_s = float(lane_change_max_age_s)
-        self.avoid_direction = AvoidDirectionDebouncer(avoid_direction_config)
+        self.lane_position_max_age_s = float(lane_position_max_age_s)
 
         self._cone_events: Deque[ConeMessageEvent] = deque()
         self._traffic_events: Deque[TrafficMessageEvent] = deque()
@@ -341,13 +351,17 @@ class RaceRuntimeAdapter:
         self.latest_lane_received_at: Optional[float] = None
         self.latest_cone_event: Optional[ConeMessageEvent] = None
         self.latest_object_snapshot: Optional[ObjectSnapshot] = None
+        self._pending_object_entry_evidence: Optional[ObjectEntryEvidence] = None
+        self.latest_side_left: float = float("inf")
+        self.latest_side_right: float = float("inf")
+        self.side_clearance_received_at: Optional[float] = None
         self._last_lane_change_received_at: Optional[float] = None
         self._lane_change_success_active = False
         self.traffic_stop_override = False
         self.lane_action = LaneActionStatus()
-        self.last_avoid_direction: Optional[AvoidDirectionDecision] = None
         # /lane_position 실측 차선 (-1=미확정). main_node 가 콜백에서 갱신한다.
         self.measured_lane: int = -1
+        self.measured_lane_received_at: Optional[float] = None
 
     def bootstrap_test_profile(
         self,
@@ -403,10 +417,16 @@ class RaceRuntimeAdapter:
         self.latest_lane_received_at = None
         self.latest_cone_event = None
         self.latest_object_snapshot = None
+        self._pending_object_entry_evidence = None
+        self.latest_side_left = float("inf")
+        self.latest_side_right = float("inf")
+        self.side_clearance_received_at = None
         self._last_lane_change_received_at = None
         self._lane_change_success_active = False
         self.traffic_stop_override = False
         self.lane_action = LaneActionStatus()
+        self.measured_lane = -1
+        self.measured_lane_received_at = None
 
     @property
     def pending_cone_event_count(self) -> int:
@@ -418,12 +438,56 @@ class RaceRuntimeAdapter:
         self.sensor_received_at["scan"] = received_at
         return True
 
+    def record_side_clearance(
+        self,
+        left: float,
+        right: float,
+        received_at: float,
+    ) -> bool:
+        """Record one validated semantic side-distance observation."""
+
+        if (
+            not self._valid_clearance(left)
+            or not self._valid_clearance(right)
+            or not self._valid_timestamp(received_at)
+        ):
+            return False
+        if (
+            self.side_clearance_received_at is not None
+            and received_at <= self.side_clearance_received_at
+        ):
+            return False
+        self.latest_side_left = float(left)
+        self.latest_side_right = float(right)
+        self.side_clearance_received_at = received_at
+        self.perception_received_at["side_clearance"] = received_at
+        return True
+
     def record_lane_offset(self, offset: int, received_at: float) -> bool:
         if not self._valid_int(offset) or not self._valid_timestamp(received_at):
             return False
         self.latest_lane_offset = offset
         self.latest_lane_received_at = received_at
         self.perception_received_at["lane_offset"] = received_at
+        return True
+
+    def record_lane_position(self, value: int, received_at: float) -> bool:
+        """Record one validated lane measurement without accepting old receipts."""
+
+        if (
+            not self._valid_int(value)
+            or value not in (-1, 0, 1, 2)
+            or not self._valid_timestamp(received_at)
+        ):
+            return False
+        if (
+            self.measured_lane_received_at is not None
+            and received_at <= self.measured_lane_received_at
+        ):
+            return False
+        self.measured_lane = value
+        self.measured_lane_received_at = received_at
+        self.perception_received_at["lane_position"] = received_at
         return True
 
     def record_traffic(self, detected: bool, received_at: float) -> bool:
@@ -692,6 +756,52 @@ class RaceRuntimeAdapter:
     def record_overtake_entry(self, received_at: float) -> InputRecordResult:
         return self._record_mission_edge("overtake_entry", received_at)
 
+    def record_object_mission_entry(
+        self,
+        expected_state: Mode,
+        snapshot: ObjectSnapshot,
+        received_at: float,
+    ) -> InputRecordResult:
+        """Queue one validated object entry and preserve its lane once.
+
+        ``MainNode`` calls this only after applying the normal LANE_DRIVE
+        session, TTL, box-size and object-type gates.  Binding the semantic
+        lane to the same mission edge lets the committed state initialize its
+        action without pretending that the pre-commit receipt occurred after
+        the new state's ``state_entered_at``.
+        """
+
+        self._pending_object_entry_evidence = None
+        if expected_state not in (Mode.FIXED_AVOID, Mode.OVERTAKE):
+            return InputRecordResult(False, "invalid object mission state")
+        if snapshot is not self.latest_object_snapshot:
+            return InputRecordResult(False, "object entry snapshot is not latest")
+        expected_type = (
+            ObjectType.FIXED
+            if expected_state is Mode.FIXED_AVOID
+            else ObjectType.MOVING
+        )
+        if snapshot.object_type is not expected_type:
+            return InputRecordResult(False, "object entry type/state mismatch")
+
+        event_name = (
+            "fixed_zone_entry"
+            if expected_state is Mode.FIXED_AVOID
+            else "overtake_entry"
+        )
+        result = self._record_mission_edge(event_name, received_at)
+        if not result.accepted:
+            return result
+
+        if opposite_lane_target(snapshot.lane) is not None:
+            self._pending_object_entry_evidence = ObjectEntryEvidence(
+                expected_state=expected_state,
+                lane=snapshot.lane,
+                object_received_at=snapshot.received_at,
+                mission_edge_received_at=received_at,
+            )
+        return result
+
     def record_overtake_complete(self, received_at: float) -> InputRecordResult:
         return self._record_mission_edge("overtake_complete", received_at)
 
@@ -729,10 +839,10 @@ class RaceRuntimeAdapter:
         except TypeError:
             values = []
 
-        if len(values) < 3:
+        if len(values) not in (3, 4):
             return ConeEnqueueResult(
                 False,
-                "rubbercone_info requires [offset, end_flag, confidence]",
+                "rubbercone_info requires legacy 3 fields or live 4 fields",
             )
         if not self._valid_timestamp(received_at):
             return ConeEnqueueResult(False, "invalid rubbercone receipt timestamp")
@@ -752,10 +862,29 @@ class RaceRuntimeAdapter:
                 "rubbercone confidence must be an integer from 0 to 100",
             )
 
+        entry_ready: Optional[bool] = None
+        if len(values) == 4:
+            raw_entry_ready = values[3]
+            if (
+                not self._valid_int(raw_entry_ready)
+                or raw_entry_ready not in (0, 1)
+            ):
+                return ConeEnqueueResult(
+                    False,
+                    "rubbercone entry_ready must be 0 or 1",
+                )
+            if end_flag == 1 and raw_entry_ready == 1:
+                return ConeEnqueueResult(
+                    False,
+                    "rubbercone end_flag and entry_ready cannot both be 1",
+                )
+            entry_ready = bool(raw_entry_ready)
+
         event = ConeMessageEvent(
             offset=offset,
             end_flag=bool(end_flag),
             confidence=confidence,
+            entry_ready=entry_ready,
             received_at=received_at,
         )
         dropped_oldest = False
@@ -847,6 +976,9 @@ class RaceRuntimeAdapter:
             ),
             cone_end_flag=(
                 cone_event.end_flag if cone_event is not None else None
+            ),
+            cone_entry_ready=(
+                cone_event.entry_ready if cone_event is not None else None
             ),
             cone_message_received_at=(
                 cone_event.received_at if cone_event is not None else None
@@ -979,16 +1111,29 @@ class RaceRuntimeAdapter:
             traffic_hold=self.traffic_stop_override,
         )
         fsm_control = ControlCycleResult(transition=transition, control=control)
-        publish_cone_reset = (
+        cone_entry_committed = (
             transition.changed
             and transition.source is Mode.LANE_DRIVE
             and transition.target is Mode.CONE_DRIVE
         )
+        cone_exit_committed = (
+            transition.changed
+            and transition.source is Mode.CONE_DRIVE
+            and transition.target is Mode.LANE_DRIVE
+            and transition.reason == "fresh cone end flag"
+            and observation.cone_end_flag is True
+            and observation.cone_message_received_at is not None
+        )
+        cone_session_active_command: Optional[bool] = None
+        if cone_entry_committed:
+            cone_session_active_command = True
+        elif cone_exit_committed:
+            cone_session_active_command = False
 
         discarded = 0
-        if publish_cone_reset:
-            # Events already queued before the reset publish belong to the old
-            # detector session and must never arm the new exit handshake.
+        if cone_session_active_command is not None:
+            # Events queued before either committed phase boundary belong to
+            # the previous producer phase and cannot be replayed afterward.
             discarded = len(self._cone_events)
             self._cone_events.clear()
             self.latest_cone_event = None
@@ -998,8 +1143,8 @@ class RaceRuntimeAdapter:
             observation=observation,
             safety=safety,
             fsm_control=fsm_control,
-            publish_cone_reset=publish_cone_reset,
-            discarded_pre_reset_events=discarded,
+            cone_session_active_command=cone_session_active_command,
+            discarded_pre_phase_events=discarded,
         )
 
     def _update_lane_action(
@@ -1007,12 +1152,10 @@ class RaceRuntimeAdapter:
         observation: MissionObservation,
         transition: Transition,
     ) -> None:
-        # 회피 방향 가드는 구간 밖에서도 계속 돌린다. 방향 판단은 카메라만 보는
-        # 인지 필터라 구간 진입을 기다릴 이유가 없고, 미리 데워 두면 진입 직후
-        # 곧바로 회피를 시작할 수 있다.
-        direction = self.avoid_direction.update(observation)
-        self.last_avoid_direction = direction
-
+        entry_evidence = self._consume_object_entry_evidence(
+            observation,
+            transition,
+        )
         mode = self.fsm.state
         action_modes = (Mode.FIXED_AVOID, Mode.OVERTAKE)
         if mode not in action_modes:
@@ -1039,28 +1182,35 @@ class RaceRuntimeAdapter:
         # 않는다." 중앙 주행은 회피 전 기본값일 뿐 복귀 목표가 아니다.
         action.safe_to_drive = object_fresh
 
-        # 회피 방향은 YOLO만으로 정한다. object_box_px 와 object_lane 은
-        # 카메라 단독 산출물이고, LiDAR는 추월 완료 확인(main.overtake)에만 쓴다.
-        #
-        # 예전에는 LiDAR 기반 object_exists 를 요구했다. 구간 진입은
-        # YOLO(box_size > FIXED_ENTRY_BOX_PX)로 하면서 방향 결정만 LiDAR에
-        # 걸어둔 비대칭이라, 카메라가 방해차량을 또렷이 보는데도 회피를
-        # 시작하지 못했다. rosbag2_fixed_obstacles_overtake_1 실측:
-        # 방해차량이 대부분 2 m 밖이라 range_max_m(2.0)에 걸려 전방 클러스터가
-        # 103 스캔 중 1번만 형성됐고(±10도 최소거리 중앙값 5.08 m),
-        # object_exists 가 1810 샘플 내내 0이었다. 같은 구간에서 YOLO는
-        # 박스 최대 10549 px^2, car_lane=1을 안정적으로 냈다.
-        #
-        # 단, 한 프레임짜리 car_lane 반전으로 방향을 확정하지는 않는다.
-        # AvoidDirectionDebouncer 가 연속 프레임 합의를 요구한다.
-        target = direction.target
+        # object_detection publishes an already stabilized semantic lane.
+        # Main validates receipt/session freshness and owns only the action.
+        entry_target = (
+            opposite_lane_target(entry_evidence.lane)
+            if entry_evidence is not None
+            else None
+        )
+        target = entry_target or opposite_lane_target(observation.object_lane)
+        target_received_at = (
+            entry_evidence.object_received_at
+            if entry_evidence is not None
+            else observation.object_received_at
+        )
+        target_fresh = self._event_is_fresh(
+            target_received_at,
+            observation.now,
+            self.object_max_age_s,
+        )
+        target_is_authorized = entry_evidence is not None or (
+            self.context.state_entered_at is not None
+            and observation.object_received_at is not None
+            and observation.object_received_at > self.context.state_entered_at
+        )
         if (
-            object_fresh
+            target_fresh
+            and (entry_evidence is not None or observation.object_box_px > 0.0)
             and target is not None
             and target != self.context.lane_target
-            and self.context.state_entered_at is not None
-            and direction.last_sample_at is not None
-            and direction.last_sample_at > self.context.state_entered_at
+            and target_is_authorized
         ):
             # 이미 시작했거나(pending) 끝난(completed) 변경이어도 방향을 고친다.
             # 예전에는 not pending and not completed 를 요구해서, 잘못된
@@ -1087,11 +1237,19 @@ class RaceRuntimeAdapter:
         if (
             action.pending
             and action.target is not None
+            and action.started_at is not None
+            and self.measured_lane_received_at is not None
+            and self.measured_lane_received_at > action.started_at
+            and self._event_is_fresh(
+                self.measured_lane_received_at,
+                observation.now,
+                self.lane_position_max_age_s,
+            )
             and self.measured_lane == action.target.value
         ):
             action.pending = False
             action.completed = True
-            action.completed_at = observation.now
+            action.completed_at = self.measured_lane_received_at
             return
 
         # 완료 판정 ②: /lane_change_state 성공 엣지 (기존 경로 유지)
@@ -1111,6 +1269,33 @@ class RaceRuntimeAdapter:
             action.pending = False
             action.completed = True
             action.completed_at = success_at
+
+    def _consume_object_entry_evidence(
+        self,
+        observation: MissionObservation,
+        transition: Transition,
+    ) -> Optional[ObjectEntryEvidence]:
+        """Consume or discard the one snapshot bound to this FSM commit."""
+
+        evidence = self._pending_object_entry_evidence
+        self._pending_object_entry_evidence = None
+        if evidence is None:
+            return None
+        if (
+            not transition.changed
+            or transition.source is not Mode.LANE_DRIVE
+            or transition.target is not evidence.expected_state
+            or self.fsm.state is not evidence.expected_state
+        ):
+            return None
+        edge_received_at = (
+            observation.fixed_zone_entry_received_at
+            if evidence.expected_state is Mode.FIXED_AVOID
+            else observation.overtake_entry_received_at
+        )
+        if edge_received_at != evidence.mission_edge_received_at:
+            return None
+        return evidence
 
     @staticmethod
     def _event_is_fresh(
@@ -1141,6 +1326,14 @@ class RaceRuntimeAdapter:
             isinstance(value, (int, float))
             and not isinstance(value, bool)
             and math.isfinite(value)
+        )
+
+    @staticmethod
+    def _valid_clearance(value: Any) -> bool:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return False
+        return (math.isfinite(value) and value >= 0.0) or (
+            math.isinf(value) and value > 0.0
         )
 
     @staticmethod

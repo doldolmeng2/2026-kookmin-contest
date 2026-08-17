@@ -223,21 +223,43 @@ def parse_cone_message(message: Any) -> Dict[str, Any]:
     except TypeError:
         values = []
 
-    if len(values) < 2:
+    if len(values) not in (2, 3, 4):
         return {
             "offset": None,
             "end_flag": None,
             "confidence": None,
+            "entry_ready": None,
             "field_count": len(values),
             "malformed": True,
         }
 
+    try:
+        offset = int(values[0])
+        end_flag = int(values[1])
+        confidence = int(values[2]) if len(values) >= 3 else None
+        entry_ready = int(values[3]) if len(values) == 4 else None
+    except (TypeError, ValueError, OverflowError):
+        return {
+            "offset": None,
+            "end_flag": None,
+            "confidence": None,
+            "entry_ready": None,
+            "field_count": len(values),
+            "malformed": True,
+        }
+
+    malformed = end_flag not in (0, 1)
+    if entry_ready is not None:
+        malformed = malformed or entry_ready not in (0, 1)
+        malformed = malformed or (end_flag == 1 and entry_ready == 1)
+
     return {
-        "offset": int(values[0]),
-        "end_flag": int(values[1]),
-        "confidence": int(values[2]) if len(values) >= 3 else None,
+        "offset": offset,
+        "end_flag": end_flag,
+        "confidence": confidence,
+        "entry_ready": entry_ready,
         "field_count": len(values),
-        "malformed": False,
+        "malformed": malformed,
     }
 
 
@@ -266,13 +288,9 @@ class OfflineBagReplay:
         self,
         *,
         start_mode: Mode = Mode.WAIT_GREEN,
-        green_min_consecutive_frames: int = 3,
-        green_min_duration_s: float = 0.0,
         cone_entry_config: Optional[ConeEntryConfig] = None,
     ) -> None:
         self.start_mode = Mode(start_mode)
-        self.green_min_consecutive_frames = green_min_consecutive_frames
-        self.green_min_duration_s = green_min_duration_s
         self.using_default_cone_entry_config = cone_entry_config is None
         self.cone_entry_config = cone_entry_config or ConeEntryConfig()
 
@@ -285,8 +303,6 @@ class OfflineBagReplay:
     ) -> Dict[str, Any]:
         fsm = RaceFSM(
             initial_state=self.start_mode,
-            green_min_consecutive_frames=self.green_min_consecutive_frames,
-            green_min_duration_s=self.green_min_duration_s,
             cone_entry_config=self.cone_entry_config,
         )
         context = RaceContext()
@@ -534,6 +550,14 @@ class OfflineBagReplay:
                     and parsed_cone is not None
                     and not parsed_cone["malformed"]
                     and parsed_cone["end_flag"] is not None
+                    else None
+                ),
+                cone_entry_ready=(
+                    bool(parsed_cone["entry_ready"])
+                    if event.topic == "/rubbercone_info"
+                    and parsed_cone is not None
+                    and not parsed_cone["malformed"]
+                    and parsed_cone["entry_ready"] in (0, 1)
                     else None
                 ),
                 cone_message_received_at=(
@@ -875,8 +899,8 @@ class OfflineBagReplay:
     @staticmethod
     def _should_evaluate(mode: Mode, topic: str) -> bool:
         # Trace-only topics do not create mission event edges. In WAIT_GREEN,
-        # only a new traffic record may advance/reset the green debouncer; this
-        # prevents one cached Bool from being counted again by unrelated data.
+        # Only a new stable traffic record may advance WAIT_GREEN; unrelated
+        # records must never reuse a cached semantic signal.
         if topic not in _FSM_EVENT_TOPICS:
             return False
         if mode is Mode.WAIT_GREEN:
@@ -919,7 +943,7 @@ class OfflineBagReplay:
             "absence of unsupported Mode transitions",
         ]
         if "/traffic_detection" in topic_types:
-            scope.append("WAIT_GREEN debounce using recorded traffic code edges")
+            scope.append("WAIT_GREEN transition using stable traffic code edges")
         if "/rubbercone_info" in topic_types:
             scope.append("rubbercone candidate/end event timing")
         if "/rubbercone_info" in topic_types and "/scan" in topic_types:

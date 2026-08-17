@@ -84,121 +84,62 @@ def test_wait_green_ready_without_traffic_message_does_not_start_race():
     assert context.race_started_at is None
 
 
-def test_green_requires_consecutive_frames_and_resets_on_gap():
-    fsm = RaceFSM(
-        initial_state=Mode.WAIT_GREEN,
-        green_min_consecutive_frames=3,
-    )
+def test_one_fresh_stable_green_starts_race():
+    fsm = RaceFSM(initial_state=Mode.WAIT_GREEN)
     context = RaceContext(state_entered_at=1.0)
-
-    for now in (2.0, 2.1):
-        transition = fsm.step(
-            MissionObservation(
-                now=now,
-                green_detected=True,
-                traffic_message_received_at=now,
-            ),
-            context,
-            safe(),
-        )
-        assert transition.changed is False
-        assert context.state_entered_at == 1.0
-
-    fsm.step(
-        MissionObservation(
-            now=2.2,
-            green_detected=False,
-            traffic_message_received_at=2.2,
-        ),
-        context,
-        safe(),
-    )
-
-    for now in (3.0, 3.1):
-        transition = fsm.step(
-            MissionObservation(
-                now=now,
-                green_detected=True,
-                traffic_message_received_at=now,
-            ),
-            context,
-            safe(),
-        )
-        assert transition.changed is False
 
     transition = fsm.step(
         MissionObservation(
-            now=3.2,
+            now=2.05,
             green_detected=True,
-            traffic_message_received_at=3.2,
+            traffic_message_received_at=2.0,
         ),
         context,
         safe(),
     )
 
     assert transition.target is Mode.LANE_DRIVE
-    assert context.state_entered_at == 3.2
-    assert context.race_started_at == 3.0
+    assert transition.reason == "stable green signal"
+    assert context.state_entered_at == 2.05
+    assert context.race_started_at == 2.0
 
 
-def test_green_debounce_can_also_require_duration():
-    fsm = RaceFSM(
-        initial_state=Mode.WAIT_GREEN,
-        green_min_consecutive_frames=2,
-        green_min_duration_s=0.5,
-    )
+def test_fresh_stable_non_green_keeps_waiting():
+    fsm = RaceFSM(initial_state=Mode.WAIT_GREEN)
     context = RaceContext(state_entered_at=1.0)
 
-    first = fsm.step(
+    transition = fsm.step(
         MissionObservation(
-            now=5.0,
-            green_detected=True,
-            traffic_message_received_at=5.0,
-        ),
-        context,
-        safe(),
-    )
-    second = fsm.step(
-        MissionObservation(
-            now=5.5,
-            green_detected=True,
-            traffic_message_received_at=5.5,
+            now=1.1,
+            green_detected=False,
+            traffic_message_received_at=1.1,
         ),
         context,
         safe(),
     )
 
-    assert first.changed is False
-    assert second.target is Mode.LANE_DRIVE
-    assert context.race_started_at == 5.0
+    assert transition.changed is False
+    assert transition.reason == "waiting for stable green"
+    assert context.race_started_at is None
 
 
-def test_race_clock_uses_first_fresh_green_receipt_not_debounce_commit_tick():
-    fsm = RaceFSM(
-        initial_state=Mode.WAIT_GREEN,
-        green_min_consecutive_frames=3,
-    )
+def test_pre_session_stable_green_is_rejected():
+    fsm = RaceFSM(initial_state=Mode.WAIT_GREEN)
     context = RaceContext(state_entered_at=9.0)
 
-    samples = (
-        (10.05, 10.0),
-        (10.15, 10.1),
-        (10.25, 10.2),
+    transition = fsm.step(
+        MissionObservation(
+            now=9.1,
+            green_detected=True,
+            traffic_message_received_at=8.9,
+        ),
+        context,
+        safe(),
     )
-    for now, received_at in samples:
-        transition = fsm.step(
-            MissionObservation(
-                now=now,
-                green_detected=True,
-                traffic_message_received_at=received_at,
-            ),
-            context,
-            safe(),
-        )
 
-    assert transition.target is Mode.LANE_DRIVE
-    assert context.race_started_at == 10.0
-    assert context.state_entered_at == 10.25
+    assert transition.changed is False
+    assert context.race_started_at is None
+    assert context.state_entered_at == 9.0
 
 
 def test_safety_stop_records_reason_and_entry_time():

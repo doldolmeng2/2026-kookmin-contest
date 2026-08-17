@@ -11,7 +11,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import (
-    Empty,
+    Bool,
     Float32MultiArray,
     Int16,
     Int32,
@@ -24,20 +24,26 @@ from main.control_selector import (
     ControlSource,
     DriveCommand,
 )
-from main.mission_types import LaneTarget, ObjectType, RouteTrafficSignal
+from main.mission_types import (
+    LaneTarget,
+    ObjectType,
+    RouteTrafficSignal,
+    opposite_lane_target,
+)
 from main.mode_info import (
     external_mode_code,
     lane_command_data,
     lane_info_value,
 )
-from main.overtake import OvertakeGuard, side_clearance
+from main.overtake import OvertakeGuard
 from main.same_lane_brake import SameLaneBrake, SameLaneBrakeDecision
 from main.shortcut_exit import ShortcutExitGuard
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
+    SIDE_CLEARANCE_MAX_AGE_S,
     MissionTestProfile,
     RaceRuntimeAdapter,
-    dispatch_cone_reset,
+    dispatch_cone_session_state,
     parse_test_profile,
     runtime_safety_monitor,
 )
@@ -45,9 +51,10 @@ from main.runtime_adapter import (
 
 RUBBERCONE_INFO_TOPIC = "/rubbercone_info"
 RUBBERCONE_OFFSET_TOPIC = "/rubbercone_offset"
-RUBBERCONE_RESET_TOPIC = "/rubbercone_reset"
+RUBBERCONE_SESSION_ACTIVE_TOPIC = "/rubbercone_session_active"
 OBJECT_INFO_TOPIC = "/object_info"
 OBJECT_INFO_RAW_TOPIC = "/object_info_raw"
+SIDE_CLEARANCE_TOPIC = "/side_clearance"
 LANE_COMMAND_TOPIC = "/internal/lane_command"
 LANE_CHANGE_STATE_TOPIC = "/lane_change_state"
 CONE_EVENT_WARNING_PERIOD_S = 5.0
@@ -122,13 +129,13 @@ def parse_initial_mode(value) -> Mode:
     raise ValueError(f"invalid initial mode value: {value!r}")
 
 
-def rubbercone_reset_qos() -> QoSProfile:
-    """Return the detector's reliable edge-command QoS contract."""
+def rubbercone_session_qos() -> QoSProfile:
+    """Return the detector's stateful lifecycle-command QoS contract."""
 
     return QoSProfile(
-        depth=10,
+        depth=1,
         reliability=ReliabilityPolicy.RELIABLE,
-        durability=DurabilityPolicy.VOLATILE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
     )
 
 
@@ -197,8 +204,8 @@ class MainNode(Node):
         self.rubbercone_offset = 0
         self.rubbercone_end_flag = 0
         self.detected_lane = -1         # 실측 현재 차선 (-1=미확정, 0=중앙, 1=왼쪽, 2=오른쪽)
-        self.side_left = float("inf")   # 좌측면 최소 거리 (m, /scan 에서 계산)
-        self.side_right = float("inf")  # 우측면 최소 거리 (m, /scan 에서 계산)
+        self.side_left = float("inf")   # perception이 승인한 좌측면 최소 거리 (m)
+        self.side_right = float("inf")  # perception이 승인한 우측면 최소 거리 (m)
         self.left = float("inf")
         self.right = float("inf")
         self.traffic_signal = 0        # /object_info 최신 신호등 코드 (표시용)
@@ -228,7 +235,7 @@ class MainNode(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
-        reset_qos = rubbercone_reset_qos()
+        session_qos = rubbercone_session_qos()
 
         self.motor_pub = self.create_publisher(
             Float32MultiArray,
@@ -250,10 +257,13 @@ class MainNode(Node):
             LANE_COMMAND_TOPIC,
             qos_fast,
         )
-        self.rubbercone_reset_pub = self.create_publisher(
-            Empty,
-            RUBBERCONE_RESET_TOPIC,
-            reset_qos,
+        self.rubbercone_session_active_pub = self.create_publisher(
+            Bool,
+            RUBBERCONE_SESSION_ACTIVE_TOPIC,
+            session_qos,
+        )
+        self._publish_cone_session_state(
+            self.runtime.fsm.state is Mode.CONE_DRIVE
         )
 
         self.rubbercone_info_sub = self.create_subscription(
@@ -290,6 +300,12 @@ class MainNode(Node):
             LaserScan,
             "/scan",
             self.scan_callback,
+            qos_fast,
+        )
+        self.side_clearance_sub = self.create_subscription(
+            Float32MultiArray,
+            SIDE_CLEARANCE_TOPIC,
+            self.side_clearance_callback,
             qos_fast,
         )
         self.lane_change_state_sub = self.create_subscription(
@@ -346,6 +362,11 @@ class MainNode(Node):
         """Read the node ROS clock used by both callbacks and FSM steps."""
 
         return self.get_clock().now().nanoseconds / 1_000_000_000.0
+
+    def _publish_cone_session_state(self, active: bool) -> None:
+        message = Bool()
+        message.data = bool(active)
+        self.rubbercone_session_active_pub.publish(message)
 
     def rubbercone_callback(self, msg: Int32MultiArray) -> None:
         """Consume the detailed internal cone contract used by the FSM."""
@@ -455,19 +476,27 @@ class MainNode(Node):
         self.moving_vehicle_lane = data[2]
         self._record_traffic_signal(data[0], received_at)
 
-    def scan_callback(self, msg: LaserScan) -> None:
+    def scan_callback(self, _msg: LaserScan) -> None:
         self.runtime.record_scan(self._now_seconds())
-        # 측면 거리는 /object_info_raw 에 담지 않고 여기서 직접 뽑는다.
-        # premerge 가 초음파를 그대로 읽던 구조와 같다. /object_info_raw의
-        # 12필드 계약과 별개로 원시 /scan에서 측면 clearance를 계산한다.
-        self.side_left, self.side_right = side_clearance(
-            msg.ranges,
-            msg.angle_min,
-            msg.angle_increment,
-            msg.range_min,
-            msg.range_max,
-            self.overtake.config,
-        )
+
+    def side_clearance_callback(self, msg: Float32MultiArray) -> None:
+        """Consume perception-owned ``[left_m, right_m]`` side distances."""
+
+        received_at = self._now_seconds()
+        data = list(msg.data)
+        if len(data) != 2 or not self.runtime.record_side_clearance(
+            data[0],
+            data[1],
+            received_at,
+        ):
+            self._warn_throttled(
+                "malformed_side_clearance",
+                "side_clearance requires two non-negative finite values or +Infinity",
+                received_at,
+            )
+            return
+        self.side_left = self.runtime.latest_side_left
+        self.side_right = self.runtime.latest_side_right
 
     def lane_position_callback(self, msg: Int16) -> None:
         """lane_detection이 노란 중앙선 실제 위치로 역산한 실측 현재 차선.
@@ -476,9 +505,19 @@ class MainNode(Node):
         """
 
         value = int(msg.data)
-        self.detected_lane = value if value in (0, 1, 2) else -1
-        # 차선 변경 완료 판정에 쓰인다 (runtime_adapter._update_lane_action).
-        self.runtime.measured_lane = self.detected_lane
+        detected_lane = value if value in (0, 1, 2) else -1
+        # Real callbacks always use the node clock.  Lightweight method
+        # harnesses have no ROS clock, so conservatively timestamp their cached
+        # input at the current state boundary.
+        received_at = (
+            self._now_seconds()
+            if isinstance(self, Node)
+            else self.runtime.context.state_entered_at
+        )
+        if received_at is None:
+            return
+        if self.runtime.record_lane_position(detected_lane, received_at):
+            self.detected_lane = detected_lane
 
     def road_surface_callback(self, msg: Int32) -> None:
         """Consume CNN road labels: 0 unknown, 1 black road, 2 white shortcut."""
@@ -577,14 +616,16 @@ class MainNode(Node):
                 f"{cycle.transition.target.value}: {cycle.transition.reason}"
             )
 
-        if cycle.publish_cone_reset:
+        if cycle.cone_session_active_command is not None:
             try:
-                dispatch_cone_reset(
+                dispatch_cone_session_state(
                     cycle,
-                    lambda: self.rubbercone_reset_pub.publish(Empty()),
+                    self._publish_cone_session_state,
                 )
             except Exception as exc:  # rclpy publisher errors are fail-safe here.
-                self.get_logger().error(f"rubbercone reset publish failed: {exc}")
+                self.get_logger().error(
+                    f"rubbercone session-state publish failed: {exc}"
+                )
 
         angle, speed = self._shape_selected_control(
             cycle.control.source,
@@ -650,11 +691,30 @@ class MainNode(Node):
     def is_pass_comp(self, now: float) -> bool:
         """추월 완료 여부. 판정은 main.overtake.OvertakeGuard가 한다."""
 
+        clearance_received_at = self.runtime.side_clearance_received_at
+        zone_entered_at = self.overtake.zone_entered_at
+        clearance_is_fresh = (
+            isinstance(clearance_received_at, (int, float))
+            and not isinstance(clearance_received_at, bool)
+            and np.isfinite(clearance_received_at)
+            and isinstance(now, (int, float))
+            and not isinstance(now, bool)
+            and np.isfinite(now)
+            and 0.0 <= now - clearance_received_at <= SIDE_CLEARANCE_MAX_AGE_S
+            and isinstance(zone_entered_at, (int, float))
+            and not isinstance(zone_entered_at, bool)
+            and np.isfinite(zone_entered_at)
+            and clearance_received_at > zone_entered_at
+        )
+        if not clearance_is_fresh:
+            self.overtake.invalidate_clearance()
+            return False
+
         decision = self.overtake.update_zone(
             now=now,
             lane_target=self.runtime.context.lane_target.value,
-            side_left=self.side_left,
-            side_right=self.side_right,
+            side_left=self.runtime.latest_side_left,
+            side_right=self.runtime.latest_side_right,
             ego_lane=self.detected_lane,
         )
         if decision.side_just_seen:
@@ -681,28 +741,23 @@ class MainNode(Node):
     def _fmt_side(distance: float) -> str:
         """측면 LiDAR 거리를 디버그 창용으로 만든다.
 
-        side_clearance()는 섹터에 유효 반사가 없으면 inf를 준다. 'inf'를 그대로
-        찍으면 값이 있을 때와 폭이 달라져 눈으로 훑기 나쁘므로 N/A로 통일한다.
+        perception은 유효한 측면 반사가 없으면 inf를 준다. 'inf'를 그대로 찍으면
+        값이 있을 때와 폭이 달라져 눈으로 훑기 나쁘므로 N/A로 통일한다.
         """
         if not np.isfinite(distance):
             return "N/A"
         return f"{distance:.2f} m"
 
     def _avoid_direction_text(self) -> str:
-        """디바운스를 통과한 회피 방향과 현재 연속 일치 수를 표시한다.
+        """Display the avoidance target approved by object perception."""
 
-        car_lane 한 프레임(위 Box 줄)과 실제로 방향을 확정한 값(이 줄)이
-        다를 수 있다는 것을 화면에서 바로 볼 수 있게 한다.
-        """
-        decision = self.runtime.last_avoid_direction
-        if decision is None:
+        snapshot = self.runtime.latest_object_snapshot
+        if snapshot is None:
             return "N/A"
-        confirmed = (
-            self._lane_label(decision.target.value)
-            if decision.target is not None
-            else "unconfirmed"
-        )
-        return f"{confirmed} (streak {decision.streak})"
+        target = opposite_lane_target(snapshot.lane)
+        if target is None:
+            return "unconfirmed"
+        return f"{self._lane_label(target.value)} (perception stable)"
 
     def _same_lane_brake_text(self) -> str:
         """같은 차선 감속 상태를 표시한다.
@@ -784,6 +839,9 @@ class MainNode(Node):
         self.side_right = float("inf")
         self.now_speed = 0.0
         self.now_angle = 0.0
+        self._publish_cone_session_state(
+            self.runtime.fsm.state is Mode.CONE_DRIVE
+        )
 
     def _drive_mission_zones(self, now: float) -> None:
         """Create typed obstacle-zone edges and CNN shortcut-exit sessions.
@@ -803,23 +861,37 @@ class MainNode(Node):
             if entered:
                 self._fixed_entry_sent = False
             entered_at = self.runtime.context.state_entered_at
+            snapshot = self.runtime.latest_object_snapshot
             # 엣지는 state_entered_at 보다 "뒤"여야 수락되고 한 번만 소비된다.
             if (
                 not self._fixed_entry_sent
-                and self.box_size > FIXED_ENTRY_BOX_PX
-                and self.object_type in (ObjectType.FIXED, ObjectType.MOVING)
+                and snapshot is not None
                 and entered_at is not None
-                and now > entered_at
+                and snapshot.received_at > entered_at
+                and self.runtime._event_is_fresh(
+                    snapshot.received_at,
+                    now,
+                    self.runtime.object_max_age_s,
+                )
+                and snapshot.box_px > FIXED_ENTRY_BOX_PX
+                and snapshot.object_type in (ObjectType.FIXED, ObjectType.MOVING)
             ):
-                self._fixed_entry_sent = True
-                if self.object_type is ObjectType.MOVING:
-                    self.runtime.record_overtake_entry(now)
+                if snapshot.object_type is ObjectType.MOVING:
+                    expected_state = Mode.OVERTAKE
                     label = "방해차량"
                 else:
-                    self.runtime.record_fixed_zone_entry(now)
+                    expected_state = Mode.FIXED_AVOID
                     label = "고정장애물"
+                result = self.runtime.record_object_mission_entry(
+                    expected_state,
+                    snapshot,
+                    now,
+                )
+                if not result.accepted:
+                    return
+                self._fixed_entry_sent = True
                 self.get_logger().info(
-                    f"{label} 검출 ({self.box_size:.0f}px^2) -> 미션 구간 진입")
+                    f"{label} 검출 ({snapshot.box_px:.0f}px^2) -> 미션 구간 진입")
             return
 
         if state is Mode.FIXED_AVOID:

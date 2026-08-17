@@ -18,8 +18,10 @@
 //   [0] offset     : 조향 오프셋 (양수=오른쪽 편향)
 //   [1] end_flag   : 0=주행 중, 1=라바콘 구간 종료
 // 발행: /rubbercone_info (std_msgs/Int32MultiArray, 내부 상세 계약)
-//   [0] offset, [1] end_flag, [2] confidence (0~100)
-// 구독: /rubbercone_reset (std_msgs/Empty) - 다음 라바콘 세션 준비
+//   [0] offset, [1] end_flag, [2] confidence (0~100), [3] entry_ready (0/1)
+// 구독: /rubbercone_session_active (std_msgs/Bool, 내부 lifecycle state)
+//   false=SEARCH_ENTRY, true=CONE_ACTIVE
+// 구독: /rubbercone_reset (std_msgs/Empty) - legacy/manual SEARCH reset
 //
 // 디버그 창 (enable_gui:=true, 기본 true):
 //   "Rubbercone Debug" - 탑뷰로 스캔 포인트 / 콘 후보 / 좌우 경계 직선 /
@@ -28,6 +30,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/int32_multi_array.hpp>
 #include <opencv2/opencv.hpp>
@@ -43,12 +46,16 @@
 #include <string>
 #include <vector>
 
+#include "rubbercone/entry_readiness.hpp"
+#include "rubbercone/session_lifecycle.hpp"
+
 using std::placeholders::_1;
 
 namespace {
 
 constexpr float kPi = 3.14159265358979323846f;
 constexpr char kRubberconeResetTopic[] = "/rubbercone_reset";
+constexpr char kRubberconeSessionActiveTopic[] = "/rubbercone_session_active";
 
 template<typename T>
 T clampValue(T value, T lower, T upper)
@@ -103,6 +110,7 @@ struct DebugSnapshot {
     int32_t offset{0};
     int32_t end_flag{0};
     int32_t confidence{0};
+    int32_t entry_ready{0};
     bool armed{false};
 };
 
@@ -137,10 +145,6 @@ public:
       max_corridor_width_(1.40f),
       offset_limit_(40.0f),
       max_offset_step_(20.0f),
-      valid_frame_count_(0),
-      missing_frame_count_(0),
-      cone_section_armed_(false),
-      end_latched_(false),
       filtered_target_y_(0.0f),
       has_filtered_target_y_(false),
       filtered_offset_(0.0f),
@@ -151,9 +155,11 @@ public:
       max_target_y_step_bilateral_(0.20f),
       max_target_y_step_one_side_(0.20f),
       end_missing_frames_(3),
+      session_lifecycle_(kArmValidFrames, 3),
       rubber_offset_value_(0),
       rubber_end_value_(0),
       rubber_confidence_value_(0),
+      rubber_entry_ready_value_(0),
       enable_gui_(false),
       px_per_m_(200.0f)
     {
@@ -175,6 +181,8 @@ public:
             0.05f, 1.0f);
         end_missing_frames_ = std::max(
             1, static_cast<int>(declare_parameter<int>("end_missing_frames", 3)));
+        session_lifecycle_.setEndMissingFrames(
+            static_cast<std::size_t>(end_missing_frames_));
 
         // 230에서는 가로 오차 0.17m만 넘어도 오프셋이 ±40으로 포화돼, 깊은
         // 코너가 전부 같은 값으로 뭉개졌다(실주행 bag으로 확인). 150이면
@@ -211,8 +219,15 @@ public:
             0.15f, 0.70f);
         resetSessionState();
 
-        // Reset is an edge-triggered command. The default mutually-exclusive
-        // callback group and single-threaded spin serialize it with scanCallback.
+        // The lifecycle topic is stateful: a restarted detector receives the
+        // latest SEARCH_ENTRY/CONE_ACTIVE command from Main.
+        auto session_qos = rclcpp::QoS(rclcpp::KeepLast(1))
+            .reliable().transient_local();
+        session_active_sub_ = create_subscription<std_msgs::msg::Bool>(
+            kRubberconeSessionActiveTopic, session_qos,
+            std::bind(&LidarViewer::sessionActiveCallback, this, _1));
+
+        // Keep the old edge command only as a manual/legacy SEARCH reset.
         auto reset_qos = rclcpp::QoS(rclcpp::KeepLast(10))
             .reliable().durability_volatile();
         reset_sub_ = create_subscription<std_msgs::msg::Empty>(
@@ -253,13 +268,8 @@ public:
     }
 
 private:
-    void resetSessionState()
+    void resetTrackingState()
     {
-        valid_frame_count_ = 0;
-        missing_frame_count_ = 0;
-        cone_section_armed_ = false;
-        end_latched_ = false;
-
         adaptive_half_width_ = nominal_half_width_;
         filtered_target_y_ = 0.0f;
         has_filtered_target_y_ = false;
@@ -269,6 +279,7 @@ private:
         rubber_offset_value_ = 0;
         rubber_end_value_ = 0;
         rubber_confidence_value_ = 0;
+        rubber_entry_ready_value_ = 0;
 
         // The GUI is diagnostic state, but clearing it here prevents an old
         // latched end/debounce display from being mistaken for the new session.
@@ -277,10 +288,27 @@ private:
         debug_.half_width = adaptive_half_width_;
     }
 
+    void resetSessionState()
+    {
+        session_lifecycle_.manualResetToSearch();
+        resetTrackingState();
+    }
+
+    void sessionActiveCallback(const std_msgs::msg::Bool::SharedPtr msg)
+    {
+        if (!session_lifecycle_.setActive(msg->data)) {
+            return;
+        }
+        resetTrackingState();
+        RCLCPP_INFO(
+            get_logger(), "Rubber-cone session phase %s",
+            msg->data ? "CONE_ACTIVE" : "SEARCH_ENTRY");
+    }
+
     void resetCallback(const std_msgs::msg::Empty::SharedPtr /*msg*/)
     {
         resetSessionState();
-        RCLCPP_INFO(get_logger(), "Rubber-cone session reset");
+        RCLCPP_INFO(get_logger(), "Rubber-cone legacy reset to SEARCH_ENTRY");
     }
 
     void publishInfo()
@@ -294,6 +322,7 @@ private:
             rubber_offset_value_,
             rubber_end_value_,
             rubber_confidence_value_,
+            rubber_entry_ready_value_,
         };
         info_pub_->publish(info_msg);
     }
@@ -605,22 +634,22 @@ private:
 
     void updateDetectionState(const PathEstimate& path)
     {
+        const int confidence = static_cast<int>(std::round(path.confidence * 100.0f));
+        const auto session = session_lifecycle_.update(
+            path.valid, path.confidence, now().seconds());
+        rubber_entry_ready_value_ = session.entry_ready ? 1 : 0;
+        rubber_end_value_ = session.end_latched ? 1 : 0;
+        if (session.armed_this_sample) {
+            RCLCPP_INFO(get_logger(), "Rubber-cone exit detection armed");
+        }
+        if (session.latched_this_sample) {
+            rubber_confidence_value_ = 0;
+            RCLCPP_INFO(
+                get_logger(), "Rubber-cone end latched after %zu missing frames",
+                session_lifecycle_.missingFrameCount());
+        }
+
         if (path.valid) {
-            missing_frame_count_ = 0;
-
-            // 한 개의 잡음 콘으로 종료 검출이 무장되지 않도록, 신뢰도 있는 프레임만 센다.
-            if (!cone_section_armed_) {
-                if (path.confidence >= 0.55f) {
-                    ++valid_frame_count_;
-                } else {
-                    valid_frame_count_ = 0;
-                }
-                if (valid_frame_count_ >= kArmValidFrames) {
-                    cone_section_armed_ = true;
-                    RCLCPP_INFO(get_logger(), "Rubber-cone exit detection armed");
-                }
-            }
-
             const float target_y = smoothTargetY(path);
             const float raw_offset = clampValue(
                 -target_y * offset_gain_, -offset_limit_, offset_limit_);
@@ -639,29 +668,16 @@ private:
             }
 
             rubber_offset_value_ = static_cast<int32_t>(std::round(filtered_offset_));
-            rubber_end_value_ = 0;
-            rubber_confidence_value_ = static_cast<int32_t>(std::round(path.confidence * 100.0f));
+            rubber_confidence_value_ = confidence;
             return;
         }
 
         // 짧은 스캔 누락에서는 마지막 조향값을 유지하되, 메인 노드가 감속할 수 있도록
         // 신뢰도만 빠르게 내린다.
         rubber_confidence_value_ = std::max(0, rubber_confidence_value_ - 25);
-        if (!cone_section_armed_) {
-            valid_frame_count_ = 0;
-            rubber_end_value_ = 0;
-            return;
-        }
-
-        ++missing_frame_count_;
-        if (missing_frame_count_ >= end_missing_frames_) {
-            end_latched_ = true;
-            rubber_end_value_ = 1;
+        if (session.end_latched) {
             rubber_confidence_value_ = 0;
-            RCLCPP_INFO(get_logger(), "Rubber-cone end latched after %d missing frames",
-                        missing_frame_count_);
-        } else {
-            rubber_end_value_ = 0;
+            rubber_entry_ready_value_ = 0;
         }
     }
 
@@ -775,7 +791,8 @@ private:
             {255, 255, 255});
         put("offset=" + std::to_string(snapshot.offset) +
             "  conf=" + std::to_string(snapshot.confidence) +
-            "  end=" + std::to_string(snapshot.end_flag), 2,
+            "  end=" + std::to_string(snapshot.end_flag) +
+            "  entry=" + std::to_string(snapshot.entry_ready), 2,
             snapshot.end_flag ? cv::Scalar{0, 0, 255} : cv::Scalar{0, 255, 0});
         put(snapshot.path.valid
                 ? "target=(" + fmt(snapshot.path.target.x) + ", " +
@@ -854,10 +871,6 @@ private:
     float offset_limit_;
     float max_offset_step_;
 
-    int valid_frame_count_;
-    int missing_frame_count_;
-    bool cone_section_armed_;
-    bool end_latched_;
     float filtered_target_y_;
     bool has_filtered_target_y_;
     float filtered_offset_;
@@ -868,9 +881,11 @@ private:
     float max_target_y_step_bilateral_;
     float max_target_y_step_one_side_;
     int end_missing_frames_;
+    rubbercone::SessionLifecycle session_lifecycle_;
     int32_t rubber_offset_value_;
     int32_t rubber_end_value_;
     int32_t rubber_confidence_value_;
+    int32_t rubber_entry_ready_value_;
 
     bool enable_gui_;
     float px_per_m_;
@@ -878,6 +893,7 @@ private:
     DebugSnapshot debug_;
 
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr session_active_sub_;
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr reset_sub_;
     rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr offset_pub_;
     rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr info_pub_;
@@ -885,9 +901,10 @@ private:
 
     void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
     {
-        if (end_latched_) {
+        if (session_lifecycle_.endLatched()) {
             rubber_end_value_ = 1;
             rubber_confidence_value_ = 0;
+            rubber_entry_ready_value_ = 0;
             publishInfo();
             // 종료 래치 이후에는 경로 추정을 멈추지만, 무엇이 보이는지는 계속 표시한다.
             if (enable_gui_) {
@@ -898,7 +915,7 @@ private:
                 debug_.raw_points = std::move(raw_points);
                 debug_.cone_centers = centers;
                 debug_.end_flag = 1;
-                debug_.armed = cone_section_armed_;
+                debug_.armed = session_lifecycle_.exitArmed();
             }
             return;
         }
@@ -920,7 +937,8 @@ private:
             debug_.offset = rubber_offset_value_;
             debug_.end_flag = rubber_end_value_;
             debug_.confidence = rubber_confidence_value_;
-            debug_.armed = cone_section_armed_;
+            debug_.entry_ready = rubber_entry_ready_value_;
+            debug_.armed = session_lifecycle_.exitArmed();
         }
     }
 };

@@ -1,9 +1,12 @@
 import inspect
+import time
 from types import SimpleNamespace
 
 import pytest
 import rclpy
 from rclpy.context import Context
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
@@ -14,7 +17,7 @@ from rclpy.qos import (
     qos_profile_sensor_data,
 )
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Empty, Float32MultiArray, Int16, Int32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, Int16, Int32MultiArray
 
 from main.main import (
     LANE_COMMAND_TOPIC,
@@ -24,16 +27,22 @@ from main.main import (
     OBJECT_INFO_TOPIC,
     RUBBERCONE_INFO_TOPIC,
     RUBBERCONE_OFFSET_TOPIC,
-    RUBBERCONE_RESET_TOPIC,
+    RUBBERCONE_SESSION_ACTIVE_TOPIC,
+    SIDE_CLEARANCE_TOPIC,
     parse_initial_mode,
-    rubbercone_reset_qos,
+    rubbercone_session_qos,
     sensor_event_qos,
 )
 from main.overtake import OvertakeGuard
 from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import RaceRuntimeAdapter
-from main.mission_types import ObjectLane, RouteTrafficSignal
+from main.mission_types import (
+    LaneTarget,
+    ObjectLane,
+    ObjectType,
+    RouteTrafficSignal,
+)
 
 
 class CallbackHarness:
@@ -48,7 +57,6 @@ class CallbackHarness:
         self.fixed_vehicle_lane = 0
         self.moving_vehicle_lane = 0
         self.traffic_signal = 0
-        # scan_callback 이 측면 거리를 계산하므로 실제 노드와 같은 필드를 갖춘다.
         self.overtake = OvertakeGuard()
         self.side_left = float("inf")
         self.side_right = float("inf")
@@ -61,6 +69,59 @@ class CallbackHarness:
 
     def _record_traffic_signal(self, value, received_at):
         return MainNode._record_traffic_signal(self, value, received_at)
+
+
+class _EntryLogger:
+    def __init__(self):
+        self.messages = []
+
+    def info(self, message):
+        self.messages.append(message)
+
+
+class ObjectEntryHarness(CallbackHarness):
+    """Minimal Main receiver that exercises the real object-entry ordering."""
+
+    def __init__(self, times, *, mode, state_entered_at):
+        super().__init__(times, mode=mode)
+        self.runtime.context.state_entered_at = state_entered_at
+        self.runtime.context.lane_target = LaneTarget.CENTER
+        self._zone_state = mode
+        self._fixed_entry_sent = False
+        self._logger = _EntryLogger()
+
+    def get_logger(self):
+        return self._logger
+
+
+def _object_entry_message(object_type, lane):
+    return SimpleNamespace(
+        data=[
+            0.0,
+            float("inf"),
+            0.0,
+            0.0,
+            0.0,
+            2090.0,
+            265.0,
+            199.5,
+            -14.541839599609375,
+            float(lane.value),
+            float(object_type.value),
+            0.9,
+        ],
+    )
+
+
+def _record_object_entry(harness, object_type, lane, *, now):
+    MainNode.object_info_raw_callback(
+        harness,
+        _object_entry_message(object_type, lane),
+    )
+    assert harness.runtime.record_lane_offset(0, now)
+    assert harness.runtime.record_scan(now)
+    MainNode._drive_mission_zones(harness, now)
+    return harness.runtime.step(now)
 
 
 def test_main_cone_callback_records_ros_clock_receipt_once():
@@ -117,6 +178,39 @@ def test_main_scan_and_cone_callbacks_use_the_same_clock_helper():
     assert cycle.observation.now == 3.02
 
 
+def test_main_side_clearance_callback_records_exact_semantic_contract():
+    harness = CallbackHarness([3.1])
+
+    MainNode.side_clearance_callback(
+        harness,
+        SimpleNamespace(data=[0.42, float("inf")]),
+    )
+
+    assert harness.runtime.latest_side_left == pytest.approx(0.42)
+    assert harness.runtime.latest_side_right == float("inf")
+    assert harness.runtime.side_clearance_received_at == 3.1
+    assert harness.runtime.perception_received_at["side_clearance"] == 3.1
+    assert harness.side_left == pytest.approx(0.42)
+    assert harness.side_right == float("inf")
+    assert harness.warnings == []
+
+
+@pytest.mark.parametrize(
+    "data",
+    ([0.2], [0.2, 0.3, 0.4], [-0.1, 0.3], [float("nan"), 0.3],
+     [float("-inf"), 0.3]),
+)
+def test_main_side_clearance_callback_rejects_malformed_payload(data):
+    harness = CallbackHarness([3.2])
+
+    MainNode.side_clearance_callback(harness, SimpleNamespace(data=data))
+
+    assert harness.runtime.side_clearance_received_at is None
+    assert harness.runtime.latest_side_left == float("inf")
+    assert harness.runtime.latest_side_right == float("inf")
+    assert harness.warnings[0][0] == "malformed_side_clearance"
+
+
 def test_main_object_raw_callback_records_validated_ten_field_snapshot():
     harness = CallbackHarness([4.0])
     message = SimpleNamespace(
@@ -164,6 +258,152 @@ def test_main_object_raw_callback_accepts_and_normalizes_no_cluster_heartbeat():
     assert cycle.observation.object_received_at == 4.0
     assert harness.runtime.lane_action.pending is False
     assert harness.warnings == []
+
+
+def test_moving_entry_snapshot_starts_one_lane_action_after_fsm_commit():
+    harness = ObjectEntryHarness(
+        [1.20],
+        mode=Mode.WAIT_GREEN,
+        state_entered_at=0.50,
+    )
+    assert harness.runtime.record_lane_offset(0, 1.0)
+    assert harness.runtime.record_scan(1.0)
+    assert harness.runtime.record_traffic(True, 1.0)
+    green = harness.runtime.step(1.0)
+    assert green.transition.target is Mode.LANE_DRIVE
+    assert harness.runtime.context.state_entered_at == pytest.approx(1.0)
+
+    cycle = _record_object_entry(
+        harness,
+        ObjectType.MOVING,
+        ObjectLane.RIGHT,
+        now=1.21,
+    )
+
+    assert cycle.transition.target is Mode.OVERTAKE
+    assert harness.runtime.context.state_entered_at == pytest.approx(1.21)
+    assert cycle.observation.object_received_at == pytest.approx(1.20)
+    assert cycle.observation.object_received_at < harness.runtime.context.state_entered_at
+    assert harness.runtime.context.lane_target is LaneTarget.LANE_ONE
+    assert harness.runtime.lane_action.target is LaneTarget.LANE_ONE
+    assert harness.runtime.lane_action.pending is True
+    assert harness.runtime.lane_action.started_at == pytest.approx(1.21)
+    assert harness.runtime._pending_object_entry_evidence is None
+
+    started_at = harness.runtime.lane_action.started_at
+    harness.runtime.step(1.22)
+    assert harness.runtime.lane_action.started_at == started_at
+
+
+def test_fixed_entry_snapshot_starts_one_lane_action_after_fsm_commit():
+    harness = ObjectEntryHarness(
+        [1.10],
+        mode=Mode.LANE_DRIVE,
+        state_entered_at=1.0,
+    )
+
+    cycle = _record_object_entry(
+        harness,
+        ObjectType.FIXED,
+        ObjectLane.LEFT,
+        now=1.20,
+    )
+
+    assert cycle.transition.target is Mode.FIXED_AVOID
+    assert harness.runtime.context.lane_target is LaneTarget.LANE_TWO
+    assert harness.runtime.lane_action.target is LaneTarget.LANE_TWO
+    assert harness.runtime.lane_action.pending is True
+    assert harness.runtime.lane_action.started_at == pytest.approx(1.20)
+    assert harness.runtime._pending_object_entry_evidence is None
+
+
+def test_unknown_fixed_entry_waits_for_one_post_zone_stable_lane():
+    harness = ObjectEntryHarness(
+        [1.10, 1.30],
+        mode=Mode.LANE_DRIVE,
+        state_entered_at=1.0,
+    )
+
+    entered = _record_object_entry(
+        harness,
+        ObjectType.FIXED,
+        ObjectLane.UNKNOWN,
+        now=1.20,
+    )
+    assert entered.transition.target is Mode.FIXED_AVOID
+    assert harness.runtime.context.lane_target is LaneTarget.CENTER
+    assert harness.runtime.lane_action.pending is False
+    assert harness.runtime._pending_object_entry_evidence is None
+
+    MainNode.object_info_raw_callback(
+        harness,
+        _object_entry_message(ObjectType.FIXED, ObjectLane.LEFT),
+    )
+    harness.runtime.step(1.31)
+
+    assert harness.runtime.context.lane_target is LaneTarget.LANE_TWO
+    assert harness.runtime.lane_action.target is LaneTarget.LANE_TWO
+    assert harness.runtime.lane_action.pending is True
+    assert harness.runtime.lane_action.started_at == pytest.approx(1.31)
+
+
+@pytest.mark.parametrize(
+    ("receipt_at", "now"),
+    [(0.90, 1.10), (1.10, 1.71)],
+    ids=["pre-lane-session", "stale"],
+)
+def test_unqualified_object_snapshot_never_becomes_entry_evidence(
+    receipt_at,
+    now,
+):
+    harness = ObjectEntryHarness(
+        [receipt_at],
+        mode=Mode.LANE_DRIVE,
+        state_entered_at=1.0,
+    )
+
+    cycle = _record_object_entry(
+        harness,
+        ObjectType.MOVING,
+        ObjectLane.RIGHT,
+        now=now,
+    )
+
+    assert cycle.transition.changed is False
+    assert harness.runtime.fsm.state is Mode.LANE_DRIVE
+    assert harness.runtime.context.lane_target is LaneTarget.CENTER
+    assert harness.runtime._pending_object_entry_evidence is None
+
+
+def test_entry_evidence_is_discarded_when_safety_commits_another_state():
+    runtime = RaceRuntimeAdapter(
+        fsm=RaceFSM(initial_state=Mode.LANE_DRIVE),
+        context=RaceContext(
+            state_entered_at=1.0,
+            lane_target=LaneTarget.CENTER,
+        ),
+    )
+    assert runtime.record_object_info(
+        _object_entry_message(ObjectType.FIXED, ObjectLane.LEFT).data,
+        1.10,
+    ).accepted
+    snapshot = runtime.latest_object_snapshot
+    assert snapshot is not None
+    assert runtime.record_object_mission_entry(
+        Mode.FIXED_AVOID,
+        snapshot,
+        1.20,
+    ).accepted
+
+    stopped = runtime.step(1.20, fault_reason="test safety fault")
+    assert stopped.transition.target is Mode.STOP
+    assert runtime._pending_object_entry_evidence is None
+
+    runtime.fsm.state = Mode.FIXED_AVOID
+    runtime.context.state_entered_at = 1.30
+    runtime.step(1.40)
+    assert runtime.context.lane_target is LaneTarget.CENTER
+    assert runtime.lane_action.pending is False
 
 
 @pytest.mark.parametrize(
@@ -223,16 +463,16 @@ def test_callback_and_control_cycle_read_the_same_node_clock_method():
     assert "self.runtime.step(" in cycle_source
 
 
-def test_rubbercone_topics_and_reset_qos_match_detector_contract():
-    qos = rubbercone_reset_qos()
+def test_rubbercone_topics_and_session_qos_match_detector_contract():
+    qos = rubbercone_session_qos()
 
     assert RUBBERCONE_INFO_TOPIC == "/rubbercone_info"
     assert RUBBERCONE_OFFSET_TOPIC == "/rubbercone_offset"
-    assert RUBBERCONE_RESET_TOPIC == "/rubbercone_reset"
+    assert RUBBERCONE_SESSION_ACTIVE_TOPIC == "/rubbercone_session_active"
     assert qos.history is HistoryPolicy.KEEP_LAST
-    assert qos.depth == 10
+    assert qos.depth == 1
     assert qos.reliability is ReliabilityPolicy.RELIABLE
-    assert qos.durability is DurabilityPolicy.VOLATILE
+    assert qos.durability is DurabilityPolicy.TRANSIENT_LOCAL
 
 
 def test_sensor_qos_is_compatible_with_cone_and_lidar_publishers():
@@ -299,13 +539,21 @@ def test_generated_ros_entities_have_exact_topic_type_and_qos():
         assert scan_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
         assert scan_sub.qos_profile.durability is DurabilityPolicy.VOLATILE
 
-        reset_pub = node.rubbercone_reset_pub
-        assert reset_pub.topic_name == RUBBERCONE_RESET_TOPIC
-        assert reset_pub.msg_type is Empty
-        assert reset_pub.qos_profile.history is HistoryPolicy.KEEP_LAST
-        assert reset_pub.qos_profile.depth == 10
-        assert reset_pub.qos_profile.reliability is ReliabilityPolicy.RELIABLE
-        assert reset_pub.qos_profile.durability is DurabilityPolicy.VOLATILE
+        side_sub = node.side_clearance_sub
+        assert side_sub.topic_name == SIDE_CLEARANCE_TOPIC
+        assert side_sub.msg_type is Float32MultiArray
+        assert side_sub.qos_profile.history is HistoryPolicy.KEEP_LAST
+        assert side_sub.qos_profile.depth == 1
+        assert side_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
+        assert side_sub.qos_profile.durability is DurabilityPolicy.VOLATILE
+
+        session_pub = node.rubbercone_session_active_pub
+        assert session_pub.topic_name == RUBBERCONE_SESSION_ACTIVE_TOPIC
+        assert session_pub.msg_type is Bool
+        assert session_pub.qos_profile.history is HistoryPolicy.KEEP_LAST
+        assert session_pub.qos_profile.depth == 1
+        assert session_pub.qos_profile.reliability is ReliabilityPolicy.RELIABLE
+        assert session_pub.qos_profile.durability is DurabilityPolicy.TRANSIENT_LOCAL
 
         lane_change_sub = node.lane_change_state_sub
         assert lane_change_sub.topic_name == LANE_CHANGE_STATE_TOPIC
@@ -340,6 +588,33 @@ def test_generated_ros_entities_have_exact_topic_type_and_qos():
         assert not hasattr(node, "lane_validity_sub")
     finally:
         node.destroy_node()
+        rclpy.shutdown(context=context)
+
+
+def test_main_bootstrap_retains_search_entry_session_state():
+    context = Context()
+    rclpy.init(context=context)
+    main_node = MainNode(context=context)
+    observer = Node("cone_session_bootstrap_observer", context=context)
+    received = []
+    observer.create_subscription(
+        Bool,
+        RUBBERCONE_SESSION_ACTIVE_TOPIC,
+        lambda message: received.append(message.data),
+        rubbercone_session_qos(),
+    )
+    executor = SingleThreadedExecutor(context=context)
+    executor.add_node(observer)
+    try:
+        deadline = time.monotonic() + 2.0
+        while not received and time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.05)
+        assert received == [False]
+    finally:
+        executor.remove_node(observer)
+        executor.shutdown()
+        observer.destroy_node()
+        main_node.destroy_node()
         rclpy.shutdown(context=context)
 
 
@@ -540,20 +815,75 @@ def test_is_pass_comp_delegates_to_the_pure_guard():
         node._enter_zone(0.0)
         node.detected_lane = 1            # 1차선(왼쪽) 주행 → 오른쪽을 본다
         # bag 실측 통과 거리(0.26~0.34 m) 안쪽 값. side_detect_m 미만이어야 한다.
-        node.side_right = 0.30
-
         delay = node.overtake.config.pass_delay_s
+        assert node.runtime.record_side_clearance(float("inf"), 0.30, 1.0)
         assert node.is_pass_comp(1.0) is False
         assert node.overtake.side_seen_at == 1.0
 
         # 완료 타이머는 장애물이 감지된 시점이 아니라, 측면에서 사라진
         # 시점부터 시작한다. 같은 근거리 값이 유지되면 고착 센서로 보고
         # fail-closed 상태를 유지해야 한다.
-        node.side_right = float("inf")
         clear_started_at = 1.1
+        assert node.runtime.record_side_clearance(
+            float("inf"),
+            float("inf"),
+            clear_started_at,
+        )
         assert node.is_pass_comp(clear_started_at) is False
         assert node.overtake.clear_started_at == clear_started_at
-        assert node.is_pass_comp(clear_started_at + delay) is True
+        completed = False
+        for now in (1.5, 1.9, 2.3, 2.7, clear_started_at + delay):
+            assert node.runtime.record_side_clearance(
+                float("inf"),
+                float("inf"),
+                now,
+            )
+            completed = node.is_pass_comp(now)
+        assert completed is True
+    finally:
+        rclpy.shutdown()
+
+
+def test_pass_completion_requires_fresh_post_zone_side_semantics():
+    import rclpy
+    from main.main import MainNode
+    from main.race_fsm import Mode
+
+    rclpy.init(args=['--ros-args', '-p', 'mode:=2'])
+    try:
+        node = MainNode()
+        node.runtime.fsm.state = Mode.OVERTAKE
+        node._enter_zone(1.0)
+        node.detected_lane = 1
+
+        assert node.is_pass_comp(1.0) is False
+        assert node.runtime.record_side_clearance(float("inf"), 0.30, 0.9)
+        assert node.is_pass_comp(1.0) is False
+        assert node.overtake.side_seen_at is None
+
+        assert node.runtime.record_side_clearance(float("inf"), 0.30, 1.2)
+        assert node.is_pass_comp(1.1) is False
+        assert node.overtake.side_seen_at is None
+
+        assert node.runtime.record_side_clearance(float("inf"), 0.30, 1.3)
+        assert node.is_pass_comp(1.3) is False
+        assert node.overtake.side_seen_at == pytest.approx(1.3)
+
+        assert node.runtime.record_side_clearance(
+            float("inf"), float("inf"), 1.4
+        )
+        assert node.is_pass_comp(1.4) is False
+        assert node.overtake.clear_started_at == pytest.approx(1.4)
+
+        assert node.is_pass_comp(2.0) is False
+        assert node.overtake.clear_started_at is None
+        assert node.overtake.side_seen_at == pytest.approx(1.3)
+
+        assert node.runtime.record_side_clearance(
+            float("inf"), float("inf"), 2.1
+        )
+        assert node.is_pass_comp(2.1) is False
+        assert node.overtake.clear_started_at == pytest.approx(2.1)
     finally:
         rclpy.shutdown()
 

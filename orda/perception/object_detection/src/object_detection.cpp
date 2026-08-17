@@ -18,6 +18,7 @@
 //    box_size, box_cx, box_cy, dx(cx-x_line), lane_label,
 //    object_type, confidence]
 //   object_type: -1=미검출, 0=고정장애물, 1=방해차량
+//   /side_clearance (std_msgs/Float32MultiArray [left_m, right_m])
 //
 // 디버그 창 (enable_gui=true 시):
 //   "OBJECT DEBUG" : exists / distance / cluster_size
@@ -41,6 +42,9 @@
 #include <vector>
 #include <iomanip>
 #include <sstream>
+
+#include "object_detection/lane_stabilizer.hpp"
+#include "object_detection/side_clearance.hpp"
 
 using std::placeholders::_1;
 
@@ -106,6 +110,8 @@ public:
         // QoS 프로파일
         // - qos_fast: 수치 토픽용 Best Effort + Volatile
         auto qos_fast = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
+        auto qos_semantic =
+            rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
 
         // LiDAR 스캔 구독
         sub_scan_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
@@ -135,6 +141,9 @@ public:
             "/object_info", qos_fast);
         pub_obj_raw_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
             "/object_info_raw", qos_fast);
+        pub_side_clearance_ =
+            this->create_publisher<std_msgs::msg::Float32MultiArray>(
+                "/side_clearance", qos_semantic);
 
         // ── YOLO 모델 초기화 ────────────────────────────────────────────
         // 모델 경로는 개발 PC / 실차 두 곳을 순서대로 확인한다 (resolveModelPath).
@@ -358,6 +367,13 @@ private:
             else moving = legacy;
         }
 
+        const rclcpp::Time sample_stamp = now();
+        const double sample_time = sample_stamp.seconds();
+        const int fixed_stable_lane = fixed_lane_stabilizer_.update(
+            fixed.detected, fixed.lane, sample_time);
+        const int moving_stable_lane = moving_lane_stabilizer_.update(
+            moving.detected, moving.lane, sample_time);
+
         const ParsedDetection* closest = nullptr;
         if (fixed.detected) closest = &fixed;
         if (moving.detected && (closest == nullptr || moving.area > closest->area)) {
@@ -365,16 +381,17 @@ private:
         }
 
         std::lock_guard<std::mutex> lk(mtx_box_);
-        last_fixed_lane_label_ = fixed.detected ? fixed.lane : 0;
-        last_moving_lane_label_ = moving.detected ? moving.lane : 0;
+        last_fixed_lane_label_ = fixed.detected ? fixed_stable_lane : 0;
+        last_moving_lane_label_ = moving.detected ? moving_stable_lane : 0;
         last_box_area_pix_ = closest != nullptr ? closest->area : 0.0f;
         last_box_cx_ = closest != nullptr ? closest->cx : 0.0f;
         last_box_cy_ = closest != nullptr ? closest->cy : 0.0f;
         last_box_dx_ = closest != nullptr ? closest->dx : 0.0f;
-        last_lane_label_ = closest != nullptr ? closest->lane : 0;
+        last_lane_label_ = closest == &fixed ? fixed_stable_lane :
+            closest == &moving ? moving_stable_lane : 0;
         last_object_type_ = closest != nullptr ? closest->type : -1;
         last_object_confidence_ = closest != nullptr ? closest->confidence : 0.0f;
-        last_box_stamp_ = now();
+        last_box_stamp_ = sample_stamp;
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -384,6 +401,19 @@ private:
     // 연속 인덱스 기반으로 클러스터링하여 가장 가까운 클러스터를 저장한다.
     // ─────────────────────────────────────────────────────────────────────
     void onScan(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+        const auto side_clearance = object_detection::calculateSideClearance(
+            msg->ranges,
+            msg->angle_min,
+            msg->angle_max,
+            msg->angle_increment,
+            msg->range_min,
+            msg->range_max);
+        if (side_clearance.publishable) {
+            std_msgs::msg::Float32MultiArray side_msg;
+            side_msg.data = {side_clearance.left_m, side_clearance.right_m};
+            pub_side_clearance_->publish(side_msg);
+        }
+
         const int N = static_cast<int>(msg->ranges.size());
         if (N == 0 || msg->angle_increment <= 0.0) {
             publishEmpty();
@@ -827,16 +857,20 @@ private:
         // 없었다"와 "한참 전 결과가 남아 있다"는 다르다.
         {
             std::lock_guard<std::mutex> lk(mtx_box_);
+            const rclcpp::Time sample_stamp = now();
+            const int stable_lane = fixed_lane_stabilizer_.update(
+                box_area > 0.0f, lane_label, sample_stamp.seconds());
+            moving_lane_stabilizer_.update(false, 0, sample_stamp.seconds());
             last_box_area_pix_ = box_area;
             last_box_cx_       = box_cx;
             last_box_cy_       = box_cy;
             last_box_dx_       = box_dx;
-            last_lane_label_   = lane_label;
+            last_lane_label_   = stable_lane;
             last_object_type_  = box_area > 0.0f ? 0 : -1;
             last_object_confidence_ = 0.0f;
-            last_fixed_lane_label_ = box_area > 0.0f ? lane_label : 0;
+            last_fixed_lane_label_ = box_area > 0.0f ? stable_lane : 0;
             last_moving_lane_label_ = 0;
-            last_box_stamp_    = now();
+            last_box_stamp_    = sample_stamp;
         }
     }
 
@@ -911,6 +945,7 @@ private:
     rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr              sub_traffic_;
     rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr       pub_obj_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr     pub_obj_raw_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr     pub_side_clearance_;
     rclcpp::TimerBase::SharedPtr timer_;      // 디버그 창 갱신 타이머
     rclcpp::TimerBase::SharedPtr pub_timer_;  // 발행 타이머
 
@@ -945,6 +980,8 @@ private:
     int   last_object_type_  = -1;
     float last_object_confidence_ = 0.0f;
     rclcpp::Time last_box_stamp_{0, 0, RCL_ROS_TIME};  // 마지막 YOLO 갱신 시각
+    object_detection::LaneStabilizer fixed_lane_stabilizer_;
+    object_detection::LaneStabilizer moving_lane_stabilizer_;
 
     // ── 신호등 YOLO 공유 변수 (뮤텍스: mtx_traffic_) ──────────────────
     std::mutex mtx_traffic_;

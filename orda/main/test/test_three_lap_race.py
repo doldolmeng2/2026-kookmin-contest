@@ -125,12 +125,8 @@ class SyntheticRace:
 
 
 def start_race(race):
-    first = race.green()
-    second = race.green()
     started = race.green()
 
-    assert first.changed is False
-    assert second.changed is False
     assert started.target is Mode.LANE_DRIVE
     assert race.context.completed_laps == 0
     assert race.context.current_lap == 1

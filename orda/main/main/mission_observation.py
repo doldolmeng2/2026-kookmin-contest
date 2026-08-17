@@ -29,6 +29,9 @@ class MissionObservation:
     cone_finished: bool = False
     cone_confidence: Optional[int] = None
     cone_end_flag: Optional[bool] = None
+    # ``None`` is the explicit three-field legacy replay contract.  Live
+    # four-field perception publishes a final semantic approval as bool.
+    cone_entry_ready: Optional[bool] = None
     cone_message_received_at: Optional[float] = None
     scan_received_at: Optional[float] = None
     object_exists: bool = False
