@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <chrono>
 #include "lane_change_state_tracker.hpp"
+#include "lane_detection/lane_measurement_publication_policy.hpp"
 #include "parameter_loader.hpp"
 
 using namespace std;
@@ -731,89 +732,102 @@ public:
         return out;
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // 토픽 발행 + 디버그 시각화
-    //
-    // 1) /lane_offset  (Int16)                발행
-    // 2) /lane_fit     (Float32MultiArray [m, b], 프레임 좌표계) 발행
-    // 3) debug_view_ ON 시 슬라이딩 윈도우 BEV + 오프셋 슬라이더 창 표시
-    // ─────────────────────────────────────────────────────────────────────
-    void publishAndDebug(const cv::Mat& frame_in,
-                         float offset,
-                         const LineFit& fit_bev,
-                         bool show_dbg,
-                         const cv::Mat* dbg_from_fit = nullptr)
-    {
-        cv::Mat frame = frame_in.clone();
+  // ─────────────────────────────────────────────────────────────────────
+  // 토픽 발행 + 디버그 시각화
+  //
+  // 1) /lane_offset  (Int16)                발행
+  // 2) /lane_fit     (Float32MultiArray [m, b], 프레임 좌표계) 발행
+  // 3) debug_view_ ON 시 슬라이딩 윈도우 BEV + 오프셋 슬라이더 창 표시
+  // ─────────────────────────────────────────────────────────────────────
+  lane_detection::LaneMeasurementPublicationPolicy publishAndDebug(
+    const cv::Mat & frame_in,
+    float offset,
+    const LineFit & fit_bev,
+    bool fit_valid,
+    bool show_dbg,
+    const cv::Mat * dbg_from_fit = nullptr)
+  {
+    cv::Mat frame = frame_in.clone();
 
-        // BEV 직선을 원본 프레임 좌표계의 두 점으로 역투영
-        cv::Point2f P0, P1;
-        bool mapped = bevLineToFrame(fit_bev, P0, P1);
+    // BEV 직선을 원본 프레임 좌표계의 두 점으로 역투영
+    cv::Point2f P0, P1;
+    bool mapped = bevLineToFrame(fit_bev, P0, P1);
 
-        // 역투영된 두 점으로 프레임 좌표계 x = m*y + b 복원
-        LineFit fit_frame{0.f, 0.f};
-        if (mapped) {
-            float dy = P1.y - P0.y;
-            if (std::abs(dy) < 1e-6f)
-                dy = (dy >= 0 ? 1e-6f : -1e-6f);
-            fit_frame.m = (P1.x - P0.x) / dy;
-            fit_frame.b = P0.x - fit_frame.m * P0.y;
-        }
-
-        // /lane_offset 발행
-        std_msgs::msg::Int16 offset_msg;
-        offset_msg.data = static_cast<int16_t>(std::round(offset));
-        offset_pub_->publish(offset_msg);
-
-        // /lane_fit 발행 (프레임 좌표계 [m, b])
-        std_msgs::msg::Float32MultiArray fit_msg;
-        fit_msg.data = { fit_frame.m, fit_frame.b };
-        fit_pub_->publish(fit_msg);
-
-        // 슬라이딩 윈도우 BEV 디버그 창 표시
-        if (debug_view_ && show_dbg && dbg_from_fit && !dbg_from_fit->empty())
-            cv::imshow("SlidingWindows", *dbg_from_fit);
-
-        // 오프셋 슬라이더 창 표시 (debug_lane_view 설정 시)
-        // waitKey는 debug_lane_view와 무관하게 호출해야 한다. HighGUI 이벤트 펌프
-        // 역할을 하므로, 이걸 건너뛰면 남아있는 창(SlidingWindows/Mask-Yellow)이
-        // 갱신되지 않는다.
-        if (debug_view_ && show_dbg && debug_lane_view_) {
-            cv::Mat vis = drawOffsetSlider(frame, offset, lane_mode_);
-            cv::imshow("Lane View + Offset", vis);
-            cv::waitKey(1);
-        } else {
-            cv::waitKey(1);
-        }
+    // 역투영된 두 점으로 프레임 좌표계 x = m*y + b 복원
+    LineFit fit_frame{0.f, 0.f};
+    if (mapped) {
+      float dy = P1.y - P0.y;
+      if (std::abs(dy) < 1e-6f)
+        dy = (dy >= 0 ? 1e-6f : -1e-6f);
+      fit_frame.m = (P1.x - P0.x) / dy;
+      fit_frame.b = P0.x - fit_frame.m * P0.y;
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // BEV 직선 → 원본 프레임 좌표 역투영
-    //
-    // BEV 세로 양 끝(y=0, y=bev_h-1)에서 x를 계산한 뒤
-    // H_inv_(BEV→프레임 역호모그래피)로 변환한다.
-    // ─────────────────────────────────────────────────────────────────────
-    bool bevLineToFrame(const LineFit& lf, cv::Point2f& p_frame0, cv::Point2f& p_frame1) {
-        if (bev_size_.width <= 1 || bev_size_.height <= 1 || H_inv_.empty()) return false;
+    const auto publication_policy =
+      lane_detection::measurementPublicationPolicy(fit_valid, mapped);
 
-        float y0 = 0.0f;
-        float y1 = static_cast<float>(bev_size_.height - 1);
-        float x0 = lf.m * y0 + lf.b;
-        float x1 = lf.m * y1 + lf.b;
-
-        auto clampf = [](float v, float lo, float hi){ return std::max(lo, std::min(hi, v)); };
-        x0 = clampf(x0, 0.0f, static_cast<float>(bev_size_.width - 1));
-        x1 = clampf(x1, 0.0f, static_cast<float>(bev_size_.width - 1));
-
-        std::vector<cv::Point2f> src = { {x0, y0}, {x1, y1} };
-        std::vector<cv::Point2f> dst;
-        cv::perspectiveTransform(src, dst, H_inv_);
-
-        if (dst.size() != 2) return false;
-        p_frame0 = dst[0];
-        p_frame1 = dst[1];
-        return true;
+    // /lane_offset 발행
+    if (publication_policy.publish_offset) {
+      std_msgs::msg::Int16 offset_msg;
+      offset_msg.data = static_cast<int16_t>(std::round(offset));
+      offset_pub_->publish(offset_msg);
     }
+
+    // /lane_fit 발행 (프레임 좌표계 [m, b])
+    if (publication_policy.publish_fit) {
+      std_msgs::msg::Float32MultiArray fit_msg;
+      fit_msg.data = {fit_frame.m, fit_frame.b};
+      fit_pub_->publish(fit_msg);
+    }
+
+    // 슬라이딩 윈도우 BEV 디버그 창 표시
+    if (debug_view_ && show_dbg && dbg_from_fit && !dbg_from_fit->empty())
+      cv::imshow("SlidingWindows", *dbg_from_fit);
+
+    // 오프셋 슬라이더 창 표시 (debug_lane_view 설정 시)
+    // waitKey는 debug_lane_view와 무관하게 호출해야 한다. HighGUI 이벤트 펌프
+    // 역할을 하므로, 이걸 건너뛰면 남아있는 창(SlidingWindows/Mask-Yellow)이
+    // 갱신되지 않는다.
+    if (debug_view_ && show_dbg && debug_lane_view_) {
+      cv::Mat vis = drawOffsetSlider(frame, offset, lane_mode_);
+      cv::imshow("Lane View + Offset", vis);
+      cv::waitKey(1);
+    } else {
+      cv::waitKey(1);
+    }
+    return publication_policy;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // BEV 직선 → 원본 프레임 좌표 역투영
+  //
+  // BEV 세로 양 끝(y=0, y=bev_h-1)에서 x를 계산한 뒤
+  // H_inv_(BEV→프레임 역호모그래피)로 변환한다.
+  // ─────────────────────────────────────────────────────────────────────
+  bool bevLineToFrame(const LineFit & lf, cv::Point2f & p_frame0, cv::Point2f & p_frame1)
+  {
+    if (bev_size_.width <= 1 || bev_size_.height <= 1 || H_inv_.empty()) return false;
+
+    float y0 = 0.0f;
+    float y1 = static_cast<float>(bev_size_.height - 1);
+    float x0 = lf.m * y0 + lf.b;
+    float x1 = lf.m * y1 + lf.b;
+
+    auto clampf = [](float v, float lo, float hi) {return std::max(lo, std::min(hi, v));};
+    x0 = clampf(x0, 0.0f, static_cast<float>(bev_size_.width - 1));
+    x1 = clampf(x1, 0.0f, static_cast<float>(bev_size_.width - 1));
+
+    std::vector<cv::Point2f> src = {{x0, y0}, {x1, y1}};
+    std::vector<cv::Point2f> dst;
+    cv::perspectiveTransform(src, dst, H_inv_);
+
+    if (dst.size() != 2 ||
+      !std::isfinite(dst[0].x) || !std::isfinite(dst[0].y) ||
+      !std::isfinite(dst[1].x) || !std::isfinite(dst[1].y)) {return false;}
+    p_frame0 = dst[0];
+    p_frame1 = dst[1];
+    return true;
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // 회전된 사각형(바퀴 등)을 그리기 위한 헬퍼: center 기준 angle_deg만큼
@@ -1139,18 +1153,19 @@ private:
             offset = has_prev_center_fit_ ? prev_offset_ : 0.f;
         }
 
-        // (6) 토픽 발행 + 디버그 출력
-        publishAndDebug(frame, offset, center_fit, show_dbg,
-                        dbg.empty() ? nullptr : &dbg);
+    // (6) 토픽 발행 + 디버그 출력
+    const auto publication_policy = publishAndDebug(
+      frame, offset, center_fit, valid, show_dbg,
+      dbg.empty() ? nullptr : &dbg);
 
-        // Use this frame's explicit fitting validity. A failed fit may reuse
-        // the prior offset for lane control, but it must reset completion
-        // progress rather than treating stale geometry as fresh evidence.
-        updateLaneChangeState(valid, center_fit, offset);
+    // A failed fit may retain prior geometry for internal tracking/debug,
+    // but invalid evidence must reset lane-change completion progress.
+    updateLaneChangeState(valid, center_fit, offset);
 
-        // 실측 현재 차선 판정 및 /lane_position 발행 (제어 목표와 무관한 인지값)
-        const LineFit& effective_fit = valid ? center_fit : prev_center_fit_;
-        updateAndPublishDetectedLane(effective_fit, valid || has_prev_center_fit_);
+    // 실측 현재 차선 판정 및 /lane_position 발행 (제어 목표와 무관한 인지값)
+    if (publication_policy.publish_lane_position) {
+      updateAndPublishDetectedLane(center_fit, true);
+  }
     }
 
     // ─────────────────────────────────────────────────────────────────────

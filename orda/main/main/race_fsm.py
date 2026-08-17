@@ -6,11 +6,6 @@ import math
 from typing import Optional
 
 from .cone_entry import ConeEntryConfig, ConeEntryDebouncer, ConeEntryDecision
-from .lane_validity import (
-    LaneValidityConfig,
-    LaneValidityDebouncer,
-    LaneValidityDecision,
-)
 from .mission_observation import MissionObservation
 from .mission_types import RouteTrafficSignal
 from .race_context import RaceContext
@@ -21,12 +16,10 @@ _TIMESTAMP_EPSILON_S = 1e-6
 
 
 class Mode(str, Enum):
-    INIT = "INIT"
-    WAIT_TRAFFIC = "WAIT_TRAFFIC"
-    WAIT_GREEN = "WAIT_TRAFFIC"  # compatibility alias
+    WAIT_GREEN = "WAIT_GREEN"
+    WAIT_TRAFFIC = "WAIT_GREEN"  # compatibility alias for old bags/configs
     LANE_DRIVE = "LANE_DRIVE"
     CONE_DRIVE = "CONE_DRIVE"
-    REJOIN = "REJOIN"
     FIXED_AVOID = "FIXED_AVOID"
     OVERTAKE = "OVERTAKE"
     SHORTCUT = "SHORTCUT"
@@ -45,47 +38,8 @@ class Transition:
         return self.source is not self.target
 
 
-class _GreenDebouncer:
-    def __init__(
-        self,
-        min_consecutive_frames: int,
-        min_duration_s: float,
-    ) -> None:
-        if min_consecutive_frames < 1:
-            raise ValueError("min_consecutive_frames must be at least one")
-        if min_duration_s < 0.0:
-            raise ValueError("min_duration_s must not be negative")
-
-        self._min_consecutive_frames = min_consecutive_frames
-        self._min_duration_s = min_duration_s
-        self.reset()
-
-    def reset(self) -> None:
-        self._consecutive_frames = 0
-        self._first_detected_at: Optional[float] = None
-
-    @property
-    def first_detected_at(self) -> Optional[float]:
-        return self._first_detected_at
-
-    def update(self, detected: bool, now: float) -> bool:
-        if not detected:
-            self.reset()
-            return False
-
-        if self._consecutive_frames == 0:
-            self._first_detected_at = now
-        self._consecutive_frames += 1
-
-        duration_s = now - self._first_detected_at
-        return (
-            self._consecutive_frames >= self._min_consecutive_frames
-            and duration_s >= self._min_duration_s
-        )
-
-
 class RaceFSM:
-    """Apply the complete ten-state orchestration without ROS side effects."""
+    """Apply the race orchestration without ROS side effects."""
 
     # FINISH만 진짜 종료 상태다. STOP은 "복귀 가능한 안전 정지"다.
     #
@@ -104,20 +58,13 @@ class RaceFSM:
 
     def __init__(
         self,
-        initial_state: Mode = Mode.INIT,
+        initial_state: Mode = Mode.WAIT_GREEN,
         *,
-        green_min_consecutive_frames: int = 3,
-        green_min_duration_s: float = 0.0,
         green_max_age_s: float = 0.5,
         mission_event_max_age_s: float = 0.5,
         cone_entry_config: Optional[ConeEntryConfig] = None,
-        lane_validity_config: Optional[LaneValidityConfig] = None,
     ) -> None:
         self.state = initial_state
-        self._green = _GreenDebouncer(
-            green_min_consecutive_frames,
-            green_min_duration_s,
-        )
         if (
             isinstance(green_max_age_s, bool)
             or not isinstance(green_max_age_s, (int, float))
@@ -137,8 +84,8 @@ class RaceFSM:
             )
         self.mission_event_max_age_s = mission_event_max_age_s
         self._cone_entry = ConeEntryDebouncer(cone_entry_config)
-        self._lane_validity = LaneValidityDebouncer(lane_validity_config)
         self._last_cone_drive_message_at: Optional[float] = None
+        self._last_live_cone_entry_message_at: Optional[float] = None
         self._last_traffic_message_at: Optional[float] = None
         self._last_mission_message_at: dict[str, float] = {}
         self._cone_exit_armed = False
@@ -146,9 +93,6 @@ class RaceFSM:
         self._stop_source: Optional[Mode] = None
         self._stop_healthy_since: Optional[float] = None
         self.last_cone_entry_decision: Optional[ConeEntryDecision] = None
-        self.last_lane_validity_decision: Optional[
-            LaneValidityDecision
-        ] = None
 
     @property
     def cone_entry_config(self) -> ConeEntryConfig:
@@ -162,10 +106,6 @@ class RaceFSM:
     def cone_exit_armed(self) -> bool:
         return self._cone_exit_armed
 
-    @property
-    def lane_validity_guard(self) -> LaneValidityDebouncer:
-        return self._lane_validity
-
     def step(
         self,
         observation: MissionObservation,
@@ -173,7 +113,6 @@ class RaceFSM:
         safety: SafetyDecision,
     ) -> Transition:
         self.last_cone_entry_decision = None
-        self.last_lane_validity_decision = None
 
         if self.state in self.TERMINAL_STATES:
             return self._stay("terminal state")
@@ -181,9 +120,7 @@ class RaceFSM:
         if safety.must_stop:
             reason = safety.reason or "safety stop"
             context.stop_reason = reason
-            self._green.reset()
             self._cone_entry.deactivate()
-            self._lane_validity.deactivate()
             self._cone_exit_armed = False
             self._stop_healthy_since = None
             # 정지 직전 모드를 기억해 두었다가 회복되면 그 구간으로 돌아간다.
@@ -220,46 +157,26 @@ class RaceFSM:
                 observation.now,
             )
 
-        if self.state is Mode.INIT:
-            if safety.inputs_ready:
-                self._green.reset()
-                return self._change(
-                    Mode.WAIT_GREEN,
-                    "required inputs ready",
-                    context,
-                    observation.now,
-                )
-            return self._stay("waiting for required inputs")
-
         if self.state is Mode.WAIT_GREEN:
             if not safety.inputs_ready:
-                self._green.reset()
                 return self._stay("waiting for required inputs")
 
             if observation.traffic_message_received_at is None:
                 return self._stay("waiting for new traffic message")
-            if not self._accept_new_traffic_message(observation):
-                self._green.reset()
+            if not self._accept_new_traffic_message(observation, context):
                 return self._stay("invalid or stale traffic message")
 
-            if self._green.update(
-                observation.green_detected,
-                observation.traffic_message_received_at,
-            ):
-                # The 2026-07-29 "제9회 경주 진행 방법" p.17 starts the
-                # official clock when the signal turns blue, not when the
-                # debounce decision commits. Receipt time is the closest
-                # available observation of that edge in this clock domain, so
-                # retain the first fresh green in the successful sequence while
-                # committing the Mode at observation.now.
-                context.race_started_at = self._green.first_detected_at
+            if observation.green_detected:
+                # traffic_node has already classified and debounced this
+                # semantic signal. Main owns only receipt/session freshness.
+                context.race_started_at = observation.traffic_message_received_at
                 return self._change(
                     Mode.LANE_DRIVE,
-                    "green signal debounced",
+                    "stable green signal",
                     context,
                     observation.now,
                 )
-            return self._stay("waiting for debounced green")
+            return self._stay("waiting for stable green")
 
         if self.state is Mode.LANE_DRIVE:
             route_transition = self._handle_traffic_encounter(
@@ -311,6 +228,26 @@ class RaceFSM:
                 self._cone_entry.deactivate()
                 return self._stay("normal-route missions suppressed on shortcut lap")
 
+            if observation.cone_entry_ready is not None:
+                self._cone_entry.deactivate()
+                if not self._accept_live_cone_entry_message(observation, context):
+                    return self._stay("invalid or stale live cone message")
+                if observation.cone_entry_ready:
+                    context.cone_entered_at = observation.now
+                    self._cone_exit_armed = False
+                    self._last_cone_drive_message_at = (
+                        observation.cone_message_received_at
+                    )
+                    return self._change(
+                        Mode.CONE_DRIVE,
+                        "perception-approved cone entry",
+                        context,
+                        observation.now,
+                    )
+                return self._stay("cone entry not approved by perception")
+
+            # Explicit legacy replay boundary: only three-field recordings use
+            # the former Main-side confidence/count/duration guard.
             decision = self._cone_entry.evaluate(observation)
             self.last_cone_entry_decision = decision
             if decision.triggered:
@@ -340,7 +277,6 @@ class RaceFSM:
                 # that episode commits its exit so a later normal lap can
                 # qualify independently.
                 self._cone_entry.deactivate()
-                self._lane_validity.deactivate()
                 self._cone_exit_armed = False
                 return self._change(
                     Mode.LANE_DRIVE,
@@ -350,25 +286,8 @@ class RaceFSM:
                 )
             return self._stay("cone end flag received before session armed")
 
-        if self.state is Mode.REJOIN:
-            decision = self._lane_validity.evaluate(
-                observation,
-                context.state_entered_at,
-            )
-            self.last_lane_validity_decision = decision
-            if decision.triggered:
-                self._lane_validity.deactivate()
-                return self._change(
-                    Mode.LANE_DRIVE,
-                    "fresh lane validity confirmed",
-                    context,
-                    observation.now,
-                )
-            return self._stay(decision.reason)
-
         if self.state is Mode.FIXED_AVOID:
             self._cone_entry.deactivate()
-            self._lane_validity.deactivate()
             if (
                 observation.fixed_zone_exited is True
                 and self._accept_mission_edge(
@@ -406,7 +325,6 @@ class RaceFSM:
 
         if self.state is Mode.OVERTAKE:
             self._cone_entry.deactivate()
-            self._lane_validity.deactivate()
             if (
                 observation.overtake_complete is True
                 and self._accept_mission_edge(
@@ -426,7 +344,6 @@ class RaceFSM:
 
         if self.state is Mode.SHORTCUT:
             self._cone_entry.deactivate()
-            self._lane_validity.deactivate()
             if (
                 observation.shortcut_complete is True
                 and self._accept_mission_edge(
@@ -447,7 +364,6 @@ class RaceFSM:
         # Cone-entry evidence must never accumulate outside LANE_DRIVE. Keep a
         # completed episode rearmed for a future LANE_DRIVE visit.
         self._cone_entry.deactivate()
-        self._lane_validity.deactivate()
 
         return self._stay("transition not implemented in this phase")
 
@@ -542,6 +458,7 @@ class RaceFSM:
     def _accept_new_traffic_message(
         self,
         observation: MissionObservation,
+        context: RaceContext,
     ) -> bool:
         timestamp = observation.traffic_message_received_at
         if not self._valid_timestamp(timestamp):
@@ -551,14 +468,47 @@ class RaceFSM:
             and timestamp <= self._last_traffic_message_at
         ):
             return False
-        self._last_traffic_message_at = timestamp
         if not self._valid_timestamp(observation.now):
             return False
+        if not self._valid_timestamp(context.state_entered_at):
+            return False
         age_s = observation.now - timestamp
-        return (
-            age_s >= -_TIMESTAMP_EPSILON_S
+        accepted = (
+            timestamp > context.state_entered_at
+            and age_s >= -_TIMESTAMP_EPSILON_S
             and age_s - self.green_max_age_s <= _TIMESTAMP_EPSILON_S
         )
+        if accepted:
+            self._last_traffic_message_at = timestamp
+        return accepted
+
+    def _accept_live_cone_entry_message(
+        self,
+        observation: MissionObservation,
+        context: RaceContext,
+    ) -> bool:
+        timestamp = observation.cone_message_received_at
+        if not self._valid_timestamp(timestamp):
+            return False
+        if (
+            self._last_live_cone_entry_message_at is not None
+            and timestamp <= self._last_live_cone_entry_message_at
+        ):
+            return False
+        if not self._valid_timestamp(observation.now):
+            return False
+        if not self._valid_timestamp(context.state_entered_at):
+            return False
+        age_s = observation.now - timestamp
+        accepted = (
+            timestamp > context.state_entered_at
+            and age_s >= -_TIMESTAMP_EPSILON_S
+            and age_s - self.cone_entry_config.max_cone_age_s
+            <= _TIMESTAMP_EPSILON_S
+        )
+        if accepted:
+            self._last_live_cone_entry_message_at = timestamp
+        return accepted
 
     def _accept_new_cone_drive_message(
         self,

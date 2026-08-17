@@ -35,6 +35,23 @@ class Letterbox:
     pad_y: float
 
 
+def normalize_class_ids(values: Iterable[int]) -> set[int]:
+    """Validate one ROS integer-array parameter as model class IDs."""
+
+    try:
+        items = list(values)
+    except TypeError as exc:
+        raise ValueError("class IDs must be an integer array") from exc
+    if any(
+        isinstance(class_id, bool) or not isinstance(class_id, int)
+        for class_id in items
+    ):
+        raise ValueError("class IDs must be integers")
+    if any(class_id < 0 for class_id in items):
+        raise ValueError("class IDs must be non-negative")
+    return set(items)
+
+
 def letterbox_blob(image: np.ndarray, input_size: int = 640) -> Letterbox:
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError("expected an HxWx3 BGR image")
@@ -148,3 +165,38 @@ def closest_detection(detections: Iterable[Detection]) -> Optional[Detection]:
     """Choose the largest box, matching the existing closest-object policy."""
 
     return max(detections, key=lambda item: item.area, default=None)
+
+
+def closest_detection_for_classes(
+    detections: Iterable[Detection],
+    class_ids: Iterable[int],
+) -> Optional[Detection]:
+    """Choose one closest representative without discarding other classes."""
+
+    allowed = set(class_ids)
+    return closest_detection(
+        item for item in detections if item.class_id in allowed
+    )
+
+
+def detection_slot(
+    detection: Optional[Detection],
+    semantic_type: int,
+) -> list[float]:
+    """Encode one ten-field internal fixed/moving detection slot."""
+
+    if detection is None:
+        return [0.0, float(semantic_type)] + [0.0] * 8
+    center_x, center_y = detection.center
+    return [
+        1.0,
+        float(semantic_type),
+        float(detection.confidence),
+        float(detection.area),
+        float(center_x),
+        float(center_y),
+        float(detection.x),
+        float(detection.y),
+        float(detection.width),
+        float(detection.height),
+    ]

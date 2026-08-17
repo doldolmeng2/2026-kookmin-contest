@@ -8,20 +8,23 @@ import os
 import onnxruntime as ort
 import rclpy
 from ament_index_python.packages import get_package_share_directory
+from rclpy.exceptions import ParameterUninitializedException
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float32MultiArray
 
 from object_detection.image_conversion import imgmsg_to_bgr
 from object_detection.yolo_runtime import (
-    closest_detection,
+    closest_detection_for_classes,
     decode_detections,
+    detection_slot,
     letterbox_blob,
+    normalize_class_ids,
 )
 
 
-UNKNOWN = -1
 FIXED = 0
 MOVING = 1
 
@@ -35,11 +38,14 @@ class ObjectYoloNode(Node):
         self.declare_parameter("confidence_threshold", 0.50)
         self.declare_parameter("nms_threshold", 0.40)
         self.declare_parameter("input_size", 640)
-        # Model class IDs are deliberately parameters.  The checked-in model
-        # is one-class/fixed.  A teammate's multi-class model can be dropped in
-        # without code changes once its exact ID mapping is known.
+        # YAML supplies integer arrays. The moving mapping has no guessed
+        # default: declaring its type explicitly lets a future non-empty YAML
+        # array initialize it while standalone runs safely treat it as empty.
         self.declare_parameter("fixed_class_ids", [0])
-        self.declare_parameter("moving_class_ids", [])
+        self.declare_parameter(
+            "moving_class_ids",
+            Parameter.Type.INTEGER_ARRAY,
+        )
 
         model_path = str(self.get_parameter("model_path").value)
         if not model_path:
@@ -56,12 +62,14 @@ class ObjectYoloNode(Node):
         )
         self.nms = float(self.get_parameter("nms_threshold").value)
         self.input_size = int(self.get_parameter("input_size").value)
-        self.fixed_ids = {
-            int(value) for value in self.get_parameter("fixed_class_ids").value
-        }
-        self.moving_ids = {
-            int(value) for value in self.get_parameter("moving_class_ids").value
-        }
+        self.fixed_ids = normalize_class_ids(
+            self.get_parameter("fixed_class_ids").value
+        )
+        try:
+            moving_class_ids = self.get_parameter("moving_class_ids").value
+        except ParameterUninitializedException:
+            moving_class_ids = []
+        self.moving_ids = normalize_class_ids(moving_class_ids)
         overlap = self.fixed_ids & self.moving_ids
         if overlap:
             raise ValueError(f"fixed/moving class IDs overlap: {sorted(overlap)}")
@@ -110,31 +118,26 @@ class ObjectYoloNode(Node):
                 nms_threshold=self.nms,
                 allowed_class_ids=self.allowed_ids,
             )
-            detection = closest_detection(detections)
+            fixed_detection = closest_detection_for_classes(
+                detections,
+                self.fixed_ids,
+            )
+            moving_detection = closest_detection_for_classes(
+                detections,
+                self.moving_ids,
+            )
         except Exception as exc:
             self.get_logger().error(f"object YOLO inference failed: {exc}")
             return
 
         output_message = Float32MultiArray()
-        if detection is None:
-            output_message.data = [0.0, float(UNKNOWN)] + [0.0] * 8
-        else:
-            semantic_type = (
-                FIXED if detection.class_id in self.fixed_ids else MOVING
-            )
-            center_x, center_y = detection.center
-            output_message.data = [
-                1.0,
-                float(semantic_type),
-                float(detection.confidence),
-                float(detection.area),
-                float(center_x),
-                float(center_y),
-                float(detection.x),
-                float(detection.y),
-                float(detection.width),
-                float(detection.height),
-            ]
+        # Two independent slots preserve a fixed and a moving detection from
+        # the same frame. The former single "closest overall" result discarded
+        # one category whenever both were visible.
+        output_message.data = (
+            detection_slot(fixed_detection, FIXED)
+            + detection_slot(moving_detection, MOVING)
+        )
         self.publisher.publish(output_message)
 
 

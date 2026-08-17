@@ -45,22 +45,11 @@ class OvertakeConfig:
     # fail-closed로 경고만 하고 현재 미션을 유지한다.
     zone_timeout_s: float = 12.0
 
-    # 측면으로 볼 각도 범위(도). LiDAR는 차 맨 앞에 달려 있고 차체가 뒤쪽을
-    # 가린다. bag의 각도별 프로파일상 |각도| > 약 105도 구간은 자기 차체가
-    # 0.10~0.14 m로 잡히므로 그 안쪽만 본다.
-    side_fov_min_deg: float = 60.0
-    side_fov_max_deg: float = 100.0
-    # 이보다 먼 것은 벽/빈 차선으로 보고 무시한다.
-    side_max_range_m: float = 1.5
-
     def __post_init__(self) -> None:
         for name, value in (
             ("side_detect_m", self.side_detect_m),
             ("pass_delay_s", self.pass_delay_s),
             ("zone_timeout_s", self.zone_timeout_s),
-            ("side_fov_min_deg", self.side_fov_min_deg),
-            ("side_fov_max_deg", self.side_fov_max_deg),
-            ("side_max_range_m", self.side_max_range_m),
         ):
             if (
                 isinstance(value, bool)
@@ -84,52 +73,8 @@ class PassDecision:
     timed_out: bool = False
 
 
-def side_clearance(
-    ranges,
-    angle_min: float,
-    angle_increment: float,
-    range_min: float,
-    range_max: float,
-    config: Optional[OvertakeConfig] = None,
-) -> tuple:
-    """LaserScan 원시 값에서 좌/우 측면 최소 거리(m)를 뽑는다.
-
-    premerge 가 초음파(`/xycar_ultrasonic`)를 그대로 읽던 자리에 LiDAR 를
-    넣은 것이다. `/object_info`의 12필드 계약과 별개로,
-    main_node 가 안전 감시용으로 이미 구독 중인 `/scan` 에서 직접 계산한다.
-
-    반환: (side_left, side_right). 해당 섹터에 유효 점이 없으면 inf.
-    """
-
-    cfg = config or OvertakeConfig()
-    left = float("inf")
-    right = float("inf")
-
-    for index, distance in enumerate(ranges):
-        if not math.isfinite(distance):
-            continue
-        if distance < range_min or distance > range_max:
-            continue
-        if distance > cfg.side_max_range_m:
-            continue
-
-        # 각도를 -180~180도로 정규화 (0도 = 전방, + = 좌, - = 우)
-        degrees = math.degrees(angle_min + index * angle_increment)
-        degrees = (degrees + 180.0) % 360.0 - 180.0
-        magnitude = abs(degrees)
-        if magnitude < cfg.side_fov_min_deg or magnitude > cfg.side_fov_max_deg:
-            continue
-
-        if degrees > 0.0:
-            left = min(left, distance)
-        else:
-            right = min(right, distance)
-
-    return left, right
-
-
 class OvertakeGuard:
-    """측면 LiDAR로 추월 완료 시점을 판단한다. lane_target은 건드리지 않는다."""
+    """Semantic side distances determine completion; lane_target stays untouched."""
 
     def __init__(self, config: Optional[OvertakeConfig] = None) -> None:
         self.config = config or OvertakeConfig()
@@ -153,6 +98,16 @@ class OvertakeGuard:
         self.side_seen_distance = float("inf")
         self._timeout_reported = False
 
+    def invalidate_clearance(self) -> None:
+        """Discard only the continuous-clear interval after semantic data loss.
+
+        A stale clearance message does not erase evidence that the obstacle was seen,
+        nor does it restart the zone timeout.  It does mean that elapsed wall
+        time can no longer count as continuously observed clearance.
+        """
+
+        self.clear_started_at = None
+
     def zone_elapsed(self, now: float) -> Optional[float]:
         """구간 진입 후 경과 시간(초). 진입 기록이 없으면 None."""
 
@@ -169,7 +124,7 @@ class OvertakeGuard:
         side_right: float,
         ego_lane: int = -1,
     ) -> PassDecision:
-        """측면 LiDAR로 추월 완료를 판정한다.
+        """Perception-approved side distances determine overtake completion.
 
         회피로 차선을 옮겼으므로 방해차량은 현재 주행 차선의 반대편에 있다.
           - 1차선(왼쪽, 1) 주행 중 → 오른쪽(side_right)

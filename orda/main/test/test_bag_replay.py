@@ -40,7 +40,7 @@ def event(topic, timestamp_s, data=None):
 
 def replay(
     events,
-    start_mode=Mode.INIT,
+    start_mode=Mode.WAIT_GREEN,
     topic_types=None,
     cone_entry_config=None,
 ):
@@ -71,15 +71,15 @@ def test_bag_timestamp_is_the_observation_and_transition_clock():
     )
 
     assert report["fsm"]["final_mode"] == "LANE_DRIVE"
-    assert report["fsm"]["state_entered_at_s"] == 103.0
+    assert report["fsm"]["state_entered_at_s"] == 101.0
     assert report["fsm"]["race_started_at_s"] == 101.0
     assert report["fsm"]["transition_timeline"] == [
         {
-            "timestamp_s": 103.0,
-            "relative_time_s": 3.0,
-                "source_mode": "WAIT_TRAFFIC",
+            "timestamp_s": 101.0,
+            "relative_time_s": 1.0,
+            "source_mode": "WAIT_GREEN",
             "target_mode": "LANE_DRIVE",
-            "reason": "green signal debounced",
+            "reason": "stable green signal",
         }
     ]
 
@@ -121,7 +121,7 @@ def test_same_topic_timestamp_is_counted_once_as_an_event_edge():
 
     assert report["processing"]["duplicate_record_count"] == 1
     assert report["fsm"]["transition_count"] == 1
-    assert report["fsm"]["transition_timeline"][0]["timestamp_s"] == 3.0
+    assert report["fsm"]["transition_timeline"][0]["timestamp_s"] == 2.0
     assert len(report["traffic"]["timeline"]) == 3
 
 
@@ -147,6 +147,7 @@ def test_three_field_and_two_field_cone_messages_are_distinct():
         "offset": -42,
         "end_flag": 0,
         "confidence": 97,
+        "entry_ready": None,
         "field_count": 3,
         "malformed": False,
     }
@@ -154,6 +155,17 @@ def test_three_field_and_two_field_cone_messages_are_distinct():
     assert two_fields["end_flag"] == 1
     assert two_fields["confidence"] is None
     assert two_fields["malformed"] is False
+
+
+def test_four_field_live_cone_schema_does_not_fall_back_to_legacy():
+    ready = parse_cone_message(SimpleNamespace(data=[0, 0, 10, 1]))
+    conflicting = parse_cone_message(SimpleNamespace(data=[0, 1, 0, 1]))
+    extra = parse_cone_message(SimpleNamespace(data=[0, 0, 100, 0, 99]))
+
+    assert ready["entry_ready"] == 1
+    assert ready["malformed"] is False
+    assert conflicting["malformed"] is True
+    assert extra["malformed"] is True
 
 
 def test_malformed_cone_message_is_warned_and_not_mission_evidence():
@@ -410,51 +422,19 @@ def test_replay_report_records_provisional_cone_config():
     assert "not a final threshold" in report["cone_entry_guard"]["warning"]
 
 
-def test_lane_offset_is_reference_only_and_never_infers_lane_validity():
+def test_lane_offset_is_reference_only_and_never_advances_wait_green():
     report = replay(
         [
             event("/lane_offset", 1.0, 12),
             event("/lane_offset", 2.0, 12),
         ],
-        start_mode=Mode.REJOIN,
+        start_mode=Mode.WAIT_GREEN,
     )
 
-    assert report["fsm"]["final_mode"] == "REJOIN"
+    assert report["fsm"]["final_mode"] == "WAIT_GREEN"
     assert report["fsm"]["transition_count"] == 0
     assert report["fsm"]["fsm_evaluation_count"] == 0
     assert report["lane_reference"]["lane_validity_inferred"] is False
-
-
-def test_replay_legacy_rejoin_enters_lane_only_on_fresh_lane_validity_edges():
-    report = replay(
-        [
-            event("/scan", 1.0),
-            event("/lane_valid", 1.1, True),
-            event("/lane_valid", 1.2, True),
-            event("/lane_valid", 1.31, True),
-        ],
-        start_mode=Mode.REJOIN,
-    )
-
-    assert report["fsm"]["final_mode"] == "LANE_DRIVE"
-    assert report["fsm"]["state_entered_at_s"] == 1.31
-    assert report["fsm"]["transition_timeline"] == [
-        {
-            "timestamp_s": 1.31,
-            "relative_time_s": 0.31,
-            "source_mode": "REJOIN",
-            "target_mode": "LANE_DRIVE",
-            "reason": "fresh lane validity confirmed",
-        }
-    ]
-    assert report["validation"]["invariants"][
-        "only_allowed_transitions_observed"
-    ] is True
-    assert any(
-        "REJOIN to LANE_DRIVE" in item
-        for item in report["validation"]["verifiable_scope"]
-    )
-
 
 def test_legacy_mode_trace_never_changes_the_new_mode():
     report = replay(

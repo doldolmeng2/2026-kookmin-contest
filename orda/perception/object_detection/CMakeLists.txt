@@ -17,7 +17,11 @@ find_package(cv_bridge REQUIRED)
 add_executable(object_node src/object_detection.cpp)
 ament_target_dependencies(object_node rclcpp std_msgs sensor_msgs cv_bridge)
 
-target_include_directories(object_node PUBLIC ${OpenCV_INCLUDE_DIRS})
+target_include_directories(object_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${OpenCV_INCLUDE_DIRS}
+)
 target_link_libraries(object_node ${OpenCV_LIBS})
 
 install(TARGETS object_node
@@ -33,5 +37,18 @@ install(FILES
   best.onnx
   best_simplified.onnx
   DESTINATION share/${PROJECT_NAME}/model)
+
+install(DIRECTORY config
+  DESTINATION share/${PROJECT_NAME})
+
+install(DIRECTORY include/ DESTINATION include)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_lane_stabilizer test/test_lane_stabilizer.cpp)
+  target_include_directories(test_lane_stabilizer PRIVATE include)
+  ament_add_gtest(test_side_clearance test/test_side_clearance.cpp)
+  target_include_directories(test_side_clearance PRIVATE include)
+endif()
 
 ament_package()

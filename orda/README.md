@@ -34,9 +34,9 @@ git clone https://github.com/doldolmeng2/2026-kookmin-contest.git .
 ```
 
 - **2·3바퀴에서도 신호등이 정지 신호(`1`)면 정지한다.** 신호 준수는 바퀴와 무관하다.
-  다만 `WAIT_TRAFFIC` 모드는 **출발 시 한 번만 사용하고 재진입하지 않는다.**
+  다만 `WAIT_GREEN` 모드는 **출발 시 한 번만 사용하고 재진입하지 않는다.**
   2·3바퀴의 정지는 모드 전환 없이 **제어 계층의 정지 오버라이드**로 처리한다
-  (`/traffic_detection == 1` → `speed = 0`, 신호가 `2`/`3` 으로 바뀌면 즉시 해제).
+  (`/object_info[0] == 1` → `speed = 0`, 신호가 `2`/`3` 으로 바뀌면 즉시 해제).
 - **S커브 구간은 모든 바퀴가 통과한다.** 지름길을 타든 안 타든 결승선 직전에 반드시 지난다.
   별도 모드를 두지 않고 `LANE_DRIVE` 로 처리하며, 감속은 `control.py` 의 조향각 기반
   감속 로직에 맡긴다.
@@ -140,7 +140,9 @@ main/main/
 
 ## 노드 및 토픽 구조
 
-토픽 표기: **[유지]** 작년과 동일 · **[변경]** 이름 유지, 페이로드 재정의 · **[신규]** 신설
+PPT에 있는 토픽은 **공식 외부 인터페이스**, PPT에 없는 토픽은 패키지 내부 구현용으로
+구분한다. 내부 토픽은 Main의 검증된 세부 판단과 기존 lane detector를 유지하기 위한
+호환 계층이며, 다른 패키지가 새 외부 계약으로 의존해서는 안 된다.
 
 ```
 [Xycar HW]
@@ -158,7 +160,7 @@ main/main/
 [인지]
   traffic_node
     sub: /resized_image
-    pub: /traffic_detection             (std_msgs/Int32)                  [변경]
+    pub: /traffic_detection             (std_msgs/Int32)                  [내부]
          0 = 인식 못함
          1 = 정지   (빨강, 주황)
          2 = 직진   (녹색)
@@ -166,26 +168,35 @@ main/main/
 
   rubbercone_node
     sub: /scan
-    pub: /rubbercone_info               (std_msgs/Int32MultiArray)        [유지]
+    pub: /rubbercone_offset             (std_msgs/Int32MultiArray)        [PPT 공식]
+         [offset, end_flag]
+         /rubbercone_info               (std_msgs/Int32MultiArray)        [내부 상세]
          [offset, end_flag, confidence]
          confidence: 경로 추정 신뢰도 (0~100)
 
   lane_node
-    sub: /resized_image, /mode_info
-    pub: /lane_offset                   (std_msgs/Int16, 픽셀 오프셋)     [유지]
-         /lane_fit                      (std_msgs/Float32MultiArray, [m, b]) [유지]
-         /lane_change_state             (std_msgs/Int32MultiArray)        [유지]
+    sub: /resized_image, /internal/lane_command
+    pub: /lane_offset                   (std_msgs/Int16, 픽셀 오프셋)     [PPT 공식]
+         /lane_fit                      (std_msgs/Float32MultiArray, [m, b]) [내부]
+         /lane_change_state             (std_msgs/Int32MultiArray)        [내부]
          [변경중, 성공여부]
+         /lane_position                 (std_msgs/Int16)                  [내부]
+         /lane_valid                    (std_msgs/Bool)                   [레거시·미사용]
 
   object_yolo_node (Python ONNX Runtime)
     sub: /resized_image
-    pub: /object_yolo                  (std_msgs/Float32MultiArray, 10 필드)
-         [detected, object_type, confidence, box_size, box_cx, box_cy,
-          box_x, box_y, box_w, box_h]
+    pub: /object_yolo                   (std_msgs/Float32MultiArray, 20 필드) [내부]
+         [fixed 10필드 슬롯, moving 10필드 슬롯]
+         슬롯: [detected, object_type, confidence, box_size, box_cx, box_cy,
+                box_x, box_y, box_w, box_h]
 
   object_node (C++ LiDAR/차선 융합)
-    sub: /scan, /resized_image, /lane_fit, /object_yolo
-    pub: /object_info                   (std_msgs/Float32MultiArray, 12 필드) [변경]
+    sub: /scan, /resized_image, /lane_fit, /object_yolo, /traffic_detection
+    pub: /object_info                   (std_msgs/Int32MultiArray)         [PPT 공식]
+         [traffic_signal, fixed_vehicle_lane, moving_vehicle_lane]
+         traffic_signal: 0=미검출, 1=정지, 2=직진, 3=좌회전
+         vehicle_lane: 0=미검출/미확정, 1=1차선, 2=2차선
+         /object_info_raw               (std_msgs/Float32MultiArray, 12 필드) [내부 상세]
          [exists, min_dist, angle, span, cluster_size,
           box_size, box_cx, box_cy, dx, car_lane, object_type, confidence]
          car_lane : 0=중앙, 1=왼쪽, 2=오른쪽
@@ -193,30 +204,52 @@ main/main/
 
 [제어]
   main_node
-    sub: /rubbercone_info, /lane_offset, /lane_change_state, /object_info,
-         /traffic_detection, /road_surface, /scan, /imu, /joy,
+    sub: /object_info, /rubbercone_offset, /lane_offset,
+         /object_info_raw, /rubbercone_info, /lane_change_state,
+         /road_surface, /scan, /imu, /joy,
          /xycar_ultrasonic
-    pub: /xycar_motor                   (std_msgs/Float32MultiArray)      [유지]
+    pub: /xycar_motor                   (std_msgs/Float32MultiArray)       [PPT 공식]
          [angle, speed]
-         /mode_info                     (std_msgs/Int32MultiArray)        [현재 호환]
-         [legacy_mode_code, lane]
+         /mode_info                     (std_msgs/Int16)                   [PPT 공식]
+         0=WAIT_GREEN, 1=LANE_DRIVE, 2=CONE_DRIVE,
+         3=FIXED_AVOID, 4=OVERTAKE, 5=SHORTCUT
+         /lane_info                     (std_msgs/Int16)                   [PPT 공식]
+         1=1차선, 2=2차선, 3=중앙
+         /internal/lane_command         (std_msgs/Int32MultiArray)         [내부 호환]
+         [legacy_lane_mode, internal_lane]
 ```
+
+PPT 외 보조 노드는 `traffic_node`와 `object_yolo_node` 두 개다. 별도
+`interface_adapter_node`는 만들지 않았다. `/object_info` 집계는 `object_node`가 직접,
+공식 모드와 lane detector 호환 명령의 분리는 `main_node`와 launch remap이 직접 맡는다.
 
 ### 인터페이스 변경 사유
 
-| 토픽 | 변경 내용 | 사유 |
+| 토픽 | 확정 계약 | 사유 |
 |---|---|---|
-| `/traffic_detection` | `Bool` → `Int32` (4상태) | 4구 신호등의 좌회전 화살표를 구분해야 지름길 판단이 가능 |
-| `/object_info` | `object_type`, `confidence` 필드 추가 | 고정장애물 회피와 방해차량 추월을 별개 미션으로 진입시킴 |
+| `/object_info` | `Int32MultiArray [신호등, 고정 객체 차선, 이동 객체 차선]` | Object Detection이 신호등·고정·이동 객체를 한 공식 메시지에서 동시에 표현 |
+| `/object_info_raw` | 기존 12필드 상세값 | Main의 거리·박스·분류 기반 판단을 보존하는 내부 이중 발행 |
+| `/rubbercone_offset` | `[offset, end_flag]` | PPT 공식 2필드 계약 |
+| `/rubbercone_info` | `[offset, end_flag, confidence]` | 기존 라바콘 진입 디바운스를 보존하는 내부 이중 발행 |
+| `/mode_info` | `Int16`, 코드 `0..5` | PPT의 모드 인터페이스. `FINISH`/`STOP`은 팀 코드가 정해질 때까지 발행하지 않음 |
+| `/lane_info` | `Int16`, `1=1차선, 2=2차선, 3=중앙` | PPT의 차선 인터페이스 |
+| `/internal/lane_command` | `[legacy_lane_mode, internal_lane]` | 기존 lane detector의 배열 계약을 launch remap으로 격리하여 차선 알고리즘은 수정하지 않음 |
+| `/traffic_detection` | `Int32` 4상태 | traffic_node와 object_node 사이의 내부 신호등 YOLO 결과 |
+| `/object_yolo` | 고정·이동 객체별 10필드 슬롯 | Python ONNX 결과를 C++ 차선 융합 노드로 전달 |
+| `/lane_fit` | `[m, b]` | 객체 박스를 1·2차선으로 분류하는 내부 회귀선 |
+| `/lane_change_state` | `[changing, success]` | FIXED/OVERTAKE 차선 변경 완료 피드백 |
+| `/lane_position` | `Int16` | 측면 LiDAR 완료 판단에 쓰는 자차 실측 차선 |
+| `/lane_valid` | `Bool` | lane detector가 계속 발행하지만 `REJOIN` 제거 후 Main은 구독하지 않음. 담당자 소스를 임의 수정하지 않아 남긴 레거시 출력 |
+| `/rubbercone_reset` | `Empty` | 한 라바콘 세션의 종료 래치를 새 진입 때 초기화 |
 | `/road_surface` | `Int32` 신설 (`0` 미확정, `1` 기본 검은 도로, `2` 흰 지름길) | 지름길을 실제로 본 뒤 기본 도로가 연속 인식될 때만 종료 |
-| `/mode_info` | 현재 `[legacy_mode_code, lane]` 유지 | 실제 소비자인 `lane_detection.cpp`가 아직 3=차선주행, 5=차선변경 계약을 사용한다. 4필드 신규 계약은 소비자 변경 전까지 발행하지 않는다. |
 
 `car_lane` · `lane_target` · `/lane_position` 은 **같은 정수 규약(0=중앙, 1=왼쪽, 2=오른쪽)** 을
 쓴다. `/lane_position` 만 미확정을 뜻하는 `-1` 을 추가로 쓴다.
 방해차량이 있는 쪽의 반대편을 추월 방향으로 그대로 뒤집어 쓸 수 있게 하기 위함이다.
 
-> `Int32MultiArray` 의 인덱스 의미는 이 문서뿐 아니라 **코드 내 상수로도 정의한다.**
-> 문서에만 존재하는 인덱스 규약은 배선 실수의 주된 원인이 된다.
+공식 `/object_info`는 신호등과 두 객체 종류를 같은 발행 주기에서 내보낸다. 고정 객체와
+이동 객체가 동시에 보이면 각 종류에서 기존 정책대로 가장 큰 박스(가장 가까운 객체)를
+하나씩 선택하므로 어느 한 종류도 다른 종류 때문에 사라지지 않는다.
 
 #### 고정장애물 YOLO 모델 (`best.onnx`)
 
@@ -226,8 +259,12 @@ main/main/
 
 - 현재 포함 모델은 단일 클래스 `obstacle_car`, 입력 640 고정 → 출력 `(1, 5, 8400)`이다.
   후처리는 Python ONNX Runtime으로 옮겼고 `(1,C,N)`/`(1,N,C)` 및 동적 클래스 수를
-  처리한다. 다중 클래스 모델을 넣을 때는 런치 파라미터 `fixed_class_ids`와
-  `moving_class_ids`만 실제 학습 라벨 순서에 맞춘다.
+  처리한다. 클래스 매핑은 `config/object_detection.yaml`의 정수 배열
+  `fixed_class_ids`와 `moving_class_ids`로 관리한다(예: `[0]`, `[1, 2]`).
+- 현재 YAML에는 `fixed_class_ids: [0]`만 확정되어 있고 `moving_class_ids`는 설정하지
+  않았다. 따라서 20필드 동시 표현 경로는 구현되어 있지만, 팀의 이동 객체 포함 모델과
+  정확한 클래스 ID 매핑을 받기 전까지 실차 `/object_info[2]`는 `0`이다. 클래스 ID를
+  임의로 추정하지 않는다.
 - 검증 성능 mAP50 0.995 / precision 0.999 / recall 1.000
 - 전처리는 **레터박스**(비율 유지 + 회색 114 패딩)를 쓴다. 640×360 원본을 640×640으로
   늘리면 세로가 1.78배 왜곡되는데 YOLOv8 은 레터박스로 학습되므로 어긋난다.
@@ -239,7 +276,8 @@ main/main/
 
 #### 정지 신호(`1`) 오검출 주의
 
-`/traffic_detection == 1` 은 **주행 중에도 즉시 정지**를 유발하므로 오검출 비용이 가장 크다.
+공식 `/object_info[0] == 1` 은 **주행 중에도 즉시 정지**를 유발하므로 오검출 비용이
+가장 크다. 이 값의 내부 원천은 `/traffic_detection`이다.
 트랙 중간에서 잘못 정지하면 재개 지연으로 실격까지 이어질 수 있다.
 
 - 정지 신호를 **빨강과 주황으로 함께 정의했는데, 라바콘이 주황색이다.** 라바콘 구간에서
@@ -268,7 +306,7 @@ main/main/
 |---|---|---|---|
 | 신호등 → 라바콘 진입 | `LANE_DRIVE` | 0 (중앙) | 실선 이탈 위험 최소화 |
 | 라바콘 | `CONE_DRIVE` | — | 라이다 경로를 따름 |
-| 라바콘 종료 | `CONE_DRIVE` → `LANE_DRIVE` | 진입 전 차선 유지 | `REJOIN`은 production 경로에서 사용하지 않음 |
+| 라바콘 종료 | `CONE_DRIVE` → `LANE_DRIVE` | 진입 전 차선 유지 | 별도 `REJOIN` 없이 즉시 복귀 |
 | 고정장애물 구간 | `FIXED_AVOID` | 장애물 **반대 차선** | 통과 후에도 그 차선을 유지한다 (되돌아오지 않음) |
 | 고정장애물 통과 → 결승선 | `LANE_DRIVE` | 회피한 차선 유지 | 측면 LiDAR clear 뒤 복귀 |
 | 방해차량 구간 | `OVERTAKE` | 방해차량 **반대 차선** | `object_type=1`로 독립 진입 |
@@ -280,7 +318,7 @@ main/main/
 - 추월 방향은 시작 차선과 무관하게 **방해차량이 있는 차선의 반대편**으로 결정한다
   (같은 쪽으로 추월하면 차선 이탈로 간주됨, 규정 p.33).
 
-`main_node` 가 `/mode_info` 의 `lane_target` 으로 목표를 지시하고,
+`main_node` 가 내부 `/internal/lane_command` 의 차선 필드로 목표를 지시하고,
 `lane_node` 가 `/lane_change_state` 로 이동 진행·완료를 보고한다.
 
 #### 센서 역할 분담 (고정장애물 구간)
@@ -325,26 +363,23 @@ main/main/
 
 ## 주행 상태 머신 (main_node)
 
-내부 상태는 `race_fsm.Mode`로 유지하지만 런치 입력은 번호를 우선 사용한다.
-`mode`: `0=INIT, 1=WAIT_TRAFFIC, 2=LANE_DRIVE, 3=CONE_DRIVE,
-4=FIXED_AVOID, 5=OVERTAKE, 6=SHORTCUT, 7=FINISH, 8=STOP`.
-`/mode_info`는 `lane_detection.cpp`의 기존 숫자 계약으로 별도 변환한다.
+내부 상태는 `race_fsm.Mode`로 유지한다. 숫자 런치 입력과 공식 `/mode_info`는 같은
+코드 `0..5`를 사용한다. `FINISH`와 `STOP`은 내부 상태로만 남기고, 팀에서 외부 코드를
+정하기 전까지 `/mode_info`를 발행하지 않는다.
 
-| 내부 모드 | 현재 외부 값 | 설명 | 전이 조건 |
+| 내부 모드 | `/mode_info` | 설명 | 전이 조건 |
 |---|---:|---|---|
-| `INIT` | 0 (STOP) | 입력 대기 | 필수 입력 수신 |
-| `WAIT_TRAFFIC` | 0 (STOP) | 신호등 앞 정지, 출발 대기 | `/traffic_detection` Int32 디바운스 |
-| `LANE_DRIVE` | 3 | 차선 주행 (기본 중앙 주행) | 아래 분기 참조 |
-| `CONE_DRIVE` | 1 | 라바콘 구간 주행 | fresh `end_flag` 0→1 |
-| `REJOIN` | 2 | 옛 bag 호환용이며 production 미사용 | fresh lane-validity → `LANE_DRIVE` |
-| `FIXED_AVOID` | action 중 5, 유지 시 3 | 고정장애물 구간 | 측면 LiDAR seen→clear→hold |
-| `OVERTAKE` | action 중 5, 유지 시 3 | 방해차량 구간 | 측면 LiDAR seen→clear→hold |
-| `SHORTCUT` | 3 | 지름길 차선 주행 | 흰 도로 확인 후 검은 도로 연속 인식 |
-| `FINISH` | 0 (STOP) | 3바퀴 완료 | — |
-| `STOP` | 0 (STOP) | 안전 정지 | — |
+| `WAIT_GREEN` | 0 | 준비 입력 확인 + 신호등 앞 정지 | 준비 완료 후 `/object_info[0]` 녹색 디바운스 |
+| `LANE_DRIVE` | 1 | 차선 주행 (기본 중앙 주행) | 아래 분기 참조 |
+| `CONE_DRIVE` | 2 | 라바콘 구간 주행 | fresh `end_flag` 0→1 |
+| `FIXED_AVOID` | 3 | 고정장애물 구간 | 측면 LiDAR seen→clear→hold |
+| `OVERTAKE` | 4 | 방해차량 구간 | 측면 LiDAR seen→clear→hold |
+| `SHORTCUT` | 5 | 지름길 차선 주행 | 흰 도로 확인 후 검은 도로 연속 인식 |
+| `FINISH` | 미발행 | 3바퀴 완료 | — |
+| `STOP` | 미발행 | 복귀 가능한 안전 정지 | 필수 입력 회복 후 직전 상태 복귀 |
 
 ```
-INIT ──(입력 준비)──▶ WAIT_TRAFFIC ──(신호 2/3)──▶ LANE_DRIVE   [시간 측정 시작]
+WAIT_GREEN ──(입력 준비 + 신호 2/3)──▶ LANE_DRIVE   [시간 측정 시작]
 
 [확정된 라바콘 흐름]
 LANE_DRIVE ─(라바콘 진입 확정)─▶ CONE_DRIVE ─(end_flag)─▶ LANE_DRIVE
@@ -363,7 +398,8 @@ LANE_DRIVE ─(3바퀴 완료)─▶ FINISH
 
 - `FIXED_AVOID`와 `OVERTAKE`는 순간 동작이 아니라 독립 구간이다. 둘 다 완료 후
   피한 차선을 그대로 유지하며, 서로를 자동으로 연쇄하지 않는다.
-- 장애물 타입은 `/object_info[10]`으로 결정한다. 실제 다중 클래스 모델을 교체할 때
+- 장애물 타입과 세부 박스 정보는 내부 `/object_info_raw[10]`으로 결정한다.
+  실제 다중 클래스 모델을 교체할 때
   `fixed_class_ids`/`moving_class_ids` 매핑을 학습 라벨 순서와 맞춰야 한다.
 - 시간 초과는 경고만 남긴다. 측면에서 장애물을 본 뒤 사라졌다는 증거가 없으면
   상태를 유지해 장애물 앞에서 일반 차선 주행으로 잘못 복귀하지 않는다.

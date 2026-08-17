@@ -60,7 +60,7 @@ TEST(LaneChangeStateTrackerTest, CancelResetsAndASecondActionCanComplete) {
 TEST(LaneChangeStateTrackerTest, InvalidTargetAndInvalidFitCannotSucceed) {
   auto state = tracker();
 
-  state.handleCommand(5, 2);
+  state.handleCommand(5, 3);
   expectFeedback(state.update(true, 0.0F, 450.0F), 0, 0);
 
   state.handleCommand(5, 0);
