@@ -36,7 +36,11 @@ git clone https://github.com/doldolmeng2/2026-kookmin-contest.git .
 - **2·3바퀴에서도 신호등이 정지 신호(`1`)면 정지한다.** 신호 준수는 바퀴와 무관하다.
   다만 `WAIT_TRAFFIC` 모드는 **출발 시 한 번만 사용하고 재진입하지 않는다.**
   2·3바퀴의 정지는 모드 전환 없이 **제어 계층의 정지 오버라이드**로 처리한다
-  (`/traffic_detection == 1` → `speed = 0`, 신호가 `2`/`3` 으로 바뀌면 즉시 해제).
+  (신호등 상태 `== 1` → `speed = 0`, `2`/`3` 으로 바뀌면 즉시 해제). 이 신호등 상태는
+  더 이상 `/traffic_detection` 토픽이 아니라 **`/object_info`의 첫 필드**로 들어온다
+  — 자세한 배경은 [인지 파이프라인 변경 이력](#인지perception-파이프라인-변경-이력) 참고.
+  ⚠️ `main_node` 는 아직 이 새 계약에 맞춰 갱신되지 않아 실제로는 이 오버라이드가
+  동작하지 않는다 (같은 절 "미반영 통합" 항목).
 - **S커브 구간은 모든 바퀴가 통과한다.** 지름길을 타든 안 타든 결승선 직전에 반드시 지난다.
   별도 모드를 두지 않고 `LANE_DRIVE` 로 처리하며, 감속은 `control.py` 의 조향각 기반
   감속 로직에 맡긴다.
@@ -94,8 +98,8 @@ src/
 ├── orda/
 │   ├── perception/                 # 원시 인지 (미션 중립)
 │   │    ├── image_resize           # 카메라 영상 리사이즈 (640×360)
-│   │    ├── traffic_light          # 4구 신호등 상태 판별
-│   │    └── object_detection       # LiDAR + YOLO 차량 검출 (정지/이동 분류)
+│   │    ├── traffic_light          # (미사용, launch 제외) 구 4구 신호등 판별 노드 — 기능은 object_detection 으로 통합됨
+│   │    └── object_detection       # YOLO 통합 검출 (정지/이동 차량 + 신호등) → /object_info 발행
 │   │
 │   ├── driving/                    # 조향 오프셋 생성
 │   │    ├── lane_detection         # BEV 기반 차선 검출
@@ -156,14 +160,6 @@ main/main/
     pub: /resized_image                 (sensor_msgs/Image, 640×360)      [유지]
 
 [인지]
-  traffic_node
-    sub: /resized_image
-    pub: /traffic_detection             (std_msgs/Int32)                  [변경]
-         0 = 인식 못함
-         1 = 정지   (빨강, 주황)
-         2 = 직진   (녹색)
-         3 = 좌회전 (녹색 + 좌회전 화살표 동시 점등 → 지름길 진입)
-
   rubbercone_node
     sub: /scan
     pub: /rubbercone_info               (std_msgs/Int32MultiArray)        [유지]
@@ -177,25 +173,35 @@ main/main/
          /lane_change_state             (std_msgs/Int32MultiArray)        [유지]
          [변경중, 성공여부]
 
-  object_yolo_node (Python ONNX Runtime)
+  object_yolo_node (Python, ONNX Runtime — object_detection 패키지)   [신규 구조, 2026-08-18]
     sub: /resized_image
     pub: /object_yolo                  (std_msgs/Float32MultiArray, 10 필드)
          [detected, object_type, confidence, box_size, box_cx, box_cy,
           box_x, box_y, box_w, box_h]
+         차량(red_car/green_car) 중 가장 가까운(면적 최대) 1개만.
+         /traffic_boxes                (std_msgs/Float32MultiArray, 6개씩 반복)
+         [class_id, confidence, x, y, w, h]
+         신호등 색상 클래스 검출 전부(프레임당 여러 개 가능).
 
-  object_node (C++ LiDAR/차선 융합)
-    sub: /scan, /resized_image, /lane_fit, /object_yolo
-    pub: /object_info                   (std_msgs/Float32MultiArray, 12 필드) [변경]
-         [exists, min_dist, angle, span, cluster_size,
-          box_size, box_cx, box_cy, dx, car_lane, object_type, confidence]
-         car_lane : 0=중앙, 1=왼쪽, 2=오른쪽
-         object_type: -1=미확정, 0=고정장애물, 1=방해차량
+  object_node (C++ — object_detection 패키지)
+    sub: /scan, /resized_image, /lane_fit, /object_yolo, /traffic_boxes
+    pub: /object_info                   (std_msgs/Int32MultiArray, 3 필드)  [변경, 2026-08-18]
+         [신호등 정보, 고정차량 위치, 방해차량 위치]
+         신호등 정보:   0=인식x  1=정지(빨강/주황)  2=직진(초록)  3=좌회전
+         고정차량 위치: 0=인식x  1=1차선  2=2차선
+         방해차량 위치: 0=인식x  1=1차선  2=2차선
+
+  ※ traffic_light 패키지(traffic_node)는 더 이상 launch 되지 않는다. 신호등 인식은
+    object_yolo_node(추론) + object_node(우선순위 판정·디바운스)가 전담한다.
+    자세한 배경은 [인지 파이프라인 변경 이력](#인지perception-파이프라인-변경-이력) 참고.
 
 [제어]
   main_node
     sub: /rubbercone_info, /lane_offset, /lane_change_state, /object_info,
-         /traffic_detection, /road_surface, /scan, /imu, /joy,
-         /xycar_ultrasonic
+         /road_surface, /scan, /imu, /joy, /xycar_ultrasonic
+         ⚠️ 코드상으로는 여전히 /object_info 를 옛 Float32MultiArray 12필드로,
+         /traffic_detection 을 별도 토픽으로 구독하려 한다 — 위 새 계약과 타입이
+         달라 실제로는 안 이어진다. main_node 미반영 상태 (아래 "미반영 통합" 참고).
     pub: /xycar_motor                   (std_msgs/Float32MultiArray)      [유지]
          [angle, speed]
          /mode_info                     (std_msgs/Int32MultiArray)        [현재 호환]
@@ -206,8 +212,8 @@ main/main/
 
 | 토픽 | 변경 내용 | 사유 |
 |---|---|---|
-| `/traffic_detection` | `Bool` → `Int32` (4상태) | 4구 신호등의 좌회전 화살표를 구분해야 지름길 판단이 가능 |
-| `/object_info` | `object_type`, `confidence` 필드 추가 | 고정장애물 회피와 방해차량 추월을 별개 미션으로 진입시킴 |
+| `/traffic_detection` | `Bool` → `Int32`(4상태) → **폐지, `/object_info[0]`으로 흡수 (2026-08-18)** | 신호등 인식을 `object_detection` 패키지로 통합하면서 별도 토픽 대신 `/object_info` 하나로 합침 |
+| `/object_info` | `Float32MultiArray` 12필드 → **`Int32MultiArray` 3필드 (2026-08-18)** | `[신호등, 고정차량 위치, 방해차량 위치]`만 최종 소비자(FSM)에 필요 — LiDAR 원시값(exists/거리/각도 등)은 더 이상 안 실음. **`main_node`는 아직 옛 계약을 구독 중이라 미반영** |
 | `/road_surface` | `Int32` 신설 (`0` 미확정, `1` 기본 검은 도로, `2` 흰 지름길) | 지름길을 실제로 본 뒤 기본 도로가 연속 인식될 때만 종료 |
 | `/mode_info` | 현재 `[legacy_mode_code, lane]` 유지 | 실제 소비자인 `lane_detection.cpp`가 아직 3=차선주행, 5=차선변경 계약을 사용한다. 4필드 신규 계약은 소비자 변경 전까지 발행하지 않는다. |
 
@@ -218,28 +224,62 @@ main/main/
 > `Int32MultiArray` 의 인덱스 의미는 이 문서뿐 아니라 **코드 내 상수로도 정의한다.**
 > 문서에만 존재하는 인덱스 규약은 배선 실수의 주된 원인이 된다.
 
-#### 고정장애물 YOLO 모델 (`best.onnx`)
+#### 통합 YOLO 모델 (`best.onnx` = `traffic_light/model/best_traffic.onnx`, 동일 파일)
 
-고정장애물(빨간 차량)을 검출하도록 재학습했다. 학습 데이터는 `rosbag2_fixed_obstacles_*`
-6개에서 뽑은 658장(박스 463개 + 차량이 없는 프레임 200장)이다. 차량이 없는 프레임의
-빈 라벨은 배경 오검출을 줄이는 negative 샘플이므로 반드시 포함한다.
+차량(고정장애물/방해차량)과 신호등을 **하나의 YOLO 모델**로 같이 검출한다.
+`object_detection/best.onnx`와 `traffic_light/model/best_traffic.onnx`는 md5까지
+동일한 파일이며, 두 인지 기능이 이 모델 하나를 공유한다.
 
-- 현재 포함 모델은 단일 클래스 `obstacle_car`, 입력 640 고정 → 출력 `(1, 5, 8400)`이다.
-  후처리는 Python ONNX Runtime으로 옮겼고 `(1,C,N)`/`(1,N,C)` 및 동적 클래스 수를
-  처리한다. 다중 클래스 모델을 넣을 때는 런치 파라미터 `fixed_class_ids`와
-  `moving_class_ids`만 실제 학습 라벨 순서에 맞춘다.
-- 검증 성능 mAP50 0.995 / precision 0.999 / recall 1.000
-- 전처리는 **레터박스**(비율 유지 + 회색 114 패딩)를 쓴다. 640×360 원본을 640×640으로
-  늘리면 세로가 1.78배 왜곡되는데 YOLOv8 은 레터박스로 학습되므로 어긋난다.
-  검증용 bag 기준 conf ≥ 0.5 검출률이 82.3% → 98.1% 로 올랐다.
-- `conf_threshold_ = 0.50`. 검출 가능한 프레임의 99%를 잡고, 차량이 없는 프레임의
-  오검출은 conf 0.05 에서도 0이었다.
+**현재 배포(2026-08-18, `train-5`)**: 6클래스, 입력 640 고정 → 출력 `(1, 10, 8400)`.
+```
+0 red_car(고정장애물)   1 green_car(방해차량)
+2 green_light(직진)     3 left_green_light(좌회전)
+4 orange_light(주황)    5 red_light(빨강)
+```
+클래스 ID는 런치 파라미터(`fixed_class_ids`/`moving_class_ids`/`traffic_class_ids`,
+`object_yolo_node.py`)로 넘기므로 재학습해서 순서가 바뀌어도 코드 수정 없이 대응한다.
 
-재학습 절차와 도구는 `object_detection/tools/TRAINING.md` 에 있다.
+**학습 이력**:
+
+| 모델 | 클래스 | precision | recall | mAP50 | mAP50-95 | 비고 |
+|---|---|---:|---:|---:|---:|---|
+| `train-3` | 7 (`4-traffic` 몸체 포함) | 98.84% | 98.47% | 99.49% | 80.46% | 실주행 bag 검출률 낮음(아래 참고) |
+| `train-4` | 7 | 99.15% | 99.32% | 99.43% | 81.33% | `train-3` 재학습 |
+| `train-5` | 6 (`4-traffic` 제거) | **99.41%** | **99.44%** | 99.50% | 80.45% | val loss 최저, **현재 배포** |
+
+지표는 각 모델 학습 시 val split 기준(`runs/detect/train-N/results.csv`)이라, 실제
+주행 bag과는 분포가 다를 수 있다. `manual_20260818_134220`(오프라인, stride 5,
+1176프레임)로 conf=0.50/NMS=0.40 기준 재검증한 결과:
+
+| 모델 | 차량 검출 프레임율 | 신호등 검출 프레임율 | 평균 추론시간 |
+|---|---:|---:|---:|
+| `train-3` | 15.4% | 6.0% | 74.3ms |
+| `train-4` | 27.7% | 25.9% | 74.5ms |
+| `train-5` | 23.3% | 25.5% | 74.2ms |
+
+`train-3`는 학습 지표는 높지만 실주행 조건(각도/거리/조명)에서 검출률이 크게 떨어진다 —
+val split과 실제 주행 영상의 분포 차이로 보인다. `train-4`/`train-5`는 비슷한 수준이고,
+`train-5`가 신뢰도는 약간 더 높다. 이 bag엔 `red_light`/`orange_light` 장면이 아예
+없어서 두 클래스는 이걸로 검증이 안 됐다.
+
+**알려진 약점 — `green_light` ↔ `left_green_light` 혼동**: `manual_20260818_134220`
+뒷부분에서 `train-5`가 직진 초록불을 좌회전 화살표로 **170프레임 이상 연속** 확신을 갖고
+오검출하는 구간을 발견했다(`left_conf` 0.5~0.87). 좌회전 오검출은 `SHORTCUT`을
+잘못 트리거할 수 있어 위험도가 높다. 해당 구간(frame 5140~5330, 191장)을 추출해
+`green_light`로 재라벨링해서 `/home/dxer1/yolo_hardneg_leftgreen/`에 준비해뒀다 —
+기존 `yolo_merged` 데이터셋에 hard negative로 합쳐서 `train-6` 재학습이 필요하다
+(아직 미실행, 아래 "미해결 항목" 참고).
+
+전처리는 **레터박스**(비율 유지 + 회색 114 패딩)를 쓴다. 640×360 원본을 640×640으로
+늘리면 세로가 1.78배 왜곡되는데 YOLOv8은 레터박스로 학습되므로 어긋난다.
+`conf_threshold_ = 0.50`, `nms_threshold_ = 0.40`.
+
+재학습 절차와 도구는 `object_detection/tools/TRAINING.md`에 있다(현재 문서는 옛 단일
+클래스 기준으로 작성돼 있어 다중 클래스 재학습 시 감안해서 읽을 것).
 
 #### 정지 신호(`1`) 오검출 주의
 
-`/traffic_detection == 1` 은 **주행 중에도 즉시 정지**를 유발하므로 오검출 비용이 가장 크다.
+신호등 상태(`/object_info[0]`) `== 1` 은 **주행 중에도 즉시 정지**를 유발하므로 오검출 비용이 가장 크다.
 트랙 중간에서 잘못 정지하면 재개 지연으로 실격까지 이어질 수 있다.
 
 - 정지 신호를 **빨강과 주황으로 함께 정의했는데, 라바콘이 주황색이다.** 라바콘 구간에서
@@ -248,6 +288,88 @@ main/main/
   ROI 를 신호등이 나타나는 화면 상단으로 제한한다.
 - 좌회전 신호(`3`)는 미검출을 줄이는 방향으로, 정지 신호(`1`)는 오검출을 줄이는 방향으로
   임계값을 잡는다. **두 신호의 튜닝 방향이 반대**라는 점에 유의한다.
+
+---
+
+## 인지(perception) 파이프라인 변경 이력
+
+2026-08-18 세션에서 `object_detection`/`traffic_light`/`lane_detection` 세 패키지를
+손봤다. 아래는 무엇을 왜 바꿨고 실제로 측정한 결과가 어땠는지 기록이다.
+
+### `object_detection` ↔ `traffic_light` 통합
+
+**배경**: 신호등(`traffic_node`, Python+onnxruntime)과 차량(`object_node`, C++ +`cv::dnn`)이
+따로 있었는데, 팀의 YOLO 모델이 차량+신호등 클래스를 한 모델로 합쳐서(`yolo_merged`
+데이터셋) 나오기 시작했다. 또 타겟 보드(J4012)의 **OpenCV 4.5.4 `cv::dnn`이 이
+YOLOv8 ONNX를 `forward()`할 때 shape assertion으로 죽는** 고질적인 문제가 있어서
+(`object_detection.cpp:109-110`), 원래도 C++ 내부 추론 대신 Python `onnxruntime`
+프론트엔드(`object_yolo_node.py`)를 거치고 있었다.
+
+**결정**: 신호등 인식을 `traffic_node`에서 떼어내 `object_yolo_node.py` +
+`object_node`로 흡수했다.
+- `object_yolo_node.py`가 같은 프레임 추론 결과에서 차량(`/object_yolo`, 가장 가까운
+  1개)과 신호등(`/traffic_boxes`, 프레임당 여러 개)을 **같이** 발행한다 — 추론을
+  두 번 안 해도 된다.
+- `object_node`가 두 토픽을 받아 신호등 우선순위(좌회전>직진>정지)·디바운스와
+  차량 차선 판정을 전부 계산해서 `/object_info` **하나**로 낸다.
+- `traffic_node`는 launch에서 뺐다(같이 띄우면 `/traffic_boxes`에 퍼블리셔가
+  겹친다). 코드는 참고용으로 남아있다.
+
+**모델 클래스 변천**: `train-3`(7클래스, `4-traffic` 몸체 포함) → `train-4`(같은
+7클래스, 재학습) → `train-5`(6클래스, `4-traffic` 제거 — **현재 배포**). 클래스가
+바뀔 때마다 `object_yolo_node.py`/`traffic_node.py`/`object_detection.cpp` 세
+곳의 클래스 ID 상수를 같이 맞춰야 했다. 상세 지표는 위 "통합 YOLO 모델" 절 참고.
+
+### 차량 차선 판정 (`object_node`, 고정장애물/방해차량이 1차선인지 2차선인지)
+
+`/lane_fit`(중앙선 `x=m·y+b`)과 검출 박스 중심(`box_cx`)의 거리(`dx`)를
+`lane_split_margin_px`와 비교해서 판정한다 (`onYoloDetection()`).
+
+- **마진 값 변천**: 45 → 30 → 25 → 10 → **5(현재)**. 처음 45였던 이유는 `/lane_fit`
+  흔들림만으로 `dx` 부호가 뒤집히는 사례(-41→+31) 때문이었는데, 아래 차선 피팅
+  안정화 작업으로 `/lane_fit` 자체가 훨씬 안정되면서 마진을 줄여도 괜찮아졌다.
+- **디바운스 추가**: `lane_debounce_frames`(기본 3) — raw 판정이 N프레임 연속 같아야
+  `lane_stable_`에 반영. 순간적으로 1프레임만 튀는 값을 걸러낸다.
+- **박스 모서리 기반 판정은 시도했다가 롤백했다**: 중심점 1개 대신 박스 4개 모서리 중
+  차선에서 가장 먼 모서리를 기준으로 판정하는 방식(차 크기에 비례해서 판정 엄격도가
+  자동 조절됨)을 구현했으나, 사용자 판단으로 롤백해서 **현재는 중심점 기반**으로
+  돌아가 있다. 필요하면 git 히스토리 또는 이 문서 개정 이력에서 코드를 다시 찾을 수
+  있다(커밋되지 않았다면 이 PR의 이전 커밋을 참고).
+
+### 차선 피팅 안정화 (`lane_detection`, `/lane_fit` 자체의 지터링)
+
+**증상**: 급조향처럼 화면이 크게 도는 게 아니어도, 정지된 카메라에서조차 `/lane_fit`이
+프레임마다 크게 흔들리는 문제가 있었다.
+
+**적용한 변경 4가지** (`lane_detection_parameter.json`, `src/lane_detection.cpp`):
+
+1. **Canny 엣지 대신 꽉 찬 색상 마스크를 그대로 사용** (`preprocessYellow()`). 예전엔
+   HLS∩HSV∩YCrCb로 만든 꽉 찬 마스크를 다시 그레이스케일+Canny로 윤곽선만 뽑아서
+   슬라이딩 윈도우에 넘겼는데, Canny의 그래디언트 임계값이 조명/압축 노이즈에
+   반응해 프레임마다 살아남는 점이 달라졌다. 모폴로지로 정리한 마스크를 그대로
+   쓰면 점이 훨씬 조밀해지고 안정적이다. 부수 효과로 처리 속도도 50Hz→62Hz로 올랐다.
+2. **강건 피팅(반복적 이상치 제거)**: 1차 SVD 피팅 → `fit_outlier_reject_px`(20px)
+   보다 먼 점 제거 → 재피팅, `fit_outlier_iterations`(2)회 반복. 윈도우 1~2개가
+   노이즈를 주워도 전체 피팅이 안 흔들리게 한다.
+3. **탐색 앵커를 고정 기준점(`ref_x_`)에서 "직전 프레임 위치" 추적으로 변경**
+   (`fitLaneFromBEV()`의 `anchor_x`). 예전엔 매 프레임 `ref_x_` 주변에서 새로
+   찾아서, fallback으로 버티다 신호가 다시 잡히면 아무 노이즈로나 확 튀었다.
+   **실측(같은 bag, 같은 구간): 평균 이동량 70px→3.4px, 최대 590px→(재획득 로직 추가
+   전 기준) 안정 구간 다수 확인.**
+4. **연속 실패 시 재획득**(`fit_reacquire_after_frames`, 기본 10): 3번 변경만으로는
+   앵커가 한 번 잘못된 자리에 멈추면 좁은 코리도어 안에 영원히 갇히는 문제가 있었다
+   (실측: `ok=false` 최장 818프레임 연속). N프레임 연속 실패하면 `ref_x_`로 강제
+   복귀하도록 해서 최장 정체 구간을 818→330프레임으로 줄였다.
+
+**코리도어 폭(`corridor_width`) 변천**: 900(원래값, 반대 차선까지 탐색범위에 들어옴)
+→ 300(반대 차선 배제) → **900(현재, 급조향 시 300은 못 따라가서 원복)**. 3번(앵커
+추적) 도입 이후에는 코리도어가 넓어도 매 프레임 "직전 위치" 중심으로 움직이므로
+예전만큼 반대 차선을 잘못 물 위험이 적다 — 단, 이론적 가능성은 남아있다.
+
+**남은 문제**: 위 개선에도 실주행 bag(`manual_20260818_134220`) 기준 피팅 성공률이
+26.5%에 그친다. 재획득 로직으로 정체 시간은 줄었지만, `ref_x_` 근처에서도 애초에
+픽셀이 부족한 구간이 많다는 뜻이라 — 코리도어/앵커와는 별개의, 색상 임계값이나
+조명 조건 쪽 원인일 가능성이 크다. 미해결로 남겨둔다.
 
 ---
 
@@ -333,7 +455,7 @@ main/main/
 | 내부 모드 | 현재 외부 값 | 설명 | 전이 조건 |
 |---|---:|---|---|
 | `INIT` | 0 (STOP) | 입력 대기 | 필수 입력 수신 |
-| `WAIT_TRAFFIC` | 0 (STOP) | 신호등 앞 정지, 출발 대기 | `/traffic_detection` Int32 디바운스 |
+| `WAIT_TRAFFIC` | 0 (STOP) | 신호등 앞 정지, 출발 대기 | `/object_info[0]` 디바운스 (옛 `/traffic_detection`) |
 | `LANE_DRIVE` | 3 | 차선 주행 (기본 중앙 주행) | 아래 분기 참조 |
 | `CONE_DRIVE` | 1 | 라바콘 구간 주행 | fresh `end_flag` 0→1 |
 | `REJOIN` | 2 | 옛 bag 호환용이며 production 미사용 | fresh lane-validity → `LANE_DRIVE` |
@@ -363,8 +485,10 @@ LANE_DRIVE ─(3바퀴 완료)─▶ FINISH
 
 - `FIXED_AVOID`와 `OVERTAKE`는 순간 동작이 아니라 독립 구간이다. 둘 다 완료 후
   피한 차선을 그대로 유지하며, 서로를 자동으로 연쇄하지 않는다.
-- 장애물 타입은 `/object_info[10]`으로 결정한다. 실제 다중 클래스 모델을 교체할 때
-  `fixed_class_ids`/`moving_class_ids` 매핑을 학습 라벨 순서와 맞춰야 한다.
+- 장애물 타입은 `/object_info[10]`(옛 12필드 `Float32MultiArray` 계약 기준)으로
+  결정하도록 `main.py`/`runtime_adapter.py`가 짜여 있다. **`object_node`는 이제 이
+  포맷을 발행하지 않으므로(3필드 `Int32MultiArray`) 이 판정은 실제로 동작하지 않는다**
+  — `main_node`를 새 계약에 맞게 갱신하기 전까지의 알려진 갭이다.
 - 시간 초과는 경고만 남긴다. 측면에서 장애물을 본 뒤 사라졌다는 증거가 없으면
   상태를 유지해 장애물 앞에서 일반 차선 주행으로 잘못 복귀하지 않는다.
 
@@ -448,18 +572,33 @@ g++ -O2 -std=c++17 measure_conf.cpp -o /tmp/measure_conf \
 | 패키지 / 모듈 | 상태 | 비고 |
 |---|---|---|
 | `image_resize` | 유지 | 카메라 동일, 변경 없음 |
-| `lane_detection` | 수정 | 차선 위치/변경 상태 계약 및 파라미터 병합 |
+| `lane_detection` | 수정 | 차선 위치/변경 상태 계약 및 파라미터 병합. 차선 피팅 지터링 감소(Canny→마스크 직접 사용, 코리도어/이상치 제거/재획득) — [상세](#인지perception-파이프라인-변경-이력) |
 | `rubbercone` | 수정중 | 라바콘 시작 지점 다름 |
-| `object_detection` | 수정 | ONNX Runtime, 동적 클래스 디코더, `object_type`/confidence 계약 |
-| `traffic_light` | 재작성 | 초록 Bool → 4구 신호등 4상태 |
+| `object_detection` | 수정 | `traffic_light` 통합, 6클래스 모델(`train-5`), `/object_info` 3필드 `Int32MultiArray`로 재정의 |
+| `traffic_light` | **미사용(launch 제외)** | 로직은 파일에 남아있으나 `object_detection`이 전담 — 코드는 참고용으로만 유지 |
 | `main/main.py` | 재작성 | 옛 정수 FSM 폐기, 순수 모듈 계층 배선으로 교체 |
 | `main` 로직 모듈 | 구현 | WAIT/차선 3종/fixed/overtake/shortcut/lap/FINISH 및 단위 테스트 |
 | `manual_drive`, `sensors_viewer` | 유지 | 하드웨어 동일 |
 
 ### 미해결 항목
 
-- 현재 포함된 장애물 `best.onnx`는 단일 클래스다. 방해차량 자동 진입까지 쓰려면 팀의
-  다중 클래스 모델과 정확한 `fixed_class_ids`/`moving_class_ids` 매핑을 넣어야 한다.
+- **(중요) `main_node`가 새 `/object_info` 계약(3필드 `Int32MultiArray`)에 안 맞춰져 있다.**
+  `object_node`는 이제 `[신호등, 고정차량 위치, 방해차량 위치]` 3필드 `Int32MultiArray`를
+  내는데, `main_node`(`main.py`/`runtime_adapter.py`)는 여전히 옛 12필드
+  `Float32MultiArray`(`exists, min_dist, ..., object_type, confidence`)를 구독하려
+  한다. ROS2는 같은 토픽 이름이라도 타입이 다르면 아예 연결되지 않으므로,
+  `main_node`와 `object_node`를 같이 띄우면 **`/object_info`가 조용히 안 이어진다**
+  (`ros2 topic echo /object_info`가 "타입이 2개"라고 에러 내는 것으로 확인 가능).
+  장애물 회피(`FIXED_AVOID`/`OVERTAKE`)와 신호 정지 오버라이드 둘 다 이 영향을 받는다.
+  `main_node`를 새 계약에 맞춰 다시 배선하기 전까지는 실차 통합 테스트가 불가능하다.
+- `object_detection`의 통합 YOLO 모델이 `green_light`를 `left_green_light`로 오검출하는
+  구간이 있다 (위 "통합 YOLO 모델" 절 참고). 라벨링한 hard negative 데이터가
+  `/home/dxer1/yolo_hardneg_leftgreen/`에 준비돼 있으나, 기존 데이터셋과 병합 후
+  `train-6` 재학습·검증이 아직 안 됐다.
+- `lane_detection`의 차선 피팅이 이번 세션에서 크게 안정화됐지만(아래 "인지 파이프라인
+  변경 이력" 참고), 여전히 **실주행 bag 기준 프레임의 약 74%에서 피팅이 실패(fallback)
+  한다** — 코리도어/앵커 문제가 아니라 노란 마스크 자체가 안 잡히는 더 근본적인
+  원인(조명/색상 임계값/구간별 실제 가시성)으로 보이며, 아직 원인 파악이 안 됐다.
 - 지름길 종료 가드와 `/road_surface` 구독 계약은 구현됐지만, 학습 중인 CNN publisher와
   모델은 이 저장소에 아직 없다. publisher가 `2(흰 지름길) → 1(검은 기본 도로)`을
   내야 자동 복귀가 완성된다.

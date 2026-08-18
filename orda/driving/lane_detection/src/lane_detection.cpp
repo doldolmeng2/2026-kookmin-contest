@@ -144,8 +144,15 @@ public:
     // (1) 노란 차선 전처리
     //
     // 입력 프레임에서 노란색 픽셀을 HLS ∩ HSV ∩ YCrCb 조건으로 추출하고,
-    // 모폴로지 연산(닫힘 → 열림) 후 Canny 엣지를 검출하여 반환한다.
+    // 모폴로지 연산(닫힘 → 열림)으로 정리한 꽉 찬 마스크를 그대로 반환한다.
     // ROI 사다리꼴 마스크를 먼저 적용해 관심 영역 외부를 제외한다.
+    //
+    // 예전엔 여기서 Canny로 마스크의 윤곽선만 뽑아서 넘겼는데, 그러면
+    // 슬라이딩 윈도우가 보는 점이 폭 1~2px짜리 성긴 엣지뿐이라 그래디언트
+    // 기반 Canny 임계값이 조명/압축 노이즈에 반응할 때마다 프레임마다 살아
+    // 남는 점 집합이 달라져 피팅이 흔들렸다(지터링). 이미 안정적인 꽉 찬
+    // 마스크를 그대로 쓰면 윈도우당 점이 훨씬 조밀해지고, 노이즈 한 프레임에
+    // 안 흔들린다.
     // ─────────────────────────────────────────────────────────────────────
     Mat preprocessYellow(const Mat& frame) {
         // ROI 마스크 적용
@@ -205,24 +212,7 @@ public:
         morphologyEx(y_mask, y_mask, MORPH_CLOSE, k_close);
         morphologyEx(y_mask, y_mask, MORPH_OPEN,  k_open);
 
-        // 가우시안 블러 + Canny 엣지 검출 (노란색 마스크 범위 내에서만)
-        Mat gray, blurred, masked_gray, edges;
-        cvtColor(roi_frame, gray, COLOR_BGR2GRAY);
-        GaussianBlur(gray, blurred,
-                     Size(config_.gaussian_blur_kernel_size, config_.gaussian_blur_kernel_size), 0);
-
-        // 마스크를 3×3 팽창하여 엣지 검출 범위를 조금 확장
-        Mat y_mask_dil;
-        Mat k3 = getStructuringElement(MORPH_RECT, Size(3, 3));
-        dilate(y_mask, y_mask_dil, k3);
-
-        blurred.copyTo(masked_gray, y_mask_dil);
-        Canny(masked_gray, edges,
-              config_.canny_yellow_low_threshold, config_.canny_yellow_high_threshold);
-
-        // 최종 마스크로 엣지 이미지를 다시 제한
-        bitwise_and(edges, edges, edges, y_mask);
-        return edges;
+        return y_mask;
     }
 
 
@@ -458,6 +448,56 @@ public:
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // 점 집합에 x = m*y + b 직선을 SVD 최소자승으로 피팅한다.
+    // pts가 비어있으면 {0,0}을 반환한다(호출부에서 크기를 먼저 확인할 것).
+    // ─────────────────────────────────────────────────────────────────────
+    static LineFit fitLineSVD(const vector<Point>& pts) {
+        Mat X(pts.size(), 2, CV_32F), Y(pts.size(), 1, CV_32F);
+        for (size_t i = 0; i < pts.size(); ++i) {
+            X.at<float>(i, 0) = static_cast<float>(pts[i].y);
+            X.at<float>(i, 1) = 1.f;
+            Y.at<float>(i, 0) = static_cast<float>(pts[i].x);
+        }
+        Mat coeff;
+        solve(X, Y, coeff, DECOMP_SVD);
+        return LineFit{ coeff.at<float>(0,0), coeff.at<float>(1,0) };
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // 반복적 잔차 클리핑(iterative outlier rejection)으로 직선을 강건하게
+    // 피팅한다. 슬라이딩 윈도우 20개 중 1~2개가 노이즈(반사광 등)를 주워도,
+    // 그 노이즈가 순수 최소제곱 피팅 전체를 흔드는 것을 막기 위함.
+    //
+    // 절차: 1) 전체 점으로 1차 피팅 → 2) 그 직선에서 reject_px 보다 먼 점을
+    // 버리고 재피팅 → 3) iterations 만큼 반복. 남은 점이 최소 임계치보다
+    // 적어지면(=이상치 제거가 과했으면) 그 직전 결과를 그대로 유지한다.
+    // ─────────────────────────────────────────────────────────────────────
+    static LineFit fitLineRobust(const vector<Point>& pts, float reject_px, int iterations) {
+        LineFit fit = fitLineSVD(pts);
+        if (reject_px <= 0.f || iterations <= 0) return fit;
+
+        vector<Point> kept = pts;
+        for (int iter = 0; iter < iterations; ++iter) {
+            vector<Point> inliers;
+            inliers.reserve(kept.size());
+            for (const auto& p : kept) {
+                float pred = fit.m * static_cast<float>(p.y) + fit.b;
+                if (std::abs(static_cast<float>(p.x) - pred) <= reject_px)
+                    inliers.push_back(p);
+            }
+            // 너무 많이 걸러졌으면(이상치 제거가 아니라 실제 신호를 지운 것으로
+            // 보고) 직전 반복의 피팅을 그대로 쓴다.
+            if (inliers.size() < 10 || inliers.size() == kept.size()) {
+                kept = std::move(inliers);
+                break;
+            }
+            kept = std::move(inliers);
+            fit  = fitLineSVD(kept);
+        }
+        return fit;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // (4) 슬라이딩 윈도우 직선 피팅
     //
     // BEV 이진 영상에서 중앙선을 슬라이딩 윈도우로 추적하고
@@ -483,19 +523,41 @@ public:
         const int h = bev_binary.rows, w = bev_binary.cols;
 
         // ── 1) corridor 범위 계산 ───────────────────────────────────────
-        // 현재 차선 모드의 ref_ratio로 기준 x(ref_x_)를 결정하고
-        // corridor_width만큼 좌우로 탐색 범위를 제한한다.
+        // 현재 차선 모드의 ref_ratio로 고정 기준 x(ref_x_)를 계산해둔다.
+        // (다른 함수의 노이즈 억제 corridor·디버그 표시에서 계속 쓰인다.)
         float ref_ratio = std::clamp(getActiveRefRatio(), 0.0f, 1.0f);
         ref_x_ = static_cast<int>(std::round(ref_ratio * w));
 
-        int x_min = std::max(0,   ref_x_ - static_cast<int>(config_.corridor_width / 2));
-        int x_max = std::min(w-1, ref_x_ + static_cast<int>(config_.corridor_width / 2));
+        // 코리도어/가중치 중심은 ref_x_(고정)가 아니라 "직전 프레임에 실제로
+        // 찾은 위치"를 앵커로 쓴다. 예전엔 매 프레임 ref_x_ 주변에서 새로
+        // 찾았는데, 그러면 신호가 잠깐 부족해 fallback으로 버티다가 다시
+        // 신호가 잡히는 순간 직전 위치와 무관하게 ref_x_ 근처 아무 노란
+        // 노이즈로 확 튀는 문제가 있었다(실측: 프레임당 평균 70px, 최대
+        // 590px 이동). 트래킹(직전 위치 기준)으로 바꾸면 탐색이 "방금 본
+        // 자리" 주변에 머물러 있어서 튈 여지가 줄어든다.
+        //
+        // 단, 실패(ok=false)가 fit_reacquire_after_frames 프레임 넘게
+        // 계속되면 그 앵커 자체를 못 믿는다는 뜻이므로 ref_x_로 되돌아가
+        // 다시 찾는다. 이게 없으면 앵커가 한 번 잘못된 자리에 멈췄을 때
+        // 좁아진 코리도어 안에서 영원히 못 빠져나오는 문제가 있었다
+        // (실측: ok=false 최장 818프레임 연속).
+        int anchor_x = ref_x_;
+        const bool anchor_trustworthy =
+            has_prev_center_fit_ &&
+            consecutive_fail_count_ < config_.fit_reacquire_after_frames;
+        if (anchor_trustworthy) {
+            anchor_x = static_cast<int>(prev_center_fit_.m * (h - 1) + prev_center_fit_.b);
+            anchor_x = std::clamp(anchor_x, 0, w - 1);
+        }
+
+        int x_min = std::max(0,   anchor_x - static_cast<int>(config_.corridor_width / 2));
+        int x_max = std::min(w-1, anchor_x + static_cast<int>(config_.corridor_width / 2));
         int histW = x_max - x_min + 1;
         if (histW <= 2) { x_min = 0; x_max = w - 1; histW = w; }
 
         // ── 2) 가중 히스토그램으로 시작점(base_x) 결정 ─────────────────
         // 하단 70% 영역에서 corridor 범위의 열별 픽셀 합 계산 후,
-        // ref_x_ 근처에 가우시안 가중치를 곱하여 최댓값 열을 시작점으로 선택
+        // anchor_x 근처에 가우시안 가중치를 곱하여 최댓값 열을 시작점으로 선택
         int y_start_hist = std::min(std::max(static_cast<int>(h * 0.3), 0), h - 1);
         cv::Mat hist_roi = bev_binary(cv::Rect(x_min, y_start_hist, histW, h - y_start_hist));
         cv::Mat nz       = (hist_roi > 0);
@@ -505,7 +567,7 @@ public:
         std::vector<int> hist(histW);
         for (int i = 0; i < histW; ++i) hist[i] = colSum.at<int>(0, i) / 255;
 
-        // sigma_ratio가 작을수록 ref 근처만 강하게 밀어줌(보수적 시작점)
+        // sigma_ratio가 작을수록 anchor 근처만 강하게 밀어줌(보수적 시작점)
         // w_min을 0.3~0.7 사이로 조절하면 멀리 있어도 완전히 무시되지 않음
         const float sigma_ratio  = (config_.ref_hist_sigma_ratio > 0.f) ?
                                     config_.ref_hist_sigma_ratio : 0.35f;
@@ -518,12 +580,12 @@ public:
         std::vector<float> weighted_hist(histW);
         for (int i = 0; i < histW; ++i) {
             int   x = x_min + i;
-            float d = static_cast<float>(std::abs(x - ref_x_));
+            float d = static_cast<float>(std::abs(x - anchor_x));
             float w = w_min + (1.f - w_min) * std::exp(-(d*d) / two_sigma2);
             weighted_hist[i] = static_cast<float>(hist[i]) * w;
         }
 
-        int base_x   = ref_x_;
+        int base_x   = anchor_x;
         auto it_w    = std::max_element(weighted_hist.begin(), weighted_hist.end());
         const float bestValW = (it_w != weighted_hist.end()) ? *it_w : 0.f;
 
@@ -531,21 +593,18 @@ public:
             int base_x_rel = static_cast<int>(std::distance(weighted_hist.begin(), it_w));
             base_x = x_min + base_x_rel;
         } else {
-            // 신호 없음: 이전 프레임 피팅 하단값 또는 ref_x_ 사용
-            if (has_prev_center_fit_) {
-                int x_prev_bottom = static_cast<int>(prev_center_fit_.m * (h - 1) + prev_center_fit_.b);
-                base_x = std::clamp(x_prev_bottom, x_min, x_max);
-            } else {
-                base_x = std::clamp(ref_x_, x_min, x_max);
-            }
+            // 신호 없음: anchor_x(직전 위치 또는 ref_x_) 그대로 유지
+            base_x = std::clamp(anchor_x, x_min, x_max);
         }
 
         // ── 3) 디버그 캔버스 준비 ───────────────────────────────────────
         cv::Mat dbg;
         if (dbg_out) {
             cv::cvtColor(bev_binary, dbg, cv::COLOR_GRAY2BGR);
-            // ref_x_: 초록 수직선
+            // ref_x_: 초록 수직선(차선 모드 고정 기준점)
             cv::line(dbg, {ref_x_, 0}, {ref_x_, h-1}, {0, 255, 0}, 1);
+            // anchor_x: 청록색 수직선(이번 프레임 탐색 중심 = 직전 위치 추적)
+            cv::line(dbg, {anchor_x, 0}, {anchor_x, h-1}, {255, 255, 0}, 1);
             // corridor 좌우 경계: 파란 점선
             for (int y = 0; y < h; y += 6) {
                 dbg.at<cv::Vec3b>(y, std::clamp(x_min, 0, w-1)) = {255, 0, 0};
@@ -600,6 +659,7 @@ public:
         // ── 5) 포인트 부족 시 이전 프레임 값으로 fallback ──────────────
         if (pts.size() < 10) {
             ok = false;
+            ++consecutive_fail_count_;
             if (dbg_out && has_prev_center_fit_) {
                 float m = prev_center_fit_.m, b = prev_center_fit_.b;
                 cv::line(dbg,
@@ -611,22 +671,14 @@ public:
             return has_prev_center_fit_ ? prev_center_fit_ : LineFit{0.f, 0.f};
         }
 
-        // ── 6) 최소자승 직선 피팅: x = m*y + b (SVD 방식) ─────────────
-        // 설계행렬 X(Nx2): 각 행 = [y_i, 1]
-        // 타겟벡터 Y(Nx1): 각 행 = x_i
-        // 해 θ = [m, b] 를 SVD로 수치 안정적으로 계산
-        Mat X(pts.size(), 2, CV_32F), Y(pts.size(), 1, CV_32F);
-        for (size_t i = 0; i < pts.size(); ++i) {
-            float yf = static_cast<float>(pts[i].y);
-            X.at<float>(i, 0) = yf;
-            X.at<float>(i, 1) = 1.f;
-            Y.at<float>(i, 0) = static_cast<float>(pts[i].x);
-        }
-        Mat coeff;
-        solve(X, Y, coeff, DECOMP_SVD);
-
-        LineFit fit{ coeff.at<float>(0,0), coeff.at<float>(1,0) };
+        // ── 6) 강건 직선 피팅: x = m*y + b (SVD + 반복 이상치 제거) ────
+        // 1차 SVD 피팅 후, 그 직선에서 fit_outlier_reject_px 보다 먼 점을
+        // 버리고 재피팅하기를 fit_outlier_iterations 회 반복한다. 노이즈를
+        // 주운 윈도우 1~2개가 전체 피팅을 흔드는 것을 막는다.
+        LineFit fit = fitLineRobust(pts, config_.fit_outlier_reject_px,
+                                     config_.fit_outlier_iterations);
         ok = true;
+        consecutive_fail_count_ = 0;
 
         // ── 7) 최종 선 디버그 표시 ─────────────────────────────────────
         if (dbg_out) {
@@ -1004,6 +1056,7 @@ private:
     bool    has_prev_center_fit_ = false;
     float   prev_offset_         = 0.f;
     int     ref_x_               = 0;
+    int     consecutive_fail_count_ = 0;  // 연속 ok=false 횟수 (재획득 판단용)
 
     // ── 디버그 제어 ─────────────────────────────────────────────────────
     int  frame_count_  = 0;
@@ -1348,6 +1401,9 @@ int main(int argc, char** argv) {
     std::cout << "[Config] sliding_window_margin = " << config.sliding_window_margin << std::endl;
     std::cout << "[Config] sliding_window_minpix = " << config.sliding_window_minpix << std::endl;
     std::cout << "[Config] corridor_width = " << config.corridor_width << std::endl;
+    std::cout << "[Config] fit_outlier_reject_px = " << config.fit_outlier_reject_px << std::endl;
+    std::cout << "[Config] fit_outlier_iterations = " << config.fit_outlier_iterations << std::endl;
+    std::cout << "[Config] fit_reacquire_after_frames = " << config.fit_reacquire_after_frames << std::endl;
     std::cout << "==============================================" << std::endl;
 
     auto node = std::make_shared<LaneDetector>(config);

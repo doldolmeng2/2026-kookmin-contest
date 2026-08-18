@@ -54,6 +54,19 @@ struct Config {
     // ── 차선 탐색 코리도어 폭 ────────────────────────────────────────────
     int corridor_width;  // 기준선(ref_x_) 중심 탐색 범위 (px)
 
+    // ── 추적 실패 시 재획득(reacquire) ──────────────────────────────────
+    // fitLaneFromBEV 이 이 프레임 수만큼 연속으로 실패(ok=false, pts<10)하면
+    // 직전 위치 앵커를 버리고 ref_x_(차선 모드 고정 기준점)로 되돌아가
+    // 다시 찾는다. 없으면 한 번 놓친 앵커에 영원히 갇힐 수 있다.
+    int fit_reacquire_after_frames;
+
+    // ── 직선 피팅 이상치 제거 (반복적 잔차 클리핑) ──────────────────────
+    // 1차 SVD 피팅 후, 그 직선에서 이 값(px)보다 멀리 떨어진 점을 제거하고
+    // 재피팅한다. 슬라이딩 윈도우 일부가 노이즈(반사광 등)를 주웠을 때
+    // 그 노이즈가 최소제곱 피팅 전체를 흔드는 것을 막기 위함.
+    float fit_outlier_reject_px;   // 잔차 임계값 (px)
+    int   fit_outlier_iterations;  // 재피팅 반복 횟수 (0이면 기존과 동일하게 비활성)
+
     // ── 전처리: 블러 및 Canny 엣지 파라미터 ─────────────────────────────
     int gaussian_blur_kernel_size;    // 가우시안 블러 커널 크기 (홀수)
     int canny_yellow_high_threshold;  // Canny 상위 임계값

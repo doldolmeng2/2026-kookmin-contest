@@ -6,19 +6,28 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import Image
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, Float32MultiArray
 from ament_index_python.packages import get_package_share_directory
 
 from traffic_light.image_conversion import imgmsg_to_bgr
 
-NAMES = ['4-traffic', 'green_light', 'left_green_light', 'orange_light', 'red_light']
-GREEN, LEFT, ORANGE, RED = 1, 2, 3, 4
+# best_traffic.onnx 는 이제 object_detection 과 공유하는 6클래스 통합 모델이다
+# (train-5 부터 "4-traffic" 몸체 클래스가 빠졌다):
+#   0 red_car  1 green_car
+#   2 green_light  3 left_green_light  4 orange_light  5 red_light
+# 장애물 클래스(0,1)는 GREEN/LEFT/ORANGE/RED 어디에도 해당하지 않으므로 무시된다.
+NAMES = ['red_car', 'green_car',
+         'green_light', 'left_green_light', 'orange_light', 'red_light']
+GREEN, LEFT, ORANGE, RED = 2, 3, 4, 5
+# 신호등 계열 클래스만 /traffic_boxes 로 내보낸다. 차량 클래스(0,1)는
+# object_node 쪽에서 이미 그려주므로 여기서는 신호등 색상(2~5)만 다룬다.
+TRAFFIC_CLASS_IDS = {GREEN, LEFT, ORANGE, RED}
 
 class TrafficNode(Node):
     def __init__(self):
         super().__init__('traffic_node')
         self.declare_parameter('model_path', '')
-        self.declare_parameter('camera_topic', '/image_raw')
+        self.declare_parameter('camera_topic', '/resized_image')
         self.declare_parameter('conf', 0.5)
         self.declare_parameter('nms', 0.45)
         self.declare_parameter('debounce_frames', 3)
@@ -39,6 +48,7 @@ class TrafficNode(Node):
         self.inp = self.sess.get_inputs()[0].name
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
         self.pub = self.create_publisher(Int32, '/traffic_detection', qos)
+        self.box_pub = self.create_publisher(Float32MultiArray, '/traffic_boxes', qos)
         self.create_subscription(Image, cam, self.on_image, qos)
         self._cand = 0; self._cnt = 0; self._stable = 0; self._last = None
         self.get_logger().info(f'traffic_node start (cam={cam}, conf={self.conf}, debounce={self.debounce_n})')
@@ -51,6 +61,14 @@ class TrafficNode(Node):
         raw, dets = self.infer(img)
         st = self.debounce(raw)
         m = Int32(); m.data = int(st); self.pub.publish(m)
+
+        flat = []
+        for (x, y, bw, bh), sc, cid in dets:
+            if cid in TRAFFIC_CLASS_IDS:
+                flat.extend([float(cid), float(sc), float(x), float(y), float(bw), float(bh)])
+        bmsg = Float32MultiArray(); bmsg.data = flat
+        self.box_pub.publish(bmsg)
+
         if st != self._last:
             self.get_logger().info(f'/traffic_detection = {st} (raw={raw})'); self._last = st
         if self.show_debug:
@@ -84,7 +102,8 @@ class TrafficNode(Node):
         return self._stable
 
     def draw(self, img, dets, raw, st):
-        col = [(200,200,200),(0,220,0),(255,255,0),(0,165,255),(0,0,255)]
+        col = [(0,0,255),(0,200,0),
+               (0,220,0),(255,255,0),(0,165,255),(0,0,255)]
         v = img.copy()
         for (x,y,bw,bh),sc,cid in dets:
             cv2.rectangle(v,(x,y),(x+bw,y+bh),col[cid],2)

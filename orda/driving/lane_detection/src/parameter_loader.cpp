@@ -74,6 +74,11 @@ Config load_config(const std::string& path) {
     config.sliding_window_minpix      = j["sliding_window_minpix"];
     config.corridor_width             = j["corridor_width"];
 
+    // 구버전 JSON에는 없을 수 있으니 기본값을 둔다.
+    config.fit_outlier_reject_px  = j.value("fit_outlier_reject_px", 20.0f);
+    config.fit_outlier_iterations = j.value("fit_outlier_iterations", 2);
+    config.fit_reacquire_after_frames = j.value("fit_reacquire_after_frames", 10);
+
     // ── 전처리 파라미터 ───────────────────────────────────────────────
     config.gaussian_blur_kernel_size   = j["gaussian_blur_kernel_size"];
     config.canny_yellow_high_threshold = j["canny_yellow_high_threshold"];

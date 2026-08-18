@@ -56,13 +56,23 @@ def main():
         shutil.copy(lbl, os.path.join(args.out, "labels", split, stem + ".txt"))
         counts[split] += 1
 
+    # classes.txt 가 있으면 그 순서를 그대로 쓴다 (다중 클래스 데이터셋 지원).
+    # 없으면 옛 단일 클래스 기본값으로 되돌아간다.
+    classes_path = os.path.join(args.labels, "classes.txt")
+    if os.path.exists(classes_path):
+        with open(classes_path) as fh:
+            names = [line.strip() for line in fh if line.strip()]
+    else:
+        names = ["obstacle_car"]
+
     yaml_path = os.path.join(args.out, "data.yaml")
+    names_yaml = "[" + ", ".join(f'"{n}"' for n in names) + "]"
     with open(yaml_path, "w") as fh:
         fh.write(f"path: {os.path.abspath(args.out)}\n"
                  "train: images/train\n"
                  "val: images/val\n"
-                 "nc: 1\n"
-                 'names: ["obstacle_car"]\n')
+                 f"nc: {len(names)}\n"
+                 f"names: {names_yaml}\n")
 
     print(f"train {counts['train']}장 / val {counts['val']}장")
     if missing:
