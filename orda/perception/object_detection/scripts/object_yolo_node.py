@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""ONNX Runtime YOLO frontend for the C++ LiDAR/lane fusion node."""
+"""ONNX Runtime YOLO frontend for the C++ LiDAR/lane fusion node.
+
+한 번의 추론으로 두 가지를 낸다:
+  /object_yolo    차량(고정장애물·방해차량) 박스 1개 -> object_node(C++)
+  /traffic_boxes  신호등처럼 생긴 위치 후보 전부       -> object_node(C++)
+
+신호등은 2단계(ROI 크롭 + 분류) 방식이다. 이 노드는 '신호등이 여기 있다'는
+위치만 낸다 — 무슨 신호인지는 여기서 정하지 않는다. object_node(C++)가 이
+박스를 /resized_image 원본에서 직접 잘라 light_cls.onnx(cv::dnn)로 분류한다
+(2026-08-19, 크롭·분류를 Python 에서 C++ 로 이전). 검출기의 신호등 클래스
+판정은 신뢰할 수 없다: 홀드아웃에서 박스 찾기는 100% 였지만 클래스는 86.9%
+였고, 같은 신호등을 축소만 해도 left_green_light -> green_light 로 뒤집혔다.
+
+/traffic_boxes 의 class_id/confidence 는 검출기가 매긴 값 그대로다 —
+object_node 는 위치(x,y,w,h)만 쓰고 이 값들은 무시한다.
+"""
 
 from __future__ import annotations
 
@@ -41,9 +56,9 @@ class ObjectYoloNode(Node):
         # car+traffic model): 0=red_car(fixed) 1=green_car(moving).
         self.declare_parameter("fixed_class_ids", [0])
         self.declare_parameter("moving_class_ids", [1])
-        # 신호등 색상 클래스. object_node 가 더 이상 traffic_node 를
-        # 거치지 않고 이 노드가 보낸 박스로 직접 상태를 계산한다.
-        # train-5 부터 "4-traffic"(몸체) 클래스가 빠져서 6클래스(0~5)다.
+        # 신호등 후보 클래스. 실제 색 판정은 object_node(C++)의 크롭
+        # 분류기가 하므로, 여기서는 "신호등처럼 생긴 위치" 후보를 고르는
+        # 용도로만 쓴다 — 순서는 의미가 없다.
         self.declare_parameter("traffic_class_ids", [2, 3, 4, 5])
         self.declare_parameter("traffic_output_topic", "/traffic_boxes")
 

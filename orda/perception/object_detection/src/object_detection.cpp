@@ -5,25 +5,43 @@
 //
 // 구독:
 //   /scan              (sensor_msgs/LaserScan)           - LiDAR 거리 데이터 (디버그 표시용)
-//   /resized_image     (sensor_msgs/Image, BGR8)          - 디버그 영상(선택)
+//   /resized_image     (sensor_msgs/Image, BGR8)          - 신호등 크롭 분류 원본 + 디버그 영상
 //   /object_yolo       (std_msgs/Float32MultiArray)       - ONNX Runtime 차량 검출(가장 가까운 1개)
-//   /traffic_boxes     (std_msgs/Float32MultiArray)       - ONNX Runtime 신호등 박스(프레임당 여러 개)
+//   /traffic_boxes     (std_msgs/Float32MultiArray)       - ONNX Runtime 신호등 "위치" 후보 박스(전부)
 //   /lane_fit          (std_msgs/Float32MultiArray [m,b]) - 차선 회귀 결과
 //
-// 신호등 인식은 traffic_node 를 거치지 않고 이 노드가 직접 한다: /traffic_boxes
-// 로 들어오는 프레임별 신호등 클래스 존재 여부를 모아 우선순위(좌회전 > 직진 >
-// 정지) 판정 + 디바운스(debounce_frames 연속)를 여기서 계산한다.
+// 신호등 인식은 traffic_node 도, Python 쪽 분류기도 거치지 않고 이 노드가
+// 직접 한다: /traffic_boxes 로 들어오는 박스마다 /resized_image 에서 직접
+// 잘라(ROI 크롭) light_cls.onnx(cv::dnn)로 분류하고, 그 결과를 모아 우선순위
+// (좌회전 > 직진 > 정지) 판정 + 디바운스(debounce_frames 연속)를 계산한다.
+//
+// /traffic_boxes 의 class_id/confidence 는 object_yolo_node.py 검출기가 매긴
+// 값이라 색 판정에는 안 쓴다 — "신호등처럼 생긴 위치" 후보로만 쓰고 실제 색은
+// 위 크롭 분류가 다시 정한다. 검출기의 신호등 클래스 판정은 거리에 따라
+// 뒤집혀 신뢰할 수 없었다(홀드아웃 클래스 정확도 86.9% -> 크롭 분류 98.3%).
+// 분류 확신도가 낮은 박스는 증거로 안 쓴다(light_min_confidence_, 기본 0.90) —
+// 자세한 배경은 README 참고.
 //
 // 발행:
-//   /object_info (std_msgs/Int32MultiArray, 3개 필드) — 유일한 출력 토픽.
-//   신호등/고정차량/방해차량 정보를 이 하나로 통합해서 낸다 (별도
-//   /traffic_detection 토픽은 발행하지 않는다).
+//   /object_info (std_msgs/Int32MultiArray, 3개 필드) — FSM 이 구독하는
+//   유일한 최종 출력. 신호등/고정차량/방해차량 정보를 이 하나로 통합해서
+//   낸다 (별도 /traffic_detection 토픽은 발행하지 않는다).
 //   [신호등 정보, 고정차량 위치, 방해차량 위치]
 //     신호등 정보:   0=인식x  1=빨간불/주황불(정지)  2=직진(초록)  3=좌회전
 //     고정차량 위치: 0=인식x  1=1차선  2=2차선   (object_type=FIXED 일 때만)
 //     방해차량 위치: 0=인식x  1=1차선  2=2차선   (object_type=MOVING 일 때만)
 //   차량 위치 둘은 /object_yolo 로 받은 최신 박스(lane_label)를 object_type 에
 //   따라 갈라 넣는다. 각 값 모두 box_max_age_s_ 보다 오래되면 0(인식x)으로 리셋된다.
+//
+//   /object_info_raw (std_msgs/Float32MultiArray, 12개 필드) [내부 상세]
+//   [exists, min_dist, angle, span, cluster_size,
+//    box_size, box_cx, box_cy, dx, car_lane, object_type, confidence]
+//     car_lane   : 0=중앙, 1=왼쪽, 2=오른쪽
+//     object_type: -1=미확정, 0=고정장애물, 1=방해차량
+//   /object_info 계산에 실제로 쓰인 원시값을 그대로 낸다 — box_*, car_lane,
+//   object_type, confidence 는 box_max_age_s_ 스테일 리셋을 적용하지 않은
+//   값이다(/object_info 의 fixed_lane/moving_lane 은 리셋된다). 디버깅·로깅
+//   용이고 FSM 계약과는 무관하다.
 //
 // 디버그 창 (enable_gui=true 시):
 //   "OBJECT DEBUG" : exists / distance / cluster_size (LiDAR 클러스터링, 표시 전용)
@@ -39,6 +57,7 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
 #include <cv_bridge/cv_bridge.h>
+#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <fstream>
 #include <string>
 #include <mutex>
@@ -114,6 +133,20 @@ public:
         // (예전 traffic_node 의 debounce_frames 기본값과 동일)
         debounce_n_ = this->declare_parameter<int>("debounce_frames", 3);
         if (debounce_n_ < 1) debounce_n_ = 1;
+        // ── 신호등 크롭 분류기 파라미터 ─────────────────────────────────
+        // 빈 문자열이면 share 디렉터리(model/light_cls.onnx)를 탐색한다.
+        // best.onnx 가 실제로 로드되는 경로(Python object_yolo_node.py 의
+        // share 디렉터리 기본값 + model_path 오버라이드)와 같은 패턴이다.
+        // 아래 resolveModelPath() 의 하드코딩된 개발PC/실차 경로 후보는 예전
+        // xycar_ws 워크스페이스를 가리키는 죽은 코드(use_external_yolo_ 기본
+        // true 라 실제로는 안 쓰인다)라 새로 참조하지 않았다.
+        light_classifier_path_ = this->declare_parameter<std::string>("light_classifier_path", "");
+        light_crop_margin_     = this->declare_parameter<double>("light_crop_margin", 0.15);
+        light_input_size_      = this->declare_parameter<int>("light_input_size", 64);
+        // 이 값 아래면 "판단 보류"(증거로 안 씀)로 처리한다. traffic2~5 bag
+        // 검증에서 오답과 정답이 확신도로 거의 완전히 갈렸다(정답 25%분위
+        // 0.998, 오답 최대 0.889). 자세한 배경은 README 참고.
+        light_min_confidence_  = this->declare_parameter<double>("light_min_confidence", 0.90);
 
 
         // QoS 프로파일
@@ -147,6 +180,10 @@ public:
 
         // 장애물 정보 발행 [신호등, 고정차량 위치, 방해차량 위치]
         pub_obj_ = this->create_publisher<std_msgs::msg::Int32MultiArray>("/object_info", qos_fast);
+        // 내부 상세 12필드 — /object_info 계산에 쓰인 원시값을 그대로 낸다
+        // (스테일 리셋 미적용). 디버깅/로깅용, FSM 은 이 토픽을 구독하지 않는다.
+        pub_obj_raw_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
+            "/object_info_raw", qos_fast);
 
         // ── YOLO 모델 초기화 ────────────────────────────────────────────
         // 모델 경로는 개발 PC / 실차 두 곳을 순서대로 확인한다 (resolveModelPath).
@@ -175,6 +212,50 @@ public:
                 }
             }
         }
+
+        // ── 신호등 크롭 분류기 초기화 ────────────────────────────────────
+        // 이전에는 object_yolo_node.py 가 onnxruntime 으로 이 모델을 불러와
+        // 크롭·분류까지 했다. YOLOv8 검출기와 달리 이건 텐서 1개짜리 단순
+        // 분류 헤드라 cv::dnn 이 문제없이 돌린다 — 실차와 같은 OpenCV 4.5.4로
+        // 직접 확인했다(출력 합 1.0, softmax 내장). 위 YOLO 검출기가 cv::dnn
+        // 을 피해 Python 으로 간 이유(shape assertion)는 검출 후처리 특유의
+        // 문제라 여기엔 해당하지 않는다.
+        {
+            std::string light_path = light_classifier_path_;
+            if (light_path.empty()) {
+                try {
+                    light_path = ament_index_cpp::get_package_share_directory("object_detection")
+                               + "/model/light_cls.onnx";
+                } catch (const std::exception& e) {
+                    RCLCPP_ERROR(this->get_logger(),
+                                 "object_detection share 디렉터리를 찾지 못했습니다: %s", e.what());
+                }
+            }
+            std::ifstream lf(light_path, std::ios::binary);
+            if (!light_path.empty() && lf.good()) {
+                try {
+                    light_net_ = cv::dnn::readNet(light_path);
+                    light_net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+                    light_net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+                    light_ok_ = true;
+                    RCLCPP_INFO(this->get_logger(),
+                                "신호등 크롭 분류기 로드 완료: %s (min_conf=%.2f)",
+                                light_path.c_str(), light_min_confidence_);
+                } catch (const cv::Exception& e) {
+                    RCLCPP_ERROR(this->get_logger(), "신호등 분류기 로드 실패: %s", e.what());
+                    light_ok_ = false;
+                }
+            } else {
+                // 모델이 없어도 차량 경로는 그대로 돈다 — 파이프라인 절반이
+                // 빠졌다고 전체가 죽는 것보다 낫다. 이 경우 신호등 상태는
+                // 항상 0(인식x)으로 나간다.
+                RCLCPP_WARN(this->get_logger(),
+                            "신호등 분류기 모델이 없어 신호등 인식을 하지 않습니다: %s",
+                            light_path.c_str());
+                light_ok_ = false;
+            }
+        }
+
         // 재학습 모델(빨간 고정 방해차량) 기준. 검증용 bag에서 이 값이 검출
         // 가능한 프레임의 99%를 잡고, 차가 없는 프레임의 오검출은 0이었다.
         // 이전 0.83은 옛 모델 최고 conf가 0.82라 사실상 전부 버리고 있었다.
@@ -344,12 +425,79 @@ private:
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // 신호등 박스 수신 콜백. 표시용 저장(enable_gui 일 때만) + 상태 계산을
-    // 여기서 직접 한다 — traffic_node 를 거치지 않는다.
+    // 신호등 박스 하나를 잘라(ROI 크롭) 분류기에 넣는다.
     //
-    // 메시지 형식: 6개씩 반복 [class_id, confidence, x, y, w, h]
-    // train-5 부터 "4-traffic"(몸체) 클래스가 빠져서 6클래스(0~5) 스키마다:
-    //   2=green_light 3=left_green_light 4=orange_light 5=red_light
+    // 예전 object_detection/light_classifier.py 의 crop_with_margin() +
+    // classify_crop() 을 그대로 옮긴 것. 전처리(정사각 stretch, INTER_CUBIC,
+    // BGR->RGB, /255, CHW)가 학습 크롭 생성과 반드시 같아야 하므로 순서를
+    // 그대로 지켰다.
+    //
+    // NAMES 순서(0=green 1=left_green 2=orange 3=red)는 학습 시 폴더명 정렬
+    // 순서 = onnx 출력 인덱스다. 재학습해서 순서가 바뀌면 아래 스위치문(호출
+    // 쪽)도 같이 고쳐야 한다.
+    // ─────────────────────────────────────────────────────────────────────
+    bool classifyLight(const cv::Rect& box, int& out_index, float& out_score) {
+        if (!light_ok_) return false;
+
+        cv::Mat frame;
+        {
+            std::lock_guard<std::mutex> lk(mtx_raw_img_);
+            if (last_raw_img_.empty()) return false;
+            frame = last_raw_img_;  // 얕은 복사: 아래에서 읽기만 한다
+        }
+
+        const double grow_x = box.width  * light_crop_margin_ * 0.5;
+        const double grow_y = box.height * light_crop_margin_ * 0.5;
+        int x1 = static_cast<int>(std::lround(box.x - grow_x));
+        int y1 = static_cast<int>(std::lround(box.y - grow_y));
+        int x2 = static_cast<int>(std::lround(box.x + box.width  + grow_x));
+        int y2 = static_cast<int>(std::lround(box.y + box.height + grow_y));
+        x1 = std::max(0, std::min(x1, frame.cols - 1));
+        y1 = std::max(0, std::min(y1, frame.rows - 1));
+        x2 = std::max(x1 + 1, std::min(x2, frame.cols));
+        y2 = std::max(y1 + 1, std::min(y2, frame.rows));
+        cv::Mat crop = frame(cv::Rect(x1, y1, x2 - x1, y2 - y1));
+
+        cv::Mat resized;
+        cv::resize(crop, resized, cv::Size(light_input_size_, light_input_size_),
+                   0, 0, cv::INTER_CUBIC);
+        cv::Mat blob = cv::dnn::blobFromImage(
+            resized, 1.0 / 255.0, cv::Size(light_input_size_, light_input_size_),
+            cv::Scalar(0, 0, 0), /*swapRB=*/true, /*crop=*/false);
+
+        cv::Mat out;
+        try {
+            light_net_.setInput(blob);
+            out = light_net_.forward();
+        } catch (const cv::Exception& e) {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                  "신호등 분류 추론 실패: %s", e.what());
+            return false;
+        }
+
+        double max_val;
+        cv::Point max_loc;
+        cv::minMaxLoc(out.reshape(1, 1), nullptr, &max_val, nullptr, &max_loc);
+        out_index = max_loc.x;
+        out_score = static_cast<float>(max_val);
+        return out_index >= 0 && out_index < 4;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // 신호등 박스 수신 콜백. 박스마다 크롭 분류(classifyLight)를 돌리고,
+    // 그 결과로 표시용 저장(enable_gui 일 때만) + 상태 계산을 여기서 직접
+    // 한다 — traffic_node 도, Python 쪽 분류기도 거치지 않는다.
+    //
+    // 메시지 형식: 6개씩 반복 [class_id, confidence, x, y, w, h]. x/y/w/h만
+    // 쓴다 — class_id/confidence 는 object_yolo_node.py 검출기가 매긴 값이라
+    // 신뢰할 수 없다(홀드아웃 클래스 정확도 86.9%, 위치만 100%). 그래서
+    // "신호등처럼 생긴 위치" 후보로만 쓰고, 실제 색 판정은 아래 크롭 분류로
+    // 다시 한다.
+    //
+    // 분류 확신도가 light_min_confidence_ 아래면 그 박스는 증거로 안 쓴다
+    // (raw=0 쪽으로 흘러간다). traffic2~5 bag 검증에서 이 게이트 하나로
+    // 화면 상단에 잘려 붙은 과폭 박스발 오답을 전부 걸렀다 — 자세한 배경은
+    // README 참고.
     //
     // 상태 판정 우선순위: 좌회전(3) > 직진(2) > 정지(1) > 없음(0).
     // 좌회전 화살표는 초록 원과 함께 켜지는 경우가 많아, left 를 먼저 봐야
@@ -357,19 +505,38 @@ private:
     // 같은 raw 코드가 debounce_n_ 프레임 연속돼야 stable 로 확정한다.
     // ─────────────────────────────────────────────────────────────────────
     void onTrafficBoxes(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
-        if (enable_gui_) {
-            std::lock_guard<std::mutex> lk(mtx_traffic_boxes_);
-            last_traffic_boxes_ = msg->data;
-            last_traffic_boxes_stamp_ = now();
+        std::vector<TrafficBoxResult> results;
+        bool tl_green = false, tl_left = false, tl_red = false, tl_orange = false;
+
+        for (size_t i = 0; i + 6 <= msg->data.size(); i += 6) {
+            const float x = msg->data[i + 2];
+            const float y = msg->data[i + 3];
+            const float w = msg->data[i + 4];
+            const float h = msg->data[i + 5];
+            if (!std::isfinite(x) || !std::isfinite(y) ||
+                !std::isfinite(w) || !std::isfinite(h)) continue;
+            if (w <= 0.f || h <= 0.f) continue;
+
+            cv::Rect box(static_cast<int>(std::lround(x)), static_cast<int>(std::lround(y)),
+                         static_cast<int>(std::lround(w)), static_cast<int>(std::lround(h)));
+
+            int index; float score;
+            if (!classifyLight(box, index, score)) continue;
+            if (score < static_cast<float>(light_min_confidence_)) continue;
+
+            results.push_back({box, index, score});
+            switch (index) {
+                case 0: tl_green  = true; break;  // green_light
+                case 1: tl_left   = true; break;  // left_green_light
+                case 2: tl_orange = true; break;  // orange_light
+                case 3: tl_red    = true; break;  // red_light
+            }
         }
 
-        bool tl_green = false, tl_left = false, tl_red = false, tl_orange = false;
-        for (size_t i = 0; i + 6 <= msg->data.size(); i += 6) {
-            const int cid = static_cast<int>(std::lround(msg->data[i]));
-            if      (cid == 2) tl_green  = true;
-            else if (cid == 3) tl_left   = true;
-            else if (cid == 4) tl_orange = true;
-            else if (cid == 5) tl_red    = true;
+        if (enable_gui_) {
+            std::lock_guard<std::mutex> lk(mtx_traffic_boxes_);
+            last_traffic_results_ = std::move(results);
+            last_traffic_boxes_stamp_ = now();
         }
 
         int traffic_raw = 0;
@@ -540,38 +707,53 @@ private:
     // /object_info를 발행한다. 스레드 안전성을 뮤텍스로 보장한다.
     // ─────────────────────────────────────────────────────────────────────
     void onPublishTick() {
-        // LiDAR 클러스터링 결과는 이제 /object_info 에 안 실린다. OBJECT DEBUG
-        // 패널 표시용으로만 계속 읽는다 (onScan 자체는 그대로 둔다).
+        // LiDAR 클러스터링 결과는 /object_info(3필드)엔 안 실린다. OBJECT
+        // DEBUG 패널과 /object_info_raw(12필드) 표시에 쓴다.
         bool  lidar_ok;
-        float minr;
+        float minr, ang, span;
         int   cnt;
         {
             std::lock_guard<std::mutex> lk(mtx_state_);
             lidar_ok = lidar_valid_;
             minr     = st_min_r_;
+            ang      = st_min_r_ang_;
+            span     = st_span_;
             cnt      = st_count_;
         }
 
-        float box_area;
-        int   lane_label;
-        int   object_type;
+        float box_area, box_cx, box_cy, box_dx, confidence;
+        int   raw_lane_label, raw_object_type;
         rclcpp::Time box_stamp{0, 0, RCL_ROS_TIME};
         {
             std::lock_guard<std::mutex> lk(mtx_box_);
-            box_area    = last_box_area_pix_;
-            lane_label  = last_lane_label_;
-            object_type = last_object_type_;
-            box_stamp   = last_box_stamp_;
+            box_area        = last_box_area_pix_;
+            box_cx          = last_box_cx_;
+            box_cy          = last_box_cy_;
+            box_dx          = last_box_dx_;
+            raw_lane_label  = last_lane_label_;
+            raw_object_type = last_object_type_;
+            confidence      = last_object_confidence_;
+            box_stamp       = last_box_stamp_;
         }
         const double box_age_s =
             box_stamp.nanoseconds() > 0
                 ? (now() - box_stamp).seconds()
                 : std::numeric_limits<double>::infinity();
         const bool box_fresh = box_age_s >= 0.0 && box_age_s <= box_max_age_s_;
+        int lane_label  = raw_lane_label;
+        int object_type = raw_object_type;
         if (!box_fresh || box_area <= 0.0f) {
             lane_label  = 0;
             object_type = -1;
         }
+        // /object_info_raw 에도 같은 스테일 리셋을 적용한다 — box_* 계열
+        // 필드는 "이 프레임 기준 실제로 유효한 값"만 낸다.
+        const bool box_stale = !box_fresh || box_area <= 0.0f;
+        const float out_box_area   = box_stale ? 0.0f : box_area;
+        const float out_box_cx     = box_stale ? 0.0f : box_cx;
+        const float out_box_cy     = box_stale ? 0.0f : box_cy;
+        const float out_box_dx     = box_stale ? 0.0f : box_dx;
+        const float out_confidence = box_stale ? 0.0f : confidence;
 
         int32_t traffic_state;
         rclcpp::Time traffic_stamp{0, 0, RCL_ROS_TIME};
@@ -600,9 +782,27 @@ private:
         out.data = { traffic_state, fixed_lane, moving_lane };
         pub_obj_->publish(out);
 
+        const float exists = (lidar_ok && (minr <= detect_threshold_m_)) ? 1.0f : 0.0f;
+
+        // /object_info_raw: [exists, min_dist, angle, span, cluster_size,
+        // box_size, box_cx, box_cy, dx, car_lane, object_type, confidence]
+        // box_size/box_cx/box_cy/dx/car_lane/object_type/confidence 는
+        // /object_info 의 fixed_lane/moving_lane 과 같은 스테일 리셋을
+        // 적용한다(box_max_age_s_ 지나거나 박스가 없으면 0/-1). LiDAR 쪽
+        // (exists/min_dist/angle/span/cluster_size)은 원래부터 별도 스테일
+        // 타이머 없이 "이번 스캔" 값을 그대로 낸다 — onScan()이 이미 감쇠를
+        // 담당한다.
+        std_msgs::msg::Float32MultiArray out_raw;
+        out_raw.data = {
+            exists, minr, ang, span, static_cast<float>(cnt),
+            out_box_area, out_box_cx, out_box_cy, out_box_dx,
+            static_cast<float>(lane_label), static_cast<float>(object_type),
+            out_confidence,
+        };
+        pub_obj_raw_->publish(out_raw);
+
         // 디버그 패널 갱신 (LiDAR exists 는 여기서만 쓰인다)
         if (enable_gui_) {
-            const float exists = (lidar_ok && (minr <= detect_threshold_m_)) ? 1.0f : 0.0f;
             std::lock_guard<std::mutex> lk(mtx_);
             dbg_exists_   = exists;
             dbg_dist_     = minr;
@@ -624,7 +824,9 @@ private:
     //   2 = 오른쪽 (2차선)
     // ─────────────────────────────────────────────────────────────────────
     void onImage(const sensor_msgs::msg::Image::SharedPtr msg) {
-        if (!enable_gui_ && !yolo_ok_) return;
+        // light_ok_ 가 추가된 뒤로는 GUI/내부 YOLO 가 둘 다 꺼져 있어도(=실차
+        // 기본 운용) 신호등 분류를 위해 프레임을 받아야 한다.
+        if (!enable_gui_ && !yolo_ok_ && !light_ok_) return;
 
         cv::Mat img;
         try {
@@ -634,6 +836,13 @@ private:
             return;
         }
         if (img.empty()) return;
+
+        // 신호등 크롭 분류용 원본 사본. last_img_ 는 GUI 가 박스/선을 직접
+        // 그려 넣어 크롭 소스로 못 쓰므로 따로 둔다.
+        if (light_ok_) {
+            std::lock_guard<std::mutex> lk(mtx_raw_img_);
+            last_raw_img_ = img.clone();
+        }
 
         if (enable_gui_) {
             std::lock_guard<std::mutex> lk(mtx_img_);
@@ -938,40 +1147,32 @@ private:
             }
 
             // 신호등 박스 (여러 개일 수 있음, 오래되면 안 그림)
+            // 색·라벨은 크롭 분류 결과(index) 기준 — 검출기의 raw class_id
+            // 가 아니다. 신뢰도(score)도 분류기 확신도다.
             {
-                static const std::vector<std::string> kTrafficNames = {
-                    "", "", "green", "left_green", "orange", "red"};
-                static const std::vector<cv::Scalar> kTrafficColors = {
-                    {}, {}, {0,220,0}, {255,255,0}, {0,165,255}, {0,0,255}};
+                static const std::vector<std::string> kLightNames = {
+                    "green", "left_green", "orange", "red"};
+                static const std::vector<cv::Scalar> kLightColors = {
+                    {0,220,0}, {255,255,0}, {0,165,255}, {0,0,255}};
 
-                std::vector<float> boxes;
+                std::vector<TrafficBoxResult> results;
                 rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
                 {
                     std::lock_guard<std::mutex> lk(mtx_traffic_boxes_);
-                    boxes = last_traffic_boxes_;
+                    results = last_traffic_results_;
                     stamp = last_traffic_boxes_stamp_;
                 }
                 const double age_s = stamp.nanoseconds() > 0
                                           ? (now() - stamp).seconds()
                                           : std::numeric_limits<double>::infinity();
                 if (age_s >= 0.0 && age_s <= box_max_age_s_) {
-                    for (size_t i = 0; i + 6 <= boxes.size(); i += 6) {
-                        const int   cid = static_cast<int>(std::lround(boxes[i]));
-                        const float sc  = boxes[i+1];
-                        const float x   = boxes[i+2];
-                        const float y   = boxes[i+3];
-                        const float w   = boxes[i+4];
-                        const float h   = boxes[i+5];
-                        if (cid < 2 || cid > 5) continue;
-                        if (!std::isfinite(x) || !std::isfinite(y) ||
-                            !std::isfinite(w) || !std::isfinite(h)) continue;
-
-                        cv::Rect box(static_cast<int>(std::round(x)), static_cast<int>(std::round(y)),
-                                     static_cast<int>(std::round(w)), static_cast<int>(std::round(h)));
-                        const cv::Scalar& col = kTrafficColors[cid];
-                        cv::rectangle(disp, box, col, 2);
-                        cv::putText(disp, kTrafficNames[cid] + " " + std::to_string(sc).substr(0,4),
-                                    {box.x, std::max(0, box.y-6)},
+                    for (const auto& r : results) {
+                        if (r.index < 0 || r.index > 3) continue;
+                        const cv::Scalar& col = kLightColors[r.index];
+                        cv::rectangle(disp, r.box, col, 2);
+                        cv::putText(disp,
+                                    kLightNames[r.index] + " " + std::to_string(r.score).substr(0,4),
+                                    {r.box.x, std::max(0, r.box.y-6)},
                                     cv::FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv::LINE_AA);
                     }
                 }
@@ -999,6 +1200,10 @@ private:
     bool   use_external_yolo_;
     std::string model_path_;
     int    debounce_n_ = 3;   // 신호등 디바운스 프레임 수
+    std::string light_classifier_path_;
+    double light_crop_margin_    = 0.15;
+    int    light_input_size_     = 64;
+    double light_min_confidence_ = 0.90;
 
     // ── ROS 통신 객체 ───────────────────────────────────────────────────
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr       sub_scan_;
@@ -1007,6 +1212,7 @@ private:
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr  sub_yolo_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr  sub_traffic_boxes_;
     rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr       pub_obj_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr     pub_obj_raw_;
     rclcpp::TimerBase::SharedPtr timer_;      // 디버그 창 갱신 타이머
     rclcpp::TimerBase::SharedPtr pub_timer_;  // 발행 타이머
 
@@ -1022,6 +1228,12 @@ private:
     std::mutex mtx_img_;
     cv::Mat    last_img_;
 
+    // ── 신호등 분류용 원본 프레임 (뮤텍스: mtx_raw_img_) ────────────────
+    // last_img_ 와 별개다 — GUI 오버레이용은 박스/선이 그려져 크롭 소스로
+    // 못 쓴다.
+    std::mutex mtx_raw_img_;
+    cv::Mat    last_raw_img_;
+
     // ── YOLO 모델 ───────────────────────────────────────────────────────
     cv::dnn::Net net_;
     bool  yolo_ok_         = false;
@@ -1029,6 +1241,13 @@ private:
     float nms_threshold_   = 0.f;
     int   min_w_pix_       = 0;
     int   min_h_pix_       = 0;
+
+    // ── 신호등 크롭 분류기 ───────────────────────────────────────────────
+    cv::dnn::Net light_net_;
+    bool  light_ok_ = false;
+
+    // classifyLight() 결과 하나(박스 + 분류 인덱스 + 확신도). GUI 오버레이용.
+    struct TrafficBoxResult { cv::Rect box; int index; float score; };
 
     // ── YOLO 박스 공유 변수 (뮤텍스: mtx_box_) ─────────────────────────
     std::mutex mtx_box_;
@@ -1042,9 +1261,9 @@ private:
     rclcpp::Time last_box_stamp_{0, 0, RCL_ROS_TIME};  // 마지막 YOLO 갱신 시각
 
     // ── 신호등 박스 공유 변수 (뮤텍스: mtx_traffic_boxes_, 표시 전용) ──
-    std::mutex          mtx_traffic_boxes_;
-    std::vector<float>  last_traffic_boxes_;
-    rclcpp::Time         last_traffic_boxes_stamp_{0, 0, RCL_ROS_TIME};
+    std::mutex                       mtx_traffic_boxes_;
+    std::vector<TrafficBoxResult>    last_traffic_results_;
+    rclcpp::Time                     last_traffic_boxes_stamp_{0, 0, RCL_ROS_TIME};
 
     // ── 신호등 상태 공유 변수 (뮤텍스: mtx_traffic_state_) ─────────────
     // onPublishTick() 이 읽는 쪽. 쓰는 쪽은 onTrafficBoxes() 하나뿐이라

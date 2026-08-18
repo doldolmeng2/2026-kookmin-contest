@@ -13,9 +13,10 @@ find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(cv_bridge REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 
 add_executable(object_node src/object_detection.cpp)
-ament_target_dependencies(object_node rclcpp std_msgs sensor_msgs cv_bridge)
+ament_target_dependencies(object_node rclcpp std_msgs sensor_msgs cv_bridge ament_index_cpp)
 
 target_include_directories(object_node PUBLIC ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(object_node ${OpenCV_LIBS})
@@ -31,7 +32,7 @@ install(PROGRAMS
 
 install(FILES
   best.onnx
-  best_simplified.onnx
+  light_cls.onnx
   DESTINATION share/${PROJECT_NAME}/model)
 
 ament_package()
