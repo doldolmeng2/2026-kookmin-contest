@@ -10,6 +10,9 @@ def generate_launch_description():
     drive_speed = LaunchConfiguration("drive_speed")
     curve_speed = LaunchConfiguration("curve_speed")
     recovery_speed = LaunchConfiguration("recovery_speed")
+    target_lookahead = LaunchConfiguration("target_lookahead")
+    offset_gain = LaunchConfiguration("offset_gain")
+    max_angle = LaunchConfiguration("max_angle")
 
     return LaunchDescription([
         DeclareLaunchArgument("enable_gui", default_value="true"),
@@ -17,6 +20,9 @@ def generate_launch_description():
         DeclareLaunchArgument("drive_speed", default_value="12.0"),
         DeclareLaunchArgument("curve_speed", default_value="8.0"),
         DeclareLaunchArgument("recovery_speed", default_value="5.5"),
+        DeclareLaunchArgument("target_lookahead", default_value="0.55"),
+        DeclareLaunchArgument("offset_gain", default_value="220.0"),
+        DeclareLaunchArgument("max_angle", default_value="45.0"),
 
         Node(
             package="rubbercone",
@@ -31,11 +37,11 @@ def generate_launch_description():
                 "far_scan_max_range": 1.80,
                 "min_far_curve_cones": 3,
                 "far_curve_min_x_span": 0.35,
-                "target_lookahead": 0.70,
-                "curve_target_lookahead": 0.50,
-                "recovery_target_lookahead": 0.50,
+                "target_lookahead": target_lookahead,
+                "curve_target_lookahead": 0.45,
+                "recovery_target_lookahead": 0.45,
                 "fake_bilateral_score_threshold": 3,
-                "offset_gain": 150.0,
+                "offset_gain": offset_gain,
                 "offset_limit": 45.0,
                 "end_missing_frames": 4,
             }],
@@ -49,7 +55,7 @@ def generate_launch_description():
                 "cruise_speed": drive_speed,
                 "curve_speed": curve_speed,
                 "recovery_speed": recovery_speed,
-                "max_angle": 45.0,
+                "max_angle": max_angle,
                 "min_drive_confidence": 20,
                 "full_speed_confidence": 85,
                 "max_cone_age_s": 0.30,
