@@ -26,7 +26,7 @@ def generate_launch_description():
             parameters=[{
                 "enable_gui": enable_gui,
                 "enable_far_curve_hint": enable_far_curve_hint,
-                "scan_max_range": 1.10,
+                "scan_max_range": 1.25,
                 "far_scan_max_range": 1.80,
                 "min_far_curve_cones": 3,
                 "far_curve_min_x_span": 0.35,
