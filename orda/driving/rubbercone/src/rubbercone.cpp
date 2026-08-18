@@ -73,6 +73,17 @@ float pointRange(const cv::Point2f& point)
     return std::hypot(point.x, point.y);
 }
 
+enum class CurveDirection {
+    UNKNOWN,
+    LEFT,
+    RIGHT,
+};
+
+struct CurveHint {
+    CurveDirection direction{CurveDirection::UNKNOWN};
+    float strength{0.0f};
+};
+
 struct BoundaryModel {
     bool valid{false};
     int count{0};
@@ -91,6 +102,8 @@ struct BoundaryModel {
 struct PathEstimate {
     bool valid{false};
     bool bilateral{false};
+    bool fake_bilateral_recovery{false};
+    bool curve_caution{false};
     cv::Point2f target{};
     float confidence{0.0f};
 };
@@ -99,6 +112,7 @@ struct PathEstimate {
 struct DebugSnapshot {
     std::vector<cv::Point2f> raw_points;    // 필터를 통과한 원본 반사점
     std::vector<cv::Point2f> cone_centers;  // 클러스터링으로 뽑은 콘 대표점
+    std::vector<cv::Point2f> far_cone_centers;  // 커브 힌트 전용 먼 콘
     std::vector<cv::Point2f> left_points;   // 좌 경계로 분류된 콘
     std::vector<cv::Point2f> right_points;  // 우 경계로 분류된 콘
     BoundaryModel left;
@@ -124,6 +138,7 @@ public:
       offset_gain_(230.0f),
       scan_min_range_(0.18f),
       scan_max_range_(1.10f),
+      far_scan_max_range_(1.80f),
       scan_max_angle_(85.0f * kPi / 180.0f),
       max_lateral_distance_(0.70f),
       front_ignore_angle_(13.0f * kPi / 180.0f),
@@ -138,6 +153,9 @@ public:
       max_boundary_slope_(1.20f),
       fit_residual_limit_(0.18f),
       target_lookahead_(0.70f),
+      active_target_lookahead_(0.70f),
+      curve_target_lookahead_(0.50f),
+      recovery_target_lookahead_(0.42f),
       min_target_lookahead_(0.35f),
       nominal_half_width_(0.30f),
       adaptive_half_width_(0.30f),
@@ -145,6 +163,12 @@ public:
       max_corridor_width_(1.40f),
       offset_limit_(40.0f),
       max_offset_step_(20.0f),
+      curve_max_offset_step_(12.0f),
+      recovery_max_offset_step_(6.0f),
+      fake_bilateral_score_threshold_(2),
+      boundary_x_gap_warn_(0.25f),
+      target_jump_warn_(0.18f),
+      curve_slope_threshold_(0.28f),
       filtered_target_y_(0.0f),
       has_filtered_target_y_(false),
       filtered_offset_(0.0f),
@@ -200,6 +224,9 @@ public:
         scan_max_range_ = clampValue(
             static_cast<float>(declare_parameter<double>("scan_max_range", 1.10)),
             0.50f, 3.00f);
+        far_scan_max_range_ = clampValue(
+            static_cast<float>(declare_parameter<double>("far_scan_max_range", 1.80)),
+            scan_max_range_, 3.00f);
         scan_max_angle_ = clampValue(
             static_cast<float>(declare_parameter<double>("scan_max_angle", 85.0)),
             30.0f, 90.0f) * kPi / 180.0f;
@@ -214,6 +241,23 @@ public:
         target_lookahead_ = clampValue(
             static_cast<float>(declare_parameter<double>("target_lookahead", 0.70)),
             min_target_lookahead_, scan_max_range_);
+        curve_target_lookahead_ = clampValue(
+            static_cast<float>(declare_parameter<double>("curve_target_lookahead", 0.50)),
+            min_target_lookahead_, target_lookahead_);
+        recovery_target_lookahead_ = clampValue(
+            static_cast<float>(declare_parameter<double>("recovery_target_lookahead", 0.42)),
+            min_target_lookahead_, curve_target_lookahead_);
+        boundary_x_gap_warn_ = clampValue(
+            static_cast<float>(declare_parameter<double>("boundary_x_gap_warn", 0.25)),
+            0.05f, 0.80f);
+        target_jump_warn_ = clampValue(
+            static_cast<float>(declare_parameter<double>("target_jump_warn", 0.18)),
+            0.05f, 0.60f);
+        curve_slope_threshold_ = clampValue(
+            static_cast<float>(declare_parameter<double>("curve_slope_threshold", 0.28)),
+            0.05f, 1.00f);
+        fake_bilateral_score_threshold_ = std::max(
+            1, static_cast<int>(declare_parameter<int>("fake_bilateral_score_threshold", 2)));
         nominal_half_width_ = clampValue(
             static_cast<float>(declare_parameter<double>("nominal_half_width", 0.30)),
             0.15f, 0.70f);
@@ -280,6 +324,7 @@ private:
         rubber_end_value_ = 0;
         rubber_confidence_value_ = 0;
         rubber_entry_ready_value_ = 0;
+        active_target_lookahead_ = target_lookahead_;
 
         // The GUI is diagnostic state, but clearing it here prevents an old
         // latched end/debounce display from being mistaken for the new session.
@@ -329,8 +374,11 @@ private:
 
     // 연속한 LaserScan 반사점 중 실제 콘 하나에 해당하는 대표점을 추출한다.
     // raw_points가 주어지면 필터를 통과한 원본 반사점도 함께 돌려준다(디버그 창용).
-    std::vector<cv::Point2f> extractConeCenters(const sensor_msgs::msg::LaserScan& scan,
-                                                std::vector<cv::Point2f>* raw_points = nullptr) const
+    std::vector<cv::Point2f> extractConeCenters(
+        const sensor_msgs::msg::LaserScan& scan,
+        float min_range,
+        float max_range,
+        std::vector<cv::Point2f>* raw_points = nullptr) const
     {
         std::vector<cv::Point2f> centers;
         std::vector<cv::Point2f> cluster;
@@ -361,7 +409,7 @@ private:
         for (const float range : scan.ranges) {
             const bool in_search_area =
                 std::isfinite(range) &&
-                range >= scan_min_range_ && range <= scan_max_range_ &&
+                range >= min_range && range <= max_range &&
                 std::abs(angle) <= scan_max_angle_;
 
             // 가까운 전방 반사는 차체/센서 마운트일 가능성이 높다. 멀리 있는
@@ -503,7 +551,7 @@ private:
 
     float chooseTargetX(const BoundaryModel* left, const BoundaryModel* right) const
     {
-        float available_x = target_lookahead_;
+        float available_x = active_target_lookahead_;
         if (left != nullptr && right != nullptr) {
             available_x = std::min(left->max_x, right->max_x);
         } else if (left != nullptr) {
@@ -512,8 +560,8 @@ private:
             available_x = right->max_x;
         }
 
-        return clampValue(std::min(target_lookahead_, available_x),
-                          min_target_lookahead_, target_lookahead_);
+        return clampValue(std::min(active_target_lookahead_, available_x),
+                          min_target_lookahead_, active_target_lookahead_);
     }
 
     float boundaryQuality(const BoundaryModel& boundary) const
@@ -523,11 +571,125 @@ private:
         const float residual_score = 1.0f - clampValue(
             boundary.mean_residual / fit_residual_limit_, 0.0f, 1.0f);
         const float coverage_score = clampValue(
-            boundary.max_x / target_lookahead_, 0.0f, 1.0f);
+            boundary.max_x / active_target_lookahead_, 0.0f, 1.0f);
         return 0.50f * count_score + 0.25f * residual_score + 0.25f * coverage_score;
     }
 
-    PathEstimate estimatePath(const std::vector<cv::Point2f>& centers)
+    CurveHint estimateCurveHint(std::vector<cv::Point2f> far_centers) const
+    {
+        if (far_centers.size() < 2) {
+            return {};
+        }
+
+        std::sort(far_centers.begin(), far_centers.end(),
+                  [](const cv::Point2f& a, const cv::Point2f& b) {
+                      return a.x < b.x;
+                  });
+
+        float sum_x = 0.0f;
+        float sum_y = 0.0f;
+        float sum_xx = 0.0f;
+        float sum_xy = 0.0f;
+        for (const auto& point : far_centers) {
+            sum_x += point.x;
+            sum_y += point.y;
+            sum_xx += point.x * point.x;
+            sum_xy += point.x * point.y;
+        }
+
+        const float n = static_cast<float>(far_centers.size());
+        const float denominator = n * sum_xx - sum_x * sum_x;
+        if (std::abs(denominator) < 1e-5f) {
+            return {};
+        }
+
+        const float slope = (n * sum_xy - sum_x * sum_y) / denominator;
+        const float strength = clampValue(
+            std::abs(slope) / std::max(curve_slope_threshold_, 1e-5f),
+            0.0f, 1.0f);
+        if (strength < 1.0f) {
+            return {};
+        }
+
+        return CurveHint{
+            slope > 0.0f ? CurveDirection::LEFT : CurveDirection::RIGHT,
+            strength,
+        };
+    }
+
+    PathEstimate makeOneSidePath(
+        const BoundaryModel& left,
+        const BoundaryModel& right,
+        bool fake_bilateral_recovery,
+        bool curve_caution) const
+    {
+        PathEstimate path;
+        const bool use_left = left.valid &&
+            (!right.valid || boundaryQuality(left) >= boundaryQuality(right));
+        const BoundaryModel* boundary = use_left ? &left : (right.valid ? &right : nullptr);
+        if (boundary == nullptr) {
+            return path;
+        }
+
+        const float target_x = chooseTargetX(use_left ? boundary : nullptr,
+                                              use_left ? nullptr : boundary);
+        const float boundary_y = boundary->at(target_x);
+        path.valid = true;
+        path.bilateral = false;
+        path.fake_bilateral_recovery = fake_bilateral_recovery;
+        path.curve_caution = curve_caution;
+        path.target = cv::Point2f{
+            target_x,
+            use_left ? boundary_y - adaptive_half_width_
+                     : boundary_y + adaptive_half_width_};
+
+        const float quality = boundaryQuality(*boundary);
+        const float base = fake_bilateral_recovery ? 0.24f : 0.32f;
+        const float span = fake_bilateral_recovery ? 0.34f : 0.46f;
+        path.confidence = clampValue(base + span * quality, 0.0f, 0.72f);
+        if (curve_caution) {
+            path.confidence = std::min(path.confidence, 0.68f);
+        }
+        return path;
+    }
+
+    bool curveHintConflictsWithTarget(const CurveHint& hint, float target_y) const
+    {
+        if (hint.direction == CurveDirection::UNKNOWN ||
+            std::abs(target_y) < side_deadband_)
+        {
+            return false;
+        }
+        return (hint.direction == CurveDirection::LEFT && target_y < 0.0f) ||
+               (hint.direction == CurveDirection::RIGHT && target_y > 0.0f);
+    }
+
+    int fakeBilateralScore(
+        const BoundaryModel& left,
+        const BoundaryModel& right,
+        const CurveHint& curve_hint,
+        const PathEstimate& candidate) const
+    {
+        int score = 0;
+        const float boundary_x_gap =
+            std::max(left.min_x, right.min_x) - std::min(left.max_x, right.max_x);
+        if (boundary_x_gap > boundary_x_gap_warn_) {
+            ++score;
+        }
+        if (has_filtered_target_y_ &&
+            std::abs(candidate.target.y - filtered_target_y_) > target_jump_warn_)
+        {
+            ++score;
+        }
+        if (curveHintConflictsWithTarget(curve_hint, candidate.target.y)) {
+            ++score;
+        }
+        return score;
+    }
+
+    PathEstimate estimatePath(
+        const std::vector<cv::Point2f>& centers,
+        const CurveHint& curve_hint)
     {
         std::vector<cv::Point2f> left_points;
         std::vector<cv::Point2f> right_points;
@@ -580,33 +742,26 @@ private:
                 const float quality = 0.5f * (boundaryQuality(left) + boundaryQuality(right));
                 path.valid = true;
                 path.bilateral = true;
+                path.curve_caution = curve_hint.direction != CurveDirection::UNKNOWN;
                 path.target = cv::Point2f{target_x, 0.5f * (left_y + right_y)};
                 path.confidence = clampValue(0.65f + 0.35f * quality, 0.0f, 1.0f);
+                if (path.curve_caution) {
+                    path.confidence = std::min(path.confidence, 0.88f);
+                }
+                if (fakeBilateralScore(left, right, curve_hint, path) >=
+                    fake_bilateral_score_threshold_)
+                {
+                    active_target_lookahead_ = recovery_target_lookahead_;
+                    return makeOneSidePath(left, right, true, path.curve_caution);
+                }
                 return path;
             }
         }
 
         // 한쪽 경계가 가려지거나 시작 위치가 치우친 경우에는 최근에 학습한 통로 폭으로
         // 반대편 경계를 추정한다. 이 상태는 유효하지만 신뢰도를 낮춰 속도를 제한한다.
-        const bool use_left = left.valid &&
-            (!right.valid || boundaryQuality(left) >= boundaryQuality(right));
-        const BoundaryModel* boundary = use_left ? &left : (right.valid ? &right : nullptr);
-        if (boundary == nullptr) {
-            return path;
-        }
-
-        const float target_x = chooseTargetX(use_left ? boundary : nullptr,
-                                              use_left ? nullptr : boundary);
-        const float boundary_y = boundary->at(target_x);
-        path.valid = true;
-        path.bilateral = false;
-        path.target = cv::Point2f{
-            target_x,
-            use_left ? boundary_y - adaptive_half_width_
-                     : boundary_y + adaptive_half_width_};
-        path.confidence = clampValue(
-            0.32f + 0.46f * boundaryQuality(*boundary), 0.0f, 0.78f);
-        return path;
+        return makeOneSidePath(
+            left, right, false, curve_hint.direction != CurveDirection::UNKNOWN);
     }
 
     float smoothTargetY(const PathEstimate& path)
@@ -621,8 +776,12 @@ private:
         }
 
         const float max_step = path.bilateral
-            ? max_target_y_step_bilateral_
-            : max_target_y_step_one_side_;
+            ? (path.curve_caution
+                ? std::min(max_target_y_step_bilateral_, 0.14f)
+                : max_target_y_step_bilateral_)
+            : (path.fake_bilateral_recovery
+                ? std::min(max_target_y_step_one_side_, 0.08f)
+                : max_target_y_step_one_side_);
         const float alpha = path.bilateral
             ? target_filter_alpha_
             : one_side_target_filter_alpha_;
@@ -632,11 +791,12 @@ private:
         return filtered_target_y_;
     }
 
-    void updateDetectionState(const PathEstimate& path)
+    void updateDetectionState(const PathEstimate& path, bool far_cones_visible)
     {
         const int confidence = static_cast<int>(std::round(path.confidence * 100.0f));
+        const bool session_path_present = path.valid || far_cones_visible;
         const auto session = session_lifecycle_.update(
-            path.valid, path.confidence, now().seconds());
+            session_path_present, path.confidence, now().seconds());
         rubber_entry_ready_value_ = session.entry_ready ? 1 : 0;
         rubber_end_value_ = session.end_latched ? 1 : 0;
         if (session.armed_this_sample) {
@@ -662,8 +822,11 @@ private:
                 const float alpha = path.bilateral
                     ? offset_filter_alpha_
                     : std::min(one_side_target_filter_alpha_, offset_filter_alpha_);
+                const float step_limit = path.fake_bilateral_recovery
+                    ? recovery_max_offset_step_
+                    : (path.curve_caution ? curve_max_offset_step_ : max_offset_step_);
                 const float bounded_delta = clampValue(
-                    raw_offset - filtered_offset_, -max_offset_step_, max_offset_step_);
+                    raw_offset - filtered_offset_, -step_limit, step_limit);
                 filtered_offset_ += alpha * bounded_delta;
             }
 
@@ -673,8 +836,11 @@ private:
         }
 
         // 짧은 스캔 누락에서는 마지막 조향값을 유지하되, 메인 노드가 감속할 수 있도록
-        // 신뢰도만 빠르게 내린다.
+        // 신뢰도만 빠르게 내린다. far 후보가 보이면 종료 대신 복구 여지로 본다.
         rubber_confidence_value_ = std::max(0, rubber_confidence_value_ - 25);
+        if (far_cones_visible) {
+            rubber_confidence_value_ = std::min(rubber_confidence_value_, 35);
+        }
         if (session.end_latched) {
             rubber_confidence_value_ = 0;
             rubber_entry_ready_value_ = 0;
@@ -835,7 +1001,7 @@ private:
         }
         // 피팅에 쓰인 구간부터 목표점 전방 거리까지 직선을 연장해 보여준다.
         const float x0 = std::max(0.0f, boundary.min_x - 0.10f);
-        const float x1 = std::max(boundary.max_x, target_lookahead_);
+        const float x1 = std::max(boundary.max_x, active_target_lookahead_);
         cv::line(canvas,
                  toPx({x0, boundary.at(x0)}),
                  toPx({x1, boundary.at(x1)}),
@@ -849,6 +1015,7 @@ private:
     float offset_gain_;
     float scan_min_range_;
     float scan_max_range_;
+    float far_scan_max_range_;
     float scan_max_angle_;
     float max_lateral_distance_;
     float front_ignore_angle_;
@@ -863,6 +1030,9 @@ private:
     float max_boundary_slope_;
     float fit_residual_limit_;
     float target_lookahead_;
+    float active_target_lookahead_;
+    float curve_target_lookahead_;
+    float recovery_target_lookahead_;
     float min_target_lookahead_;
     float nominal_half_width_;
     float adaptive_half_width_;
@@ -870,6 +1040,12 @@ private:
     float max_corridor_width_;
     float offset_limit_;
     float max_offset_step_;
+    float curve_max_offset_step_;
+    float recovery_max_offset_step_;
+    int fake_bilateral_score_threshold_;
+    float boundary_x_gap_warn_;
+    float target_jump_warn_;
+    float curve_slope_threshold_;
 
     float filtered_target_y_;
     bool has_filtered_target_y_;
@@ -909,7 +1085,8 @@ private:
             // 종료 래치 이후에는 경로 추정을 멈추지만, 무엇이 보이는지는 계속 표시한다.
             if (enable_gui_) {
                 std::vector<cv::Point2f> raw_points;
-                const auto centers = extractConeCenters(*msg, &raw_points);
+                const auto centers = extractConeCenters(
+                    *msg, scan_min_range_, scan_max_range_, &raw_points);
                 std::lock_guard<std::mutex> lock(debug_mutex_);
                 debug_ = DebugSnapshot{};
                 debug_.raw_points = std::move(raw_points);
@@ -921,15 +1098,23 @@ private:
         }
 
         std::vector<cv::Point2f> raw_points;
-        const auto centers = extractConeCenters(*msg, enable_gui_ ? &raw_points : nullptr);
-        const auto path = estimatePath(centers);
-        updateDetectionState(path);
+        const auto centers = extractConeCenters(
+            *msg, scan_min_range_, scan_max_range_, enable_gui_ ? &raw_points : nullptr);
+        const auto far_centers = extractConeCenters(
+            *msg, scan_max_range_, far_scan_max_range_, nullptr);
+        const auto curve_hint = estimateCurveHint(far_centers);
+        active_target_lookahead_ = curve_hint.direction == CurveDirection::UNKNOWN
+            ? target_lookahead_
+            : curve_target_lookahead_;
+        const auto path = estimatePath(centers, curve_hint);
+        updateDetectionState(path, !far_centers.empty());
         publishInfo();
 
         if (enable_gui_) {
             std::lock_guard<std::mutex> lock(debug_mutex_);
             debug_.raw_points = std::move(raw_points);
             debug_.cone_centers = centers;
+            debug_.far_cone_centers = far_centers;
             debug_.path = path;
             debug_.filtered_target = cv::Point2f{path.target.x, filtered_target_y_};
             debug_.has_filtered_target = has_filtered_target_y_ && path.valid;
