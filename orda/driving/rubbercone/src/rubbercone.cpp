@@ -104,7 +104,6 @@ struct BoundaryModel {
 struct PathEstimate {
     bool valid{false};
     bool bilateral{false};
-    bool fake_bilateral_recovery{false};
     bool curve_caution{false};
     cv::Point2f target{};
     float confidence{0.0f};
@@ -161,7 +160,6 @@ public:
       target_lookahead_(0.70f),
       active_target_lookahead_(0.70f),
       curve_target_lookahead_(0.50f),
-      recovery_target_lookahead_(0.50f),
       min_target_lookahead_(0.35f),
       nominal_half_width_(0.30f),
       adaptive_half_width_(0.30f),
@@ -170,10 +168,6 @@ public:
       offset_limit_(40.0f),
       max_offset_step_(20.0f),
       curve_max_offset_step_(12.0f),
-      recovery_max_offset_step_(12.0f),
-      fake_bilateral_score_threshold_(3),
-      boundary_x_gap_warn_(0.25f),
-      target_jump_warn_(0.18f),
       curve_slope_threshold_(0.28f),
       filtered_target_y_(0.0f),
       has_filtered_target_y_(false),
@@ -259,20 +253,9 @@ public:
         curve_target_lookahead_ = clampValue(
             static_cast<float>(declare_parameter<double>("curve_target_lookahead", 0.50)),
             min_target_lookahead_, target_lookahead_);
-        recovery_target_lookahead_ = clampValue(
-            static_cast<float>(declare_parameter<double>("recovery_target_lookahead", 0.50)),
-            min_target_lookahead_, curve_target_lookahead_);
-        boundary_x_gap_warn_ = clampValue(
-            static_cast<float>(declare_parameter<double>("boundary_x_gap_warn", 0.25)),
-            0.05f, 0.80f);
-        target_jump_warn_ = clampValue(
-            static_cast<float>(declare_parameter<double>("target_jump_warn", 0.18)),
-            0.05f, 0.60f);
         curve_slope_threshold_ = clampValue(
             static_cast<float>(declare_parameter<double>("curve_slope_threshold", 0.28)),
             0.05f, 1.00f);
-        fake_bilateral_score_threshold_ = std::max(
-            1, static_cast<int>(declare_parameter<int>("fake_bilateral_score_threshold", 3)));
         nominal_half_width_ = clampValue(
             static_cast<float>(declare_parameter<double>("nominal_half_width", 0.30)),
             0.15f, 0.70f);
@@ -724,7 +707,6 @@ private:
     PathEstimate makeOneSidePath(
         const BoundaryModel& left,
         const BoundaryModel& right,
-        bool fake_bilateral_recovery,
         bool curve_caution) const
     {
         PathEstimate path;
@@ -740,7 +722,6 @@ private:
         const float boundary_y = boundary->at(target_x);
         path.valid = true;
         path.bilateral = false;
-        path.fake_bilateral_recovery = fake_bilateral_recovery;
         path.curve_caution = curve_caution;
         path.target = cv::Point2f{
             target_x,
@@ -748,47 +729,13 @@ private:
                      : boundary_y + adaptive_half_width_};
 
         const float quality = boundaryQuality(*boundary);
-        const float base = fake_bilateral_recovery ? 0.24f : 0.32f;
-        const float span = fake_bilateral_recovery ? 0.34f : 0.46f;
+        const float base = 0.32f;
+        const float span = 0.46f;
         path.confidence = clampValue(base + span * quality, 0.0f, 0.72f);
         if (curve_caution) {
             path.confidence = std::min(path.confidence, 0.68f);
         }
         return path;
-    }
-
-    bool curveHintConflictsWithTarget(const CurveHint& hint, float target_y) const
-    {
-        if (hint.direction == CurveDirection::UNKNOWN ||
-            std::abs(target_y) < side_deadband_)
-        {
-            return false;
-        }
-        return (hint.direction == CurveDirection::LEFT && target_y < 0.0f) ||
-               (hint.direction == CurveDirection::RIGHT && target_y > 0.0f);
-    }
-
-    int fakeBilateralScore(
-        const BoundaryModel& left,
-        const BoundaryModel& right,
-        const CurveHint& curve_hint,
-        const PathEstimate& candidate) const
-    {
-        int score = 0;
-        const float boundary_x_gap =
-            std::max(left.min_x, right.min_x) - std::min(left.max_x, right.max_x);
-        if (boundary_x_gap > boundary_x_gap_warn_) {
-            ++score;
-        }
-        if (has_filtered_target_y_ &&
-            std::abs(candidate.target.y - filtered_target_y_) > target_jump_warn_)
-        {
-            ++score;
-        }
-        if (curveHintConflictsWithTarget(curve_hint, candidate.target.y)) {
-            ++score;
-        }
-        return score;
     }
 
     PathEstimate estimatePath(
@@ -852,12 +799,6 @@ private:
                 if (path.curve_caution) {
                     path.confidence = std::min(path.confidence, 0.88f);
                 }
-                if (fakeBilateralScore(left, right, curve_hint, path) >=
-                    fake_bilateral_score_threshold_)
-                {
-                    active_target_lookahead_ = recovery_target_lookahead_;
-                    return makeOneSidePath(left, right, true, path.curve_caution);
-                }
                 return path;
             }
         }
@@ -865,7 +806,7 @@ private:
         // 한쪽 경계가 가려지거나 시작 위치가 치우친 경우에는 최근에 학습한 통로 폭으로
         // 반대편 경계를 추정한다. 이 상태는 유효하지만 신뢰도를 낮춰 속도를 제한한다.
         return makeOneSidePath(
-            left, right, false, curve_hint.direction != CurveDirection::UNKNOWN);
+            left, right, curve_hint.direction != CurveDirection::UNKNOWN);
     }
 
     float smoothTargetY(const PathEstimate& path)
@@ -883,9 +824,7 @@ private:
             ? (path.curve_caution
                 ? std::min(max_target_y_step_bilateral_, 0.14f)
                 : max_target_y_step_bilateral_)
-            : (path.fake_bilateral_recovery
-                ? std::min(max_target_y_step_one_side_, 0.08f)
-                : max_target_y_step_one_side_);
+            : max_target_y_step_one_side_;
         const float alpha = path.bilateral
             ? target_filter_alpha_
             : one_side_target_filter_alpha_;
@@ -926,9 +865,9 @@ private:
                 const float alpha = path.bilateral
                     ? offset_filter_alpha_
                     : std::min(one_side_target_filter_alpha_, offset_filter_alpha_);
-                const float step_limit = path.fake_bilateral_recovery
-                    ? recovery_max_offset_step_
-                    : (path.curve_caution ? curve_max_offset_step_ : max_offset_step_);
+                const float step_limit = path.curve_caution
+                    ? curve_max_offset_step_
+                    : max_offset_step_;
                 const float bounded_delta = clampValue(
                     raw_offset - filtered_offset_, -step_limit, step_limit);
                 filtered_offset_ += alpha * bounded_delta;
@@ -1140,7 +1079,6 @@ private:
     float target_lookahead_;
     float active_target_lookahead_;
     float curve_target_lookahead_;
-    float recovery_target_lookahead_;
     float min_target_lookahead_;
     float nominal_half_width_;
     float adaptive_half_width_;
@@ -1149,10 +1087,6 @@ private:
     float offset_limit_;
     float max_offset_step_;
     float curve_max_offset_step_;
-    float recovery_max_offset_step_;
-    int fake_bilateral_score_threshold_;
-    float boundary_x_gap_warn_;
-    float target_jump_warn_;
     float curve_slope_threshold_;
 
     float filtered_target_y_;
