@@ -87,6 +87,8 @@ struct CurveHint {
 struct BoundaryModel {
     bool valid{false};
     int count{0};
+    bool quadratic{false};
+    float curvature{0.0f};
     float slope{0.0f};
     float intercept{0.0f};
     float min_x{0.0f};
@@ -95,7 +97,7 @@ struct BoundaryModel {
 
     float at(float x) const
     {
-        return slope * x + intercept;
+        return curvature * x * x + slope * x + intercept;
     }
 };
 
@@ -154,6 +156,7 @@ public:
       max_cone_centers_(6),
       max_boundary_points_(3),
       max_boundary_slope_(1.20f),
+      max_boundary_curvature_(2.50f),
       fit_residual_limit_(0.18f),
       target_lookahead_(0.70f),
       active_target_lookahead_(0.70f),
@@ -246,6 +249,9 @@ public:
             2, static_cast<int>(declare_parameter<int>("max_cone_centers", 6)));
         max_boundary_points_ = clampValue(
             static_cast<int>(declare_parameter<int>("boundary_points", 3)), 2, 6);
+        max_boundary_curvature_ = clampValue(
+            static_cast<float>(declare_parameter<double>("max_boundary_curvature", 2.50)),
+            0.25f, 8.00f);
 
         target_lookahead_ = clampValue(
             static_cast<float>(declare_parameter<double>("target_lookahead", 0.70)),
@@ -508,6 +514,81 @@ private:
         intercept = (sum_y - slope * sum_x) / sum_w;
     }
 
+    bool fitWeightedQuadratic(
+        const std::vector<cv::Point2f>& points,
+        float& curvature,
+        float& slope,
+        float& intercept) const
+    {
+        if (points.size() < 3) {
+            return false;
+        }
+
+        float s0 = 0.0f;
+        float s1 = 0.0f;
+        float s2 = 0.0f;
+        float s3 = 0.0f;
+        float s4 = 0.0f;
+        float t0 = 0.0f;
+        float t1 = 0.0f;
+        float t2 = 0.0f;
+
+        for (const auto& point : points) {
+            const float weight = 1.0f / (0.15f + pointRange(point));
+            const float x = point.x;
+            const float x2 = x * x;
+            s0 += weight;
+            s1 += weight * x;
+            s2 += weight * x2;
+            s3 += weight * x2 * x;
+            s4 += weight * x2 * x2;
+            t0 += weight * point.y;
+            t1 += weight * x * point.y;
+            t2 += weight * x2 * point.y;
+        }
+
+        float a[3][4] = {
+            {s4, s3, s2, t2},
+            {s3, s2, s1, t1},
+            {s2, s1, s0, t0},
+        };
+
+        for (int col = 0; col < 3; ++col) {
+            int pivot = col;
+            for (int row = col + 1; row < 3; ++row) {
+                if (std::abs(a[row][col]) > std::abs(a[pivot][col])) {
+                    pivot = row;
+                }
+            }
+            if (std::abs(a[pivot][col]) < 1e-5f) {
+                return false;
+            }
+            if (pivot != col) {
+                for (int k = col; k < 4; ++k) {
+                    std::swap(a[col][k], a[pivot][k]);
+                }
+            }
+            const float divisor = a[col][col];
+            for (int k = col; k < 4; ++k) {
+                a[col][k] /= divisor;
+            }
+            for (int row = 0; row < 3; ++row) {
+                if (row == col) {
+                    continue;
+                }
+                const float factor = a[row][col];
+                for (int k = col; k < 4; ++k) {
+                    a[row][k] -= factor * a[col][k];
+                }
+            }
+        }
+
+        curvature = clampValue(a[0][3], -max_boundary_curvature_, max_boundary_curvature_);
+        slope = clampValue(a[1][3], -max_boundary_slope_, max_boundary_slope_);
+        intercept = a[2][3];
+        return true;
+    }
+
     BoundaryModel fitBoundary(std::vector<cv::Point2f> points) const
     {
         BoundaryModel model;
@@ -523,33 +604,41 @@ private:
             points.resize(static_cast<std::size_t>(max_boundary_points_));
         }
 
+        float curvature = 0.0f;
         float slope = 0.0f;
         float intercept = 0.0f;
         fitWeightedLine(points, slope, intercept);
+        bool quadratic = fitWeightedQuadratic(points, curvature, slope, intercept);
 
         // 첫 추정에서 크게 벗어난 점은 인접 코스/잡음일 가능성이 높으므로 한 번 제거한다.
         std::vector<cv::Point2f> inliers;
         for (const auto& point : points) {
-            if (std::abs(point.y - (slope * point.x + intercept)) <= fit_residual_limit_) {
+            const float predicted = curvature * point.x * point.x + slope * point.x + intercept;
+            if (std::abs(point.y - predicted) <= fit_residual_limit_) {
                 inliers.push_back(point);
             }
         }
         if (inliers.size() >= 2 && inliers.size() < points.size()) {
             points = inliers;
+            curvature = 0.0f;
             fitWeightedLine(points, slope, intercept);
+            quadratic = fitWeightedQuadratic(points, curvature, slope, intercept);
         }
 
         float residual_sum = 0.0f;
         float min_x = std::numeric_limits<float>::max();
         float max_x = std::numeric_limits<float>::lowest();
         for (const auto& point : points) {
-            residual_sum += std::abs(point.y - (slope * point.x + intercept));
+            const float predicted = curvature * point.x * point.x + slope * point.x + intercept;
+            residual_sum += std::abs(point.y - predicted);
             min_x = std::min(min_x, point.x);
             max_x = std::max(max_x, point.x);
         }
 
         model.valid = true;
         model.count = static_cast<int>(points.size());
+        model.quadratic = quadratic;
+        model.curvature = quadratic ? curvature : 0.0f;
         model.slope = slope;
         model.intercept = intercept;
         model.min_x = min_x;
@@ -1046,6 +1135,7 @@ private:
     int max_cone_centers_;
     int max_boundary_points_;
     float max_boundary_slope_;
+    float max_boundary_curvature_;
     float fit_residual_limit_;
     float target_lookahead_;
     float active_target_lookahead_;
