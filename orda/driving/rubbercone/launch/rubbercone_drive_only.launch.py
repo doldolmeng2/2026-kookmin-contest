@@ -6,13 +6,15 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     enable_gui = LaunchConfiguration("enable_gui")
+    enable_far_curve_hint = LaunchConfiguration("enable_far_curve_hint")
     drive_speed = LaunchConfiguration("drive_speed")
     curve_speed = LaunchConfiguration("curve_speed")
     recovery_speed = LaunchConfiguration("recovery_speed")
 
     return LaunchDescription([
         DeclareLaunchArgument("enable_gui", default_value="true"),
-        DeclareLaunchArgument("drive_speed", default_value="11.0"),
+        DeclareLaunchArgument("enable_far_curve_hint", default_value="false"),
+        DeclareLaunchArgument("drive_speed", default_value="12.0"),
         DeclareLaunchArgument("curve_speed", default_value="8.0"),
         DeclareLaunchArgument("recovery_speed", default_value="5.5"),
 
@@ -23,8 +25,11 @@ def generate_launch_description():
             output="screen",
             parameters=[{
                 "enable_gui": enable_gui,
+                "enable_far_curve_hint": enable_far_curve_hint,
                 "scan_max_range": 1.10,
                 "far_scan_max_range": 1.80,
+                "min_far_curve_cones": 3,
+                "far_curve_min_x_span": 0.35,
                 "target_lookahead": 0.70,
                 "curve_target_lookahead": 0.50,
                 "recovery_target_lookahead": 0.42,
@@ -45,7 +50,7 @@ def generate_launch_description():
                 "max_angle": 45.0,
                 "min_drive_confidence": 20,
                 "full_speed_confidence": 85,
-                "max_cone_age_s": 0.25,
+                "max_cone_age_s": 0.30,
                 "publish_session_active": True,
             }],
         ),

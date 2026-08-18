@@ -139,6 +139,9 @@ public:
       scan_min_range_(0.18f),
       scan_max_range_(1.10f),
       far_scan_max_range_(1.80f),
+      enable_far_curve_hint_(false),
+      min_far_curve_cones_(3),
+      far_curve_min_x_span_(0.35f),
       scan_max_angle_(85.0f * kPi / 180.0f),
       max_lateral_distance_(0.70f),
       front_ignore_angle_(13.0f * kPi / 180.0f),
@@ -227,6 +230,12 @@ public:
         far_scan_max_range_ = clampValue(
             static_cast<float>(declare_parameter<double>("far_scan_max_range", 1.80)),
             scan_max_range_, 3.00f);
+        enable_far_curve_hint_ = declare_parameter<bool>("enable_far_curve_hint", false);
+        min_far_curve_cones_ = std::max(
+            2, static_cast<int>(declare_parameter<int>("min_far_curve_cones", 3)));
+        far_curve_min_x_span_ = clampValue(
+            static_cast<float>(declare_parameter<double>("far_curve_min_x_span", 0.35)),
+            0.10f, 1.20f);
         scan_max_angle_ = clampValue(
             static_cast<float>(declare_parameter<double>("scan_max_angle", 85.0)),
             30.0f, 90.0f) * kPi / 180.0f;
@@ -577,7 +586,9 @@ private:
 
     CurveHint estimateCurveHint(std::vector<cv::Point2f> far_centers) const
     {
-        if (far_centers.size() < 2) {
+        if (!enable_far_curve_hint_ ||
+            static_cast<int>(far_centers.size()) < min_far_curve_cones_)
+        {
             return {};
         }
 
@@ -585,6 +596,10 @@ private:
                   [](const cv::Point2f& a, const cv::Point2f& b) {
                       return a.x < b.x;
                   });
+        const float x_span = far_centers.back().x - far_centers.front().x;
+        if (x_span < far_curve_min_x_span_) {
+            return {};
+        }
 
         float sum_x = 0.0f;
         float sum_y = 0.0f;
@@ -1016,6 +1031,9 @@ private:
     float scan_min_range_;
     float scan_max_range_;
     float far_scan_max_range_;
+    bool enable_far_curve_hint_;
+    int min_far_curve_cones_;
+    float far_curve_min_x_span_;
     float scan_max_angle_;
     float max_lateral_distance_;
     float front_ignore_angle_;
@@ -1100,14 +1118,16 @@ private:
         std::vector<cv::Point2f> raw_points;
         const auto centers = extractConeCenters(
             *msg, scan_min_range_, scan_max_range_, enable_gui_ ? &raw_points : nullptr);
-        const auto far_centers = extractConeCenters(
-            *msg, scan_max_range_, far_scan_max_range_, nullptr);
+        const auto far_centers = enable_far_curve_hint_
+            ? extractConeCenters(*msg, scan_max_range_, far_scan_max_range_, nullptr)
+            : std::vector<cv::Point2f>{};
         const auto curve_hint = estimateCurveHint(far_centers);
         active_target_lookahead_ = curve_hint.direction == CurveDirection::UNKNOWN
             ? target_lookahead_
             : curve_target_lookahead_;
         const auto path = estimatePath(centers, curve_hint);
-        updateDetectionState(path, !far_centers.empty());
+        const bool far_evidence = curve_hint.direction != CurveDirection::UNKNOWN;
+        updateDetectionState(path, far_evidence);
         publishInfo();
 
         if (enable_gui_) {
