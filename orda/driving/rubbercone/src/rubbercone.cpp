@@ -160,7 +160,7 @@ public:
       target_lookahead_(0.70f),
       active_target_lookahead_(0.70f),
       curve_target_lookahead_(0.50f),
-      recovery_target_lookahead_(0.42f),
+      recovery_target_lookahead_(0.50f),
       min_target_lookahead_(0.35f),
       nominal_half_width_(0.30f),
       adaptive_half_width_(0.30f),
@@ -169,8 +169,8 @@ public:
       offset_limit_(40.0f),
       max_offset_step_(20.0f),
       curve_max_offset_step_(12.0f),
-      recovery_max_offset_step_(6.0f),
-      fake_bilateral_score_threshold_(2),
+      recovery_max_offset_step_(12.0f),
+      fake_bilateral_score_threshold_(3),
       boundary_x_gap_warn_(0.25f),
       target_jump_warn_(0.18f),
       curve_slope_threshold_(0.28f),
@@ -256,7 +256,7 @@ public:
             static_cast<float>(declare_parameter<double>("curve_target_lookahead", 0.50)),
             min_target_lookahead_, target_lookahead_);
         recovery_target_lookahead_ = clampValue(
-            static_cast<float>(declare_parameter<double>("recovery_target_lookahead", 0.42)),
+            static_cast<float>(declare_parameter<double>("recovery_target_lookahead", 0.50)),
             min_target_lookahead_, curve_target_lookahead_);
         boundary_x_gap_warn_ = clampValue(
             static_cast<float>(declare_parameter<double>("boundary_x_gap_warn", 0.25)),
@@ -268,7 +268,7 @@ public:
             static_cast<float>(declare_parameter<double>("curve_slope_threshold", 0.28)),
             0.05f, 1.00f);
         fake_bilateral_score_threshold_ = std::max(
-            1, static_cast<int>(declare_parameter<int>("fake_bilateral_score_threshold", 2)));
+            1, static_cast<int>(declare_parameter<int>("fake_bilateral_score_threshold", 3)));
         nominal_half_width_ = clampValue(
             static_cast<float>(declare_parameter<double>("nominal_half_width", 0.30)),
             0.15f, 0.70f);
