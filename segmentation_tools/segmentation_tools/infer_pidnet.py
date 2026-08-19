@@ -24,6 +24,17 @@ CLASS_COLORS = np.array([
 ], dtype=np.uint8)
 
 
+def warmup_runner(runner, enabled=True):
+    """Run exactly one startup inference, returning its elapsed milliseconds."""
+    if not enabled:
+        return None
+    started = time.perf_counter()
+    runner.predict(np.zeros((runner.height, runner.width, 3), dtype=np.uint8))
+    if runner.device.type == 'cuda':
+        torch.cuda.synchronize(runner.device)
+    return (time.perf_counter() - started) * 1000.0
+
+
 def make_class_visualization(frame, labels):
     colors = CLASS_COLORS[np.clip(labels, 0, len(CLASS_COLORS) - 1)]
     overlay = cv2.addWeighted(frame, 0.55, colors, 0.45, 0.0)
@@ -91,7 +102,23 @@ class PIDNetInferenceNode(Node):
         self.roi_crop_visualization=bool(self.declare_parameter('roi_crop_visualization',True).value)
         width=self.declare_parameter('model_width',640).value; height=self.declare_parameter('model_height',360).value
         lane_classes=self.declare_parameter('lane_classes',[1]).value
-        self.runner=PIDNetRunner(model_path,device,width,height,lane_classes); self.bridge=CvBridge(); self.frames=0; self.total_time=0.
+        warmup_on_start=bool(self.declare_parameter('warmup_on_start',True).value)
+        self.runner=PIDNetRunner(model_path,device,width,height,lane_classes)
+        if warmup_on_start:
+            try:
+                elapsed_ms=warmup_runner(self.runner)
+            except Exception as error:
+                raise RuntimeError(f'PIDNet startup warm-up failed: {error}') from error
+            self.get_logger().info(
+                f'PIDNet-S ready: model={self.runner.checkpoint} device={self.runner.device} '
+                f'epoch={self.runner.best_epoch} warmup_elapsed_ms={elapsed_ms:.1f} ready=true'
+            )
+        else:
+            self.get_logger().info(
+                f'PIDNet-S ready: model={self.runner.checkpoint} device={self.runner.device} '
+                f'epoch={self.runner.best_epoch} warmup_elapsed_ms=disabled ready=true'
+            )
+        self.bridge=CvBridge(); self.frames=0; self.total_time=0.
         self.roi_top=label_roi_top(int(height))
         self.mask_pub=self.create_publisher(Image,mask_topic,qos_profile_sensor_data)
         self.class_pub=self.create_publisher(Image,class_topic,qos_profile_sensor_data)

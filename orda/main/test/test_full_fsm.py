@@ -417,5 +417,5 @@ def test_safety_stop_precedes_all_simultaneous_mission_edges():
         SafetyDecision(must_stop=True, reason="synthetic fault"),
     )
 
-    assert transition.target is Mode.STOP
+    assert transition.target is Mode.FIXED_AVOID
     assert context.stop_reason == "synthetic fault"

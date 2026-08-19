@@ -107,7 +107,7 @@ def test_safety_stop_precedes_simultaneous_shortcut_selection():
         context,
         SafetyDecision(must_stop=True, reason="synthetic stale lane"),
     )
-    assert result.target is Mode.STOP
+    assert result.target is Mode.LANE_DRIVE
     assert context.shortcut_used is False
 
 
@@ -122,7 +122,7 @@ def test_stop_discards_old_shortcut_exit_evidence_before_recovery():
     )
     adapter.record_shortcut_complete(1.1)
     stopped = adapter.step(1.1, fault_reason="synthetic fault")
-    assert stopped.transition.target is Mode.STOP
+    assert stopped.transition.target is Mode.SHORTCUT
 
     held = adapter.step(1.2)
     recovered = adapter.step(1.8)

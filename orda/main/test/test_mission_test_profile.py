@@ -185,8 +185,8 @@ def test_profile_start_does_not_weaken_safety_stop_priority():
 
     cycle = runtime.step(10.1, fault_reason="synthetic profile fault")
 
-    assert cycle.transition.target is Mode.STOP
-    assert cycle.control.source is ControlSource.STOP
+    assert cycle.transition.target is Mode.FIXED_AVOID
+    assert cycle.control.source is ControlSource.HOLD
     assert runtime.context.stop_reason == "external fault: synthetic profile fault"
 
 

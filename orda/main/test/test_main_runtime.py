@@ -396,7 +396,7 @@ def test_entry_evidence_is_discarded_when_safety_commits_another_state():
     ).accepted
 
     stopped = runtime.step(1.20, fault_reason="test safety fault")
-    assert stopped.transition.target is Mode.STOP
+    assert stopped.transition.target is Mode.LANE_DRIVE
     assert runtime._pending_object_entry_evidence is None
 
     runtime.fsm.state = Mode.FIXED_AVOID
@@ -716,7 +716,6 @@ def test_main_object_info_rejects_malformed_ppt_payload(data):
         (4, Mode.OVERTAKE),
         (5, Mode.SHORTCUT),
         ("FINISH", Mode.FINISH),
-        ("STOP", Mode.STOP),
         ("LANE_DRIVE", Mode.LANE_DRIVE),
     ],
 )
@@ -912,10 +911,10 @@ class ShapeHarness:
         self.now_angle = now_angle
 
 
-def test_stop_source_ramps_speed_down_and_holds_the_steering_angle():
+def test_hold_source_ramps_speed_down_and_holds_the_steering_angle():
     """인지 한 프레임 공백이 완전 정지로 번지지 않게 램프로 감속한다.
 
-    예전에는 ControlSource.STOP 이면 속도를 즉시 0으로, 조향을 0으로 꺾었다.
+    예전에는 ControlSource.HOLD 이면 속도를 즉시 0으로, 조향을 0으로 꺾었다.
     재가속이 사이클당 +0.1(=5/초)이라 21.5까지 4초 넘게 걸렸고, 그 전에 다음
     stale 이 와서 차가 앞으로 못 나갔다 (실측 평균 속도 2.24).
     """
@@ -926,7 +925,7 @@ def test_stop_source_ramps_speed_down_and_holds_the_steering_angle():
 
     angle, speed = MainNode._shape_selected_control(
         harness,
-        ControlSource.STOP,
+        ControlSource.HOLD,
         DriveCommand(0.0, 0.0),
         1.0,
     )
@@ -936,7 +935,7 @@ def test_stop_source_ramps_speed_down_and_holds_the_steering_angle():
     assert angle == pytest.approx(12.0)
 
 
-def test_stop_source_still_reaches_a_full_stop_quickly():
+def test_hold_source_still_reaches_a_full_stop_quickly():
     from main.control_selector import ControlSource, DriveCommand
     from main.main import MainNode
 
@@ -947,7 +946,7 @@ def test_stop_source_still_reaches_a_full_stop_quickly():
     while speed > 0.0 and cycles < 200:
         _, speed = MainNode._shape_selected_control(
             harness,
-            ControlSource.STOP,
+            ControlSource.HOLD,
             DriveCommand(0.0, 0.0),
             1.0,
         )

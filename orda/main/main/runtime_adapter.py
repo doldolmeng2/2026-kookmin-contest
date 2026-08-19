@@ -49,7 +49,7 @@ DEFAULT_CONE_EVENT_QUEUE_CAPACITY = 16
 #
 # 예전 값(0.25 / 0.5초)은 이 실측보다 빠듯해서, 정상 주행 중에도 lane_offset이
 # 19%(0.25초 기준) / 4%(0.5초 기준) 확률로 "끊김"으로 분류됐다. 그때마다
-# LANE_DRIVE -> STOP 으로 떨어지고 속도가 0으로 리셋돼 차가 앞으로 못 나갔다
+# LANE_DRIVE에서 입력 부족을 상태 전이로 처리하면 속도가 0으로 리셋돼 차가 앞으로 못 나갔다
 # (기록된 모터 출력: 속도 0인 사이클 24.2%, 평균 속도 2.24).
 #
 # 근본 해결은 인지 파이프라인을 빠르게 하는 것이다(디버그 창 비활성화 등 별도
@@ -256,25 +256,8 @@ def runtime_safety_monitor() -> SafetyMonitor:
                     LANE_OFFSET_MAX_AGE_S,
                 ),
             ),
-            # STOP 복귀 조건. 이 항목이 비어 있으면 SafetyMonitor 가 STOP 에서
-            # 검사할 입력이 없어 inputs_ready 가 항상 True 였고, RaceFSM 의
-            # 복귀 게이트(STOP_RECOVERY_HOLD_S)가 "입력이 회복됐는지"가 아니라
-            # 단순 0.5초 타이머로 동작했다. 실측에서 STOP 구간 길이가 전부
-            # 0.50~0.52초로 똑같았던 이유다. 그래서 인지가 죽은 채로 주행을
-            # 재개했다가 곧바로 다시 STOP 으로 떨어지기를 반복했다.
-            #
-            # STOP 은 motion_enabled=False 이므로, 여기 등록해도 must_stop 이
-            # 새로 발생하지는 않는다. 오직 복귀 게이트로만 쓰인다.
-            Mode.STOP: (
-                InputRequirement(
-                    InputCategory.PERCEPTION,
-                    "lane_offset",
-                    LANE_OFFSET_MAX_AGE_S,
-                ),
-                InputRequirement(InputCategory.SENSOR, "scan", SCAN_MAX_AGE_S),
-            ),
             # A missing detector reset must leave CONE_DRIVE waiting for a
-            # fresh zero, not force an immediate terminal STOP. Scan loss is
+            # fresh zero, not force an immediate terminal state. Scan loss is
             # still a terminal sensor failure; cone command freshness is
             # enforced independently by ControlSelector.
             Mode.CONE_DRIVE: (
@@ -1109,6 +1092,7 @@ class RaceRuntimeAdapter:
             cone=cone,
             mission_lane_authorized=self.lane_action.safe_to_drive,
             traffic_hold=self.traffic_stop_override,
+            safety_hold=safety.must_stop,
         )
         fsm_control = ControlCycleResult(transition=transition, control=control)
         cone_entry_committed = (
@@ -1174,7 +1158,7 @@ class RaceRuntimeAdapter:
         # 인지가 살아 있으면 주행을 인가한다. 회피 방향이 아직 확정되지 않았어도
         # (박스가 안 보이거나, 좌/우가 미확정이거나, 디바운스가 덜 찼어도)
         # 지금 차선을 그대로 유지한 채 계속 가는 편이 장애물 앞에서 멈춰 서는
-        # 것보다 안전하다. 예전에는 이 세 경우가 STOP 이라, 방향이 흔들릴 때마다
+        # 것보다 안전하다. 예전에는 이 세 경우가 별도 안전 상태라, 방향이 흔들릴 때마다
         # 구간 한복판에서 속도가 0으로 떨어졌다.
         #
         # README: "고정장애물이 2차선에 있으면 1차선으로 회피하고, 그대로

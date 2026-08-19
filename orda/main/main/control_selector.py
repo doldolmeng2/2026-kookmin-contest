@@ -15,7 +15,7 @@ _TIMESTAMP_EPSILON_S = 1e-6
 
 
 class ControlSource(str, Enum):
-    STOP = "STOP"
+    HOLD = "HOLD"
     LANE = "LANE"
     CONE = "CONE"
 
@@ -46,7 +46,7 @@ class ControlSelectorConfig:
     이 값은 실측 발행 주기에서 나온다. rosbag2_2026_08_13-09_30_09 (275초)
     에서 ``/lane_offset`` 은 평균 169 ms, p90 358 ms, p99 721 ms 주기로
     나왔다(카메라는 18.8 Hz인데 인지가 5.9 Hz). 예전 기본값 0.25초는 그
-    간격의 19%를 "stale"로 분류해, 정상 주행 중에 ControlSource.STOP 이
+    간격의 19%를 "stale"로 분류해, 정상 주행 중에 ControlSource.HOLD 이
     끊임없이 튀어나오고 속도가 0으로 리셋됐다.
 
     라바콘 명령(``/rubbercone_info``)은 LiDAR 전용 노드라 카메라 부하와
@@ -81,7 +81,7 @@ class ControlSelector:
 
     CONE_DRIVE deliberately has no lane fallback. Rubbercones are placed on
     the lane, so using a lane command when cone control is absent or stale is
-    unsafe; the only fallback is a zero STOP command.
+    unsafe; the only fallback is a zero HOLD command.
     """
 
     ZERO_COMMAND = DriveCommand(angle=0.0, speed=0.0)
@@ -98,14 +98,18 @@ class ControlSelector:
         cone: Optional[CommandCandidate] = None,
         mission_lane_authorized: bool = False,
         traffic_hold: bool = False,
+        safety_hold: bool = False,
     ) -> ControlDecision:
         """Select using receipt ages computed only in the caller's clock domain."""
 
         if not self._valid_number(now):
-            return self._stop("invalid selection timestamp")
+            return self._hold("invalid selection timestamp")
+
+        if safety_hold:
+            return self._hold("safety hold")
 
         if traffic_hold:
-            return self._stop("recoverable route-traffic hold")
+            return self._hold("recoverable route-traffic hold")
 
         if mode in (Mode.LANE_DRIVE, Mode.SHORTCUT):
             valid, reason = self._candidate_is_fresh(
@@ -124,7 +128,7 @@ class ControlSelector:
                         else "fresh lane command selected"
                     ),
                 )
-            return self._stop(reason)
+            return self._hold(reason)
 
         if mode is Mode.CONE_DRIVE:
             valid, reason = self._candidate_is_fresh(
@@ -141,11 +145,11 @@ class ControlSelector:
                 )
             # Never inspect lane freshness here. There is intentionally no
             # lane fallback in CONE_DRIVE.
-            return self._stop(reason)
+            return self._hold(reason)
 
         if mode in (Mode.FIXED_AVOID, Mode.OVERTAKE):
             if not mission_lane_authorized:
-                return self._stop(f"{mode.value} lane action not authorized")
+                return self._hold(f"{mode.value} lane action not authorized")
             valid, reason = self._candidate_is_fresh(
                 lane,
                 now,
@@ -158,12 +162,12 @@ class ControlSelector:
                     lane.command,
                     f"fresh {mode.value} lane command selected",
                 )
-            return self._stop(reason)
+            return self._hold(reason)
 
-        if mode in (Mode.WAIT_GREEN, Mode.FINISH, Mode.STOP):
-            return self._stop(f"{mode.value} requires stop")
+        if mode in (Mode.WAIT_GREEN, Mode.FINISH):
+            return self._hold(f"{mode.value} requires zero output")
 
-        return self._stop(f"{mode.value} controller not implemented")
+        return self._hold(f"{mode.value} controller not implemented")
 
     def _candidate_is_fresh(
         self,
@@ -195,8 +199,8 @@ class ControlSelector:
         return True, "fresh"
 
     @classmethod
-    def _stop(cls, reason: str) -> ControlDecision:
-        return ControlDecision(ControlSource.STOP, cls.ZERO_COMMAND, reason)
+    def _hold(cls, reason: str) -> ControlDecision:
+        return ControlDecision(ControlSource.HOLD, cls.ZERO_COMMAND, reason)
 
     @staticmethod
     def _valid_number(value: float) -> bool:
@@ -229,5 +233,6 @@ def commit_fsm_then_select_control(
         cone=cone,
         mission_lane_authorized=mission_lane_authorized,
         traffic_hold=traffic_hold,
+        safety_hold=safety.must_stop,
     )
     return ControlCycleResult(transition=transition, control=control)

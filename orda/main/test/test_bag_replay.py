@@ -504,16 +504,10 @@ def test_finish_is_sticky():
     assert report["validation"]["invariants"]["terminal_modes_are_sticky"] is True
 
 
-def test_stop_recovers_once_inputs_are_healthy_again():
-    """STOP은 종료 상태가 아니라 복귀 가능한 안전 정지다.
+def test_safety_hold_keeps_the_active_mode():
+    report = replay(_terminal_probe_events(), start_mode=Mode.LANE_DRIVE)
 
-    센서가 잠깐 끊겼다고 주행이 영영 끝나면 안 된다. 규정상 정지 후 1분 내
-    미재개는 실격이다.
-    """
-    report = replay(_terminal_probe_events(), start_mode=Mode.STOP)
-
-    assert report["fsm"]["final_mode"] != Mode.STOP.value
-    assert report["fsm"]["transition_count"] >= 1
+    assert report["fsm"]["final_mode"] == Mode.LANE_DRIVE.value
 
 
 def test_timestamp_regression_is_rejected_and_reported():

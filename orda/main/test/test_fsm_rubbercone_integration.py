@@ -89,7 +89,7 @@ def test_integrated_cone_session_activates_once_then_accepts_fixed_entry():
 
     assert armed.transition.reason == "cone exit session armed"
     assert returned.transition.target is Mode.LANE_DRIVE
-    assert returned.control.source is ControlSource.STOP
+    assert returned.control.source is ControlSource.HOLD
 
     for timestamp in (1.3, 1.4):
         waiting = adapter.step(
@@ -104,7 +104,7 @@ def test_integrated_cone_session_activates_once_then_accepts_fixed_entry():
 
     assert fixed.transition.source is Mode.LANE_DRIVE
     assert fixed.transition.target is Mode.FIXED_AVOID
-    assert fixed.control.source is ControlSource.STOP
+    assert fixed.control.source is ControlSource.HOLD
 
 
 def test_safety_stop_wins_over_fresh_cone_exit_in_integrated_cycle():
@@ -125,9 +125,9 @@ def test_safety_stop_wins_over_fresh_cone_exit_in_integrated_cycle():
         fault_reason="integration fault",
     )
 
-    assert stopped.transition.target is Mode.STOP
+    assert stopped.transition.target is Mode.CONE_DRIVE
     assert stopped.transition.reason == "external fault: integration fault"
-    assert stopped.control.source is ControlSource.STOP
+    assert stopped.control.source is ControlSource.HOLD
     assert stopped.control.command == DriveCommand(0.0, 0.0)
 
 
@@ -147,7 +147,7 @@ def test_stale_rubbercone_command_stops_without_lane_fallback():
 
     assert cycle.transition.changed is False
     assert adapter.fsm.state is Mode.CONE_DRIVE
-    assert cycle.control.source is ControlSource.STOP
+    assert cycle.control.source is ControlSource.HOLD
     assert cycle.control.reason == "cone command stale"
 
 

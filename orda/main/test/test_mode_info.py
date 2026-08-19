@@ -33,7 +33,7 @@ def test_ppt_external_mode_mapping(mode, expected):
 
 @pytest.mark.parametrize(
     "internal_or_invalid",
-    [Mode.FINISH, Mode.STOP, None, 3, "LANE_DRIVE", True, object()],
+    [Mode.FINISH, None, 3, "LANE_DRIVE", True, object()],
 )
 def test_unassigned_or_invalid_modes_have_no_external_code(internal_or_invalid):
     assert external_mode_code(internal_or_invalid) is None

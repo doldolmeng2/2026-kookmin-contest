@@ -169,13 +169,13 @@ def test_stale_object_snapshot_stops_the_avoid_zone():
     assert runtime.lane_action.pending is False
     assert runtime.lane_action.completed is False
     assert runtime.lane_action.safe_to_drive is False
-    assert cycle.control.source is ControlSource.STOP
+    assert cycle.control.source is ControlSource.HOLD
 
 
 def test_fresh_pre_entry_no_object_holds_the_lane_without_starting_action():
     """구간 진입 직전 표본은 주행을 막지 않지만 회피를 시작하지도 않는다.
 
-    예전에는 '진입 이후 표본'이 아니면 safe_to_drive 를 내려 STOP 으로
+    예전에는 '진입 이후 표본'이 아니면 safe_to_drive 를 내려 hold 으로
     떨어뜨렸다. 그러면 구간에 들어서자마자 다음 /object_info_raw가 올 때까지
     (실측 최대 0.35초) 장애물 앞에서 멈춰 섰다.
     """
@@ -360,7 +360,7 @@ def test_stale_lane_command_is_zero_even_when_fixed_action_is_authorized():
     cycle = runtime.step(1.3, lane=candidate(0.4))
 
     assert runtime.lane_action.safe_to_drive is True
-    assert cycle.control.source is ControlSource.STOP
+    assert cycle.control.source is ControlSource.HOLD
 
 
 def test_camera_alone_decides_avoid_direction_without_lidar():
@@ -469,8 +469,8 @@ def test_red_amber_is_recoverable_zero_control_not_terminal_stop():
     resumed = runtime.step(1.3, lane=candidate(1.3))
 
     assert held.transition.changed is False
-    assert held.control.source is ControlSource.STOP
-    assert still_held.control.source is ControlSource.STOP
+    assert held.control.source is ControlSource.HOLD
+    assert still_held.control.source is ControlSource.HOLD
     assert runtime.fsm.state is Mode.LANE_DRIVE
     assert resumed.control.source is ControlSource.LANE
 
