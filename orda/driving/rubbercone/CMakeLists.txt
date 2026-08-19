@@ -36,14 +36,6 @@ install(TARGETS
   rubbercone_node
   DESTINATION lib/${PROJECT_NAME})
 
-install(PROGRAMS
-  scripts/rubbercone_drive_only_node.py
-  DESTINATION lib/${PROJECT_NAME})
-
-install(DIRECTORY
-  launch
-  DESTINATION share/${PROJECT_NAME})
-
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_entry_readiness test/test_entry_readiness.cpp)
