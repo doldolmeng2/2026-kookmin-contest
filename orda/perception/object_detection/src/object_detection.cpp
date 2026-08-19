@@ -68,7 +68,8 @@
 #include <std_msgs/msg/int32.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
-#include <cv_bridge/cv_bridge.h>
+#include <cv_bridge/cv_bridge.hpp>
+#include <ament_index_cpp/get_package_prefix.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <fstream>
 #include <string>
@@ -320,22 +321,11 @@ private:
     // YOLO 모델 경로 결정
     //
     // 1) model_path 파라미터가 지정되면 그대로 사용
-    // 2) 없으면 아래 후보 경로를 순서대로 확인한다
-    // 읽을 수 있는 파일이 없으면 빈 문자열을 반환한다.
-    //
-    // ★ 새 PC에서 쓰려면 MODEL_PATH_CANDIDATES에 그 PC의 경로를 추가해야 한다.
-    //   임시로는 model_path 파라미터로 넘겨도 된다:
+    // 2) 없으면 package share의 legacy best.onnx를 사용한다.
+    // 읽을 수 있는 파일이 없으면 빈 문자열을 반환한다. 임시 override:
     //   ros2 run object_detection object_node --ros-args -p model_path:=<경로>
     // ─────────────────────────────────────────────────────────────────────
     std::string resolveModelPath() {
-        // 소스 트리를 직접 가리키므로 모델을 교체하면 재빌드 없이 반영된다.
-        static const std::vector<std::string> MODEL_PATH_CANDIDATES = {
-            // 개발 PC
-            "/home/dxer0/xycar_ws/src/orda/perception/object_detection/best.onnx",
-            // 실차 (Xycar)
-            "/home/xytron/xycar_ws/src/orda/perception/object_detection/best.onnx",
-        };
-
         auto readable = [](const std::string& p) {
             if (p.empty()) return false;
             std::ifstream f(p, std::ios::binary);
@@ -350,11 +340,19 @@ private:
             return "";
         }
 
-        for (const auto& candidate : MODEL_PATH_CANDIDATES)
-            if (readable(candidate)) return candidate;
-
-        for (const auto& candidate : MODEL_PATH_CANDIDATES)
-            RCLCPP_ERROR(this->get_logger(), "  후보 경로 없음: %s", candidate.c_str());
+        std::string package_model;
+        try {
+            package_model = ament_index_cpp::get_package_share_directory(
+                "object_detection") + "/model/best.onnx";
+        } catch (const ament_index_cpp::PackageNotFoundError& e) {
+            RCLCPP_ERROR(this->get_logger(),
+                         "object_detection package share를 찾지 못했습니다: %s",
+                         e.what());
+            return "";
+        }
+        if (readable(package_model)) return package_model;
+        RCLCPP_ERROR(this->get_logger(), "legacy 모델 없음: %s",
+                     package_model.c_str());
         return "";
     }
 

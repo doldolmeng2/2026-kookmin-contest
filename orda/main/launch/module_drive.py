@@ -44,8 +44,12 @@ import os
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
-from launch.launch_description_sources import PythonLaunchDescriptionSource, AnyLaunchDescriptionSource
+from launch.launch_description_sources import (
+    AnyLaunchDescriptionSource,
+    PythonLaunchDescriptionSource,
+)
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
 
@@ -80,6 +84,15 @@ def generate_launch_description():
         description='상태 OpenCV 창 표시 여부 (실차 제어 시 false 권장)'
     )
     show_debug = LaunchConfiguration('show_debug')
+    pidnet_model_arg = DeclareLaunchArgument(
+        'pidnet_model',
+        default_value=os.path.join(
+            get_package_share_directory('segmentation_tools'),
+            'model', 'pidnet_s_best.pt',
+        ),
+        description='PIDNet-S checkpoint path'
+    )
+    pidnet_model = LaunchConfiguration('pidnet_model')
     rubbercone_offset_filter_alpha_arg = DeclareLaunchArgument(
         'rubbercone_offset_filter_alpha',
         default_value='0.80',
@@ -164,6 +177,51 @@ def generate_launch_description():
         )
     )
     object_enable_gui = LaunchConfiguration('object_enable_gui')
+    detector_model_path_arg = DeclareLaunchArgument(
+        'detector_model_path',
+        default_value='',
+        description=(
+            'train10_detector_best.onnx override (empty uses package share)'
+        ),
+    )
+    detector_model_path = LaunchConfiguration('detector_model_path')
+    traffic_classifier_model_path_arg = DeclareLaunchArgument(
+        'traffic_classifier_model_path',
+        default_value='',
+        description=(
+            'light1_classifier_best.onnx override (empty uses package share)'
+        ),
+    )
+    traffic_classifier_model_path = LaunchConfiguration(
+        'traffic_classifier_model_path'
+    )
+    perception_camera_topic_arg = DeclareLaunchArgument(
+        'perception_camera_topic',
+        default_value='/resized_image',
+    )
+    perception_camera_topic = LaunchConfiguration('perception_camera_topic')
+    motor_output_topic_arg = DeclareLaunchArgument(
+        'motor_output_topic',
+        default_value='/xycar_motor',
+        description='Main motor output; production default is the fixed contract',
+    )
+    motor_output_topic = LaunchConfiguration('motor_output_topic')
+    enable_ultrasonic_arg = DeclareLaunchArgument(
+        'enable_ultrasonic', default_value='false', choices=('false', 'true'),
+        description='Start the unused ultrasonic producer only when explicitly requested',
+    )
+    enable_ultrasonic = LaunchConfiguration('enable_ultrasonic')
+    lidar_port_arg = DeclareLaunchArgument(
+        'lidar_port',
+        default_value='/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0',
+        description='Stable CP2102 LiDAR device path overriding the YAML port',
+    )
+    lidar_port = LaunchConfiguration('lidar_port')
+    udp_motor_bridge_arg = DeclareLaunchArgument(
+        'udp_motor_bridge', default_value='true', choices=('false', 'true'),
+        description='Forward the selected motor output to the local ROS1 UDP receiver',
+    )
+    udp_motor_bridge = LaunchConfiguration('udp_motor_bridge')
 
     # ── 소프트웨어 노드 ──────────────────────────────────────────────────────
     main_node = Node(
@@ -176,6 +234,12 @@ def generate_launch_description():
             'lane_target': lane_target,
             'show_debug': show_debug,
         }],
+        remappings=[('xycar_motor', motor_output_topic)],
+    )
+    motor_bridge_node = Node(
+        package='main', executable='udp_motor_bridge', name='udp_motor_bridge',
+        output='screen', remappings=[('xycar_motor', motor_output_topic)],
+        condition=IfCondition(udp_motor_bridge),
     )
     rubbercone_node = Node(
         package='rubbercone',
@@ -203,6 +267,20 @@ def generate_launch_description():
         name='resize_node',
         output='screen',
     )
+    pidnet_node = Node(
+        package='segmentation_tools',
+        executable='pidnet_inference',
+        name='pidnet_inference_node',
+        output='screen',
+        parameters=[{
+            'model_path': pidnet_model,
+            'input_topic': '/resized_image',
+            'mask_topic': '/lane_segmentation_mask',
+            'class_topic': '/pidnet_class_map',
+            'lane_classes': [1, 2, 3],
+            'device': 'auto',
+        }],
+    )
     lane_node = Node(
         package='lane_detection',
         executable='lane_node',
@@ -215,7 +293,11 @@ def generate_launch_description():
         executable='object_yolo_node.py',
         name='object_yolo_node',
         output='screen',
-        parameters=[object_detection_config],
+        parameters=[object_detection_config, {
+            'detector_model_path': detector_model_path,
+            'traffic_classifier_model_path': traffic_classifier_model_path,
+            'camera_topic': perception_camera_topic,
+        }],
     )
     object_node = Node(
         package='object_detection',
@@ -233,6 +315,20 @@ def generate_launch_description():
         parameters=[{
             'dev': '/dev/input/js0',
             'deadzone': 0.05,
+        }],
+    )
+    preflight_node = Node(
+        package='main',
+        executable='kmu_preflight',
+        name='production_preflight',
+        output='screen',
+        parameters=[{
+            'required_topics': [
+                '/lane_offset', '/scan', '/object_info',
+                '/object_info_raw', '/side_clearance',
+            ],
+            'motor_output_topic': motor_output_topic,
+            'require_motor_subscriber': True,
         }],
     )
 
@@ -253,7 +349,8 @@ def generate_launch_description():
                 get_package_share_directory('xycar_lidar'),
                 'launch/xycar_lidar.launch.py'
             )
-        )
+        ),
+        launch_arguments={'port': lidar_port}.items(),
     )
     # 초음파
     ultrasonic_launch = IncludeLaunchDescription(
@@ -262,13 +359,15 @@ def generate_launch_description():
                 get_package_share_directory('xycar_ultrasonic'),
                 'launch/xycar_ultrasonic.launch.py'
             )
-        )
+        ),
+        condition=IfCondition(enable_ultrasonic),
     )
 
     return LaunchDescription([
         mode_arg,
         lane_target_arg,
         show_debug_arg,
+        pidnet_model_arg,
         rubbercone_offset_filter_alpha_arg,
         rubbercone_end_missing_frames_arg,
         rubbercone_scan_max_range_arg,
@@ -282,13 +381,23 @@ def generate_launch_description():
         rubbercone_offset_limit_arg,
         rubbercone_enable_gui_arg,
         object_enable_gui_arg,
+        detector_model_path_arg,
+        traffic_classifier_model_path_arg,
+        perception_camera_topic_arg,
+        motor_output_topic_arg,
+        enable_ultrasonic_arg,
+        lidar_port_arg,
+        udp_motor_bridge_arg,
         main_node,
+        motor_bridge_node,
         rubbercone_node,
         resize_node,
+        pidnet_node,
         lane_node,
         object_yolo_node,
         object_node,
         joy_node,
+        preflight_node,
         cam_launch,
         lidar_launch,
         ultrasonic_launch,

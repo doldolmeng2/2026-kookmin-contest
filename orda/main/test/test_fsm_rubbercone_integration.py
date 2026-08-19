@@ -89,7 +89,7 @@ def test_integrated_cone_session_activates_once_then_accepts_fixed_entry():
 
     assert armed.transition.reason == "cone exit session armed"
     assert returned.transition.target is Mode.LANE_DRIVE
-    assert returned.control.source is ControlSource.STOP
+    assert returned.control.source is ControlSource.HOLD
 
     for timestamp in (1.3, 1.4):
         waiting = adapter.step(
@@ -104,7 +104,7 @@ def test_integrated_cone_session_activates_once_then_accepts_fixed_entry():
 
     assert fixed.transition.source is Mode.LANE_DRIVE
     assert fixed.transition.target is Mode.FIXED_AVOID
-    assert fixed.control.source is ControlSource.STOP
+    assert fixed.control.source is ControlSource.HOLD
 
 
 def test_safety_stop_wins_over_fresh_cone_exit_in_integrated_cycle():
@@ -125,9 +125,9 @@ def test_safety_stop_wins_over_fresh_cone_exit_in_integrated_cycle():
         fault_reason="integration fault",
     )
 
-    assert stopped.transition.target is Mode.STOP
+    assert stopped.transition.target is Mode.CONE_DRIVE
     assert stopped.transition.reason == "external fault: integration fault"
-    assert stopped.control.source is ControlSource.STOP
+    assert stopped.control.source is ControlSource.HOLD
     assert stopped.control.command == DriveCommand(0.0, 0.0)
 
 
@@ -147,7 +147,7 @@ def test_stale_rubbercone_command_stops_without_lane_fallback():
 
     assert cycle.transition.changed is False
     assert adapter.fsm.state is Mode.CONE_DRIVE
-    assert cycle.control.source is ControlSource.STOP
+    assert cycle.control.source is ControlSource.HOLD
     assert cycle.control.reason == "cone command stale"
 
 
@@ -243,15 +243,19 @@ def test_object_class_mapping_is_loaded_from_installed_yaml():
 
     assert "object_yolo_node:" in config
     assert "fixed_class_ids: [0]" in config
-    assert "# 예: moving_class_ids: [1]" in config
+    assert "moving_class_ids: [1]" in config
+    assert "traffic_classifier_model_path" in config
     assert "install(DIRECTORY config" in cmake
-    assert "parameters=[object_detection_config]" in production
-    assert "parameters=[object_detection_config, {'use_sim_time': True}]" in bag_test
+    assert "parameters=[object_detection_config, {" in production
+    assert "parameters=[object_detection_config, {" in bag_test
+    assert "'traffic_classifier_model_path': traffic_classifier_model_path" in production
+    assert "'traffic_classifier_model_path': traffic_classifier_model_path" in bag_test
 
 
 @pytest.mark.skip(reason="main 이 두 브랜치를 합치기 전 확인한 옛 object_detection 설계를 검사한다 (traffic_light 패키지, /traffic_detection 토픽, config/object_detection.yaml, fixed/moving 2슬롯 + lane_stabilizer). 2026-08-19 병합에서 HEAD(신호등 크롭·분류 재작업 + 기존 1슬롯 포맷)를 유지하고 main 의 개선안은 별도 PR로 미뤘다 — 그 PR에서 이 테스트들을 되살려야 한다.")
 def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
-    tree = ast.parse(BAG_TEST_LAUNCH.read_text(encoding="utf-8"))
+    source = BAG_TEST_LAUNCH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
     node_calls = [
         node
         for node in ast.walk(tree)
@@ -268,12 +272,20 @@ def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
     }
     assert packages == {
         "main",
-        "traffic_light",
         "rubbercone",
-        "image_resize",
         "lane_detection",
         "object_detection",
+        "segmentation_tools",
     }
+    assert "image_resize" not in packages
+    assert "executable='resize_node'" not in source
+    assert "'input_topic': '/resized_image'" in source
+    assert not {
+        "xycar_cam", "xycar_lidar", "xycar_ultrasonic"
+    }.intersection(packages)
+    assert "default_value='false'" in source
+    assert "'udp_motor_bridge', default_value='false'" in source
+    assert "' == 'true' and '" in source
 
     main_call = next(
         call
@@ -289,7 +301,10 @@ def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
         for keyword in main_call.keywords
         if keyword.arg == "remappings"
     )
-    assert remappings == [("xycar_motor", "/bag_test/xycar_motor")]
+    assert remappings == [
+        ("xycar_motor", "/kmu_main_offline/xycar_motor")
+    ]
+    assert "'/xycar_motor'" not in source
 
     assert not any(
         isinstance(node, ast.Call)
@@ -331,7 +346,7 @@ def test_rubbercone_bag_runner_enforces_safe_scan_only_playback():
     assert "post_cone_lane_motor_sample.log" in source
     assert "--topics /scan /xycar_motor" not in source
     assert "--topics /scan /rubbercone_info" not in source
-    assert "/bag_test/xycar_motor" in source
+    assert "/kmu_main_offline/xycar_motor" in source
     assert "FSM LANE_DRIVE -> CONE_DRIVE: cone entry confirmed" in source
     assert "xycar_camera" not in source
     assert "xycar_lidar" not in source

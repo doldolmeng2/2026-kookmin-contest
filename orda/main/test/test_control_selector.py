@@ -40,7 +40,7 @@ def cone_observation(timestamp, confidence=90):
 
 def test_control_source_values_are_exact():
     assert [(source.name, source.value) for source in ControlSource] == [
-        ("STOP", "STOP"),
+        ("HOLD", "HOLD"),
         ("LANE", "LANE"),
         ("CONE", "CONE"),
     ]
@@ -53,10 +53,9 @@ def test_control_source_values_are_exact():
         Mode.FIXED_AVOID,
         Mode.OVERTAKE,
         Mode.FINISH,
-        Mode.STOP,
     ],
 )
-def test_non_driving_or_unimplemented_modes_select_zero_stop(mode):
+def test_non_driving_or_unimplemented_modes_select_zero_hold(mode):
     decision = ControlSelector().select(
         mode,
         10.0,
@@ -64,7 +63,7 @@ def test_non_driving_or_unimplemented_modes_select_zero_stop(mode):
         cone=candidate(CONE_COMMAND, 10.0),
     )
 
-    assert decision.source is ControlSource.STOP
+    assert decision.source is ControlSource.HOLD
     assert decision.command == DriveCommand(0.0, 0.0)
 
 
@@ -104,7 +103,7 @@ def test_lane_drive_missing_or_stale_lane_stops_without_cone_fallback(lane):
         cone=candidate(CONE_COMMAND, 10.0),
     )
 
-    assert decision.source is ControlSource.STOP
+    assert decision.source is ControlSource.HOLD
     assert decision.command == DriveCommand(0.0, 0.0)
 
 
@@ -136,7 +135,7 @@ def test_action_modes_select_lane_only_with_explicit_authorization(mode):
         mission_lane_authorized=True,
     )
 
-    assert unauthorized.source is ControlSource.STOP
+    assert unauthorized.source is ControlSource.HOLD
     assert authorized.source is ControlSource.LANE
     assert authorized.command is LANE_COMMAND
 
@@ -149,7 +148,7 @@ def test_authorized_action_mode_still_rejects_stale_lane_command():
         mission_lane_authorized=True,
     )
 
-    assert decision.source is ControlSource.STOP
+    assert decision.source is ControlSource.HOLD
 
 
 @pytest.mark.parametrize(
@@ -172,7 +171,7 @@ def test_route_traffic_hold_overrides_motion_without_changing_mode(mode):
         traffic_hold=True,
     )
 
-    assert decision.source is ControlSource.STOP
+    assert decision.source is ControlSource.HOLD
     assert decision.reason == "recoverable route-traffic hold"
 
 
@@ -188,7 +187,7 @@ def test_cone_drive_missing_or_stale_cone_stops_without_lane_fallback(cone):
         cone=cone,
     )
 
-    assert decision.source is ControlSource.STOP
+    assert decision.source is ControlSource.HOLD
     assert decision.command == DriveCommand(0.0, 0.0)
 
 
@@ -217,7 +216,7 @@ def test_invalid_or_future_candidate_timestamp_stops(received_at):
         cone=candidate(CONE_COMMAND, received_at),
     )
 
-    assert decision.source is ControlSource.STOP
+    assert decision.source is ControlSource.HOLD
 
 
 @pytest.mark.parametrize("now", [math.nan, math.inf, True])
@@ -228,7 +227,7 @@ def test_invalid_selection_timestamp_stops(now):
         cone=candidate(CONE_COMMAND, 10.0),
     )
 
-    assert decision.source is ControlSource.STOP
+    assert decision.source is ControlSource.HOLD
     assert decision.reason == "invalid selection timestamp"
 
 
@@ -239,7 +238,7 @@ def test_invalid_command_value_stops():
         cone=candidate(DriveCommand(math.nan, 4.0), 10.0),
     )
 
-    assert decision.source is ControlSource.STOP
+    assert decision.source is ControlSource.HOLD
     assert decision.reason == "invalid cone command value"
 
 
@@ -250,7 +249,7 @@ def test_malformed_command_candidate_stops():
         cone=CommandCandidate(command=None, received_at=10.0),
     )
 
-    assert decision.source is ControlSource.STOP
+    assert decision.source is ControlSource.HOLD
     assert decision.reason == "invalid cone command candidate"
 
 
@@ -385,5 +384,5 @@ def test_transition_cycle_without_cone_command_stops_instead_of_using_lane():
     )
 
     assert committed.transition.target is Mode.CONE_DRIVE
-    assert committed.control.source is ControlSource.STOP
+    assert committed.control.source is ControlSource.HOLD
     assert committed.control.command == DriveCommand(0.0, 0.0)

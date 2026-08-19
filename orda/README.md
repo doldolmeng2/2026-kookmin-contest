@@ -162,8 +162,10 @@ main/main/
 [인지]
   rubbercone_node
     sub: /scan
-    pub: /rubbercone_info               (std_msgs/Int32MultiArray)        [유지]
-         [offset, end_flag, confidence]
+    pub: /rubbercone_offset             (std_msgs/Int32MultiArray)        [PPT 공식]
+         [offset, end_flag]
+         /rubbercone_info               (std_msgs/Int32MultiArray)        [내부 상세]
+         [offset, end_flag, confidence, entry_ready]
          confidence: 경로 추정 신뢰도 (0~100)
 
   lane_node
@@ -175,17 +177,20 @@ main/main/
 
   object_yolo_node (Python, ONNX Runtime — object_detection 패키지)   [신규 구조, 2026-08-18]
     sub: /resized_image
-    pub: /object_yolo                  (std_msgs/Float32MultiArray, 10 필드)
-         [detected, object_type, confidence, box_size, box_cx, box_cy,
-          box_x, box_y, box_w, box_h]
-         차량(red_car/green_car) 중 가장 가까운(면적 최대) 1개만.
-         /traffic_boxes                (std_msgs/Float32MultiArray, 6개씩 반복)
-         [class_id, confidence, x, y, w, h]
-         신호등 박스를 **검출에 쓴 그 프레임에서** 잘라(ROI 크롭) 별도
-         분류기(light_cls.onnx)에 넣은 결과. class_id·confidence 는
-         **분류기**가 낸 값(0=green 1=left_green 2=orange 3=red)이고,
-         기하 게이트를 통과한 박스가 **전부** 나간다. 분류기를 못 띄웠으면
-         class_id=-1 로 나가고 object_node 가 직접 분류한다(폴백).
+    pub: /object_yolo                   (std_msgs/Float32MultiArray, 20 필드) [내부]
+         /traffic_detection             (std_msgs/Int32)                  [내부]
+         [fixed 10필드 슬롯, moving 10필드 슬롯]
+         슬롯: [detected, object_type, confidence, box_size, box_cx, box_cy,
+                box_x, box_y, box_w, box_h]
+    train-10 detector가 같은 프레임의 신호등 candidate crop을 만들고,
+    light1 classifier가 0=green, 1=left, 2=orange, 3=red를 분류한다.
+    최종 mapping은 green→2, left→3, orange/red→1, 없음/불확실/오류→0이다.
+
+  road_surface_node
+    sub: /pidnet_class_map              (sensor_msgs/Image)
+    pub: /road_surface                  (std_msgs/Int32, 0/1/2)
+    PIDNet class 4/5 ratio와 최대 connected component를 parameterized ROI에서
+    판정한다. normal bag separation 전에는 threshold를 명시해야만 시작한다.
 
   object_node (C++ — object_detection 패키지)
     sub: /scan, /resized_image, /lane_fit, /object_yolo, /traffic_boxes
@@ -212,12 +217,28 @@ main/main/
          [legacy_mode_code, lane]
 ```
 
+PPT 외 보조 인지는 `object_yolo_node`와 `road_surface_node`다. 별도
+`interface_adapter_node`는 만들지 않았다. `/object_info` 집계는 `object_node`가 직접,
+공식 모드와 lane detector 호환 명령의 분리는 `main_node`와 launch remap이 직접 맡는다.
+
 ### 인터페이스 변경 사유
 
 | 토픽 | 변경 내용 | 사유 |
 |---|---|---|
-| `/traffic_detection` | `Bool` → `Int32`(4상태) → **폐지, `/object_info[0]`으로 흡수 (2026-08-18)** | 신호등 인식을 `object_detection` 패키지로 통합하면서 별도 토픽 대신 `/object_info` 하나로 합침 |
-| `/object_info` | `Float32MultiArray` 12필드 → **`Int32MultiArray` 3필드 (2026-08-18)** | `[신호등, 고정차량 위치, 방해차량 위치]`만 최종 소비자(FSM)에 필요 — LiDAR 원시값(exists/거리/각도 등)은 더 이상 안 실음. **`main_node`는 아직 옛 계약을 구독 중이라 미반영** |
+| `/object_info` | `Int32MultiArray [신호등, 고정 객체 차선, 이동 객체 차선]` | Object Detection이 신호등·고정·이동 객체를 한 공식 메시지에서 동시에 표현 |
+| `/object_info_raw` | 기존 12필드 상세값 | Main의 거리·박스·분류 기반 판단을 보존하는 내부 이중 발행 |
+| `/rubbercone_offset` | `[offset, end_flag]` | PPT 공식 2필드 계약 |
+| `/rubbercone_info` | `[offset, end_flag, confidence, entry_ready]` | producer가 승인한 진입 edge를 보존하는 내부 이중 발행 |
+| `/mode_info` | `Int16`, 코드 `0..5` | PPT의 모드 인터페이스. `FINISH`/`STOP`은 팀 코드가 정해질 때까지 발행하지 않음 |
+| `/lane_info` | `Int16`, `1=1차선, 2=2차선, 3=중앙` | PPT의 차선 인터페이스 |
+| `/internal/lane_command` | `[legacy_lane_mode, internal_lane]` | 기존 lane detector의 배열 계약을 launch remap으로 격리하여 차선 알고리즘은 수정하지 않음 |
+| `/traffic_detection` | `Int32` 4상태 | same-frame detector crop classifier와 object_node 사이의 내부 결과 |
+| `/object_yolo` | 고정·이동 객체별 10필드 슬롯 | Python ONNX 결과를 C++ 차선 융합 노드로 전달 |
+| `/lane_fit` | `[m, b]` | 객체 박스를 1·2차선으로 분류하는 내부 회귀선 |
+| `/lane_change_state` | `[changing, success]` | FIXED/OVERTAKE 차선 변경 완료 피드백 |
+| `/lane_position` | `Int16` | 측면 LiDAR 완료 판단에 쓰는 자차 실측 차선 |
+| `/lane_valid` | `Bool` | lane detector가 계속 발행하지만 `REJOIN` 제거 후 Main은 구독하지 않음. 담당자 소스를 임의 수정하지 않아 남긴 레거시 출력 |
+| `/rubbercone_reset` | `Empty` | 한 라바콘 세션의 종료 래치를 새 진입 때 초기화 |
 | `/road_surface` | `Int32` 신설 (`0` 미확정, `1` 기본 검은 도로, `2` 흰 지름길) | 지름길을 실제로 본 뒤 기본 도로가 연속 인식될 때만 종료 |
 | `/mode_info` | 현재 `[legacy_mode_code, lane]` 유지 | 실제 소비자인 `lane_detection.cpp`가 아직 3=차선주행, 5=차선변경 계약을 사용한다. 4필드 신규 계약은 소비자 변경 전까지 발행하지 않는다. |
 
@@ -228,20 +249,31 @@ main/main/
 > `Int32MultiArray` 의 인덱스 의미는 이 문서뿐 아니라 **코드 내 상수로도 정의한다.**
 > 문서에만 존재하는 인덱스 규약은 배선 실수의 주된 원인이 된다.
 
-#### 통합 YOLO 모델 (`best.onnx` = `traffic_light/model/best_traffic.onnx`, 동일 파일)
+#### Competition detector/classifier assets
+
+Production은 package share의 `model/train-10/best.onnx`와
+`model/classify/light1/weights/best.onnx`를 기본으로 사용하며 launch argument로만
+override한다. 두 파일의 class metadata가 고정 계약과 다르면 fail-fast한다. 저장소의
+기존 단일 클래스 `best.onnx`는 아래 legacy 자산이며 train-10 대체물로 사용하지 않는다.
+
+#### Legacy 고정장애물 YOLO 모델 (`best.onnx`)
 
 차량(고정장애물/방해차량)과 신호등을 **하나의 YOLO 모델**로 같이 검출한다.
 `object_detection/best.onnx`와 `traffic_light/model/best_traffic.onnx`는 md5까지
 동일한 파일이며, 두 인지 기능이 이 모델 하나를 공유한다.
 
-**현재 배포(2026-08-18, `train-5`)**: 6클래스, 입력 640 고정 → 출력 `(1, 10, 8400)`.
-```
-0 red_car(고정장애물)   1 green_car(방해차량)
-2 green_light(직진)     3 left_green_light(좌회전)
-4 orange_light(주황)    5 red_light(빨강)
-```
-클래스 ID는 런치 파라미터(`fixed_class_ids`/`moving_class_ids`/`traffic_class_ids`,
-`object_yolo_node.py`)로 넘기므로 재학습해서 순서가 바뀌어도 코드 수정 없이 대응한다.
+- 현재 포함 모델은 단일 클래스 `obstacle_car`, 입력 640 고정 → 출력 `(1, 5, 8400)`이다.
+  후처리는 Python ONNX Runtime으로 옮겼고 `(1,C,N)`/`(1,N,C)` 및 동적 클래스 수를
+  처리한다. 클래스 매핑은 `config/object_detection.yaml`의 정수 배열
+  `fixed_class_ids`와 `moving_class_ids`로 관리한다(예: `[0]`, `[1, 2]`).
+- Production YAML은 train-10 계약대로 `fixed_class_ids: [0]`,
+  `moving_class_ids: [1]`을 사용한다. 단일 클래스 legacy weight에는 적용하지 않는다.
+- 검증 성능 mAP50 0.995 / precision 0.999 / recall 1.000
+- 전처리는 **레터박스**(비율 유지 + 회색 114 패딩)를 쓴다. 640×360 원본을 640×640으로
+  늘리면 세로가 1.78배 왜곡되는데 YOLOv8 은 레터박스로 학습되므로 어긋난다.
+  검증용 bag 기준 conf ≥ 0.5 검출률이 82.3% → 98.1% 로 올랐다.
+- `conf_threshold_ = 0.50`. 검출 가능한 프레임의 99%를 잡고, 차량이 없는 프레임의
+  오검출은 conf 0.05 에서도 0이었다.
 
 **학습 이력**:
 

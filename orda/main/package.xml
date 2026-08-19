@@ -8,9 +8,22 @@
   <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>
+  <depend>ament_index_python</depend>
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>xycar_msgs</depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>image_resize</exec_depend>
+  <exec_depend>lane_detection</exec_depend>
+  <exec_depend>object_detection</exec_depend>
+  <exec_depend>rubbercone</exec_depend>
+  <exec_depend>joy</exec_depend>
+  <exec_depend>xycar_cam</exec_depend>
+  <exec_depend>xycar_lidar</exec_depend>
+  <exec_depend>xycar_ultrasonic</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

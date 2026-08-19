@@ -14,14 +14,13 @@ from main.safety_monitor import SafetyDecision
 
 
 STATE_CONTRACT = (
-    (Mode.WAIT_GREEN, ControlSource.STOP, 0),
+    (Mode.WAIT_GREEN, ControlSource.HOLD, 0),
     (Mode.LANE_DRIVE, ControlSource.LANE, 1),
     (Mode.CONE_DRIVE, ControlSource.CONE, 2),
-    (Mode.FIXED_AVOID, ControlSource.STOP, 3),
-    (Mode.OVERTAKE, ControlSource.STOP, 4),
+    (Mode.FIXED_AVOID, ControlSource.HOLD, 3),
+    (Mode.OVERTAKE, ControlSource.HOLD, 4),
     (Mode.SHORTCUT, ControlSource.LANE, 5),
-    (Mode.FINISH, ControlSource.STOP, None),
-    (Mode.STOP, ControlSource.STOP, None),
+    (Mode.FINISH, ControlSource.HOLD, None),
 )
 
 
@@ -42,7 +41,7 @@ def test_every_state_has_explicit_control_and_external_mode_contract(
     assert control.source is expected_source
     code = external_mode_code(mode)
     assert (None if code is None else int(code)) == expected_external_code
-    if expected_source is ControlSource.STOP:
+    if expected_source is ControlSource.HOLD:
         assert control.command == DriveCommand(0.0, 0.0)
 
 
@@ -71,7 +70,8 @@ def test_safety_fault_precedes_every_nonterminal_mission_transition(mode):
         assert transition.changed is False
         assert fsm.state is mode
     else:
-        assert transition.target is Mode.STOP
+        assert transition.target is mode
+        assert transition.changed is False
         assert context.stop_reason == "contract fault"
 
 

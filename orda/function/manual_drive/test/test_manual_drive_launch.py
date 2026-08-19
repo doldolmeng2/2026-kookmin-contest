@@ -99,7 +99,7 @@ def test_isolated_node_remaps_motor_and_live_node_does_not():
     live = next(node for node in nodes if type(node.condition) is IfCondition)
 
     assert _remapping_text(isolated) == [
-        ('xycar_motor', '/manual_test/xycar_motor')
+        ('xycar_motor', '/kmu_main_offline/xycar_motor')
     ]
     assert _remapping_text(live) == []
 
@@ -154,5 +154,5 @@ def test_legacy_launch_entry_point_delegates_to_safe_default():
     live_argument.execute(context)
     assert context.launch_configurations['live_drive'] == 'false'
     assert _remapping_text(isolated) == [
-        ('xycar_motor', '/manual_test/xycar_motor')
+        ('xycar_motor', '/kmu_main_offline/xycar_motor')
     ]

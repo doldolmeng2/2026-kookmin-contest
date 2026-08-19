@@ -21,7 +21,8 @@
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/int32_multi_array.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
-#include <cv_bridge/cv_bridge.h>
+#include <cv_bridge/cv_bridge.hpp>
+#include <ament_index_cpp/get_package_share_directory.hpp>
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/version.hpp>
@@ -1405,23 +1406,18 @@ private:
 // 파라미터 JSON 경로 결정
 //
 // 1) `--config <경로>` 명령행 인수가 있으면 그 경로를 사용
-// 2) 없으면 아래 후보 경로를 순서대로 확인한다
-//
-// 소스 트리를 직접 가리키므로 JSON을 고치면 재빌드 없이 바로 반영된다.
-// 예전에는 실차 경로 하나만 하드코딩되어 있었는데, 개발 PC에는 그 파일이
-// 없어서 lane_node가 시작하자마자 parse_error로 죽었다.
-//
-// ★ 새 PC에서 쓰려면 CONFIG_PATH_CANDIDATES에 그 PC의 경로를 추가해야 한다.
-//   임시로는 --config <경로> 로 넘겨도 된다.
+// 2) 없으면 설치된 package share의 JSON을 사용한다.
 // ─────────────────────────────────────────────────────────────────────────────
 static std::string resolve_config_path(int argc, char ** argv)
 {
-  static const std::vector<std::string> CONFIG_PATH_CANDIDATES = {
-    // 개발 PC
-    "/home/dxer0/xycar_ws/src/orda/driving/lane_detection/lane_detection_parameter.json",
-    // 실차 (Xycar)
-    "/home/xytron/xycar_ws/src/orda/driving/lane_detection/lane_detection_parameter.json",
-  };
+  std::vector<std::string> config_path_candidates;
+  try {
+    config_path_candidates.push_back(
+      ament_index_cpp::get_package_share_directory("lane_detection") +
+      "/lane_detection_parameter.json");
+  } catch (const std::exception &) {
+    // An explicit --config remains available in source-only execution.
+  }
 
   auto readable = [](const std::string & p) {
       if (p.empty()) {return false;}
@@ -1437,11 +1433,11 @@ static std::string resolve_config_path(int argc, char ** argv)
     }
   }
 
-  for (const auto & candidate : CONFIG_PATH_CANDIDATES) {
+  for (const auto & candidate : config_path_candidates) {
     if (readable(candidate)) {return candidate;}}
 
   std::string msg = "lane_detection_parameter.json을 찾지 못했습니다. 확인한 경로:";
-  for (const auto & candidate : CONFIG_PATH_CANDIDATES) {
+  for (const auto & candidate : config_path_candidates) {
     msg += "\n  - " + candidate;
   }
   msg += "\n--config <경로> 로 직접 지정할 수 있습니다.";

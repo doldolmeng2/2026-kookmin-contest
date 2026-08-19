@@ -926,7 +926,7 @@ class MainNode(Node):
                 self._shortcut_exit_sent = False
             return
 
-        # 그 밖의 상태(WAIT_GREEN/FINISH/STOP)에서는 구간 판정을 쉰다.
+        # 그 밖의 상태(WAIT_GREEN/FINISH)에서는 구간 판정을 쉰다.
         if entered:
             self._enter_zone(now)
 
@@ -996,7 +996,7 @@ class MainNode(Node):
         ):
             target_speed = min(target_speed, 5.0)
 
-        if source is ControlSource.STOP:
+        if source is ControlSource.HOLD:
             # 감속은 램프로 한다. 인지가 한 프레임 늦었다고 속도를 즉시 0으로
             # 꺾으면 재가속에 수 초가 걸려, 다음 끊김 전에 순항 속도를 회복하지
             # 못한다. 실측(bag): 속도 0인 사이클 24.2%, 5 미만 83.4%, 평균 2.24

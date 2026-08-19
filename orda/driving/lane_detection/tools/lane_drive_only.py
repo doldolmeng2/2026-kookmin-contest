@@ -31,20 +31,20 @@ from std_msgs.msg import Float32MultiArray, Int16
 
 class LaneDriveOnly(Node):
     def __init__(self):
-        super().__init__("lane_drive_only")
+        super().__init__('lane_drive_only')
 
         # ── 튜닝 파라미터 (control.py의 LANE_DRIVE 값과 동일한 기본값) ──────
-        self.kp = self.declare_parameter("kp", 0.145).value
-        self.kd = self.declare_parameter("kd", 0.3).value
-        self.max_speed = self.declare_parameter("max_speed", 43.0).value
-        self.min_speed = self.declare_parameter("min_speed", 16.0).value
-        self.scale_factor = self.declare_parameter("scale_factor", 0.5).value
+        self.kp = self.declare_parameter('kp', 0.145).value
+        self.kd = self.declare_parameter('kd', 0.3).value
+        self.max_speed = self.declare_parameter('max_speed', 43.0).value
+        self.min_speed = self.declare_parameter('min_speed', 16.0).value
+        self.scale_factor = self.declare_parameter('scale_factor', 0.5).value
         # main.py가 최종 발행 직전에 적용하는 1/2 스케일
-        self.speed_scale = self.declare_parameter("speed_scale", 0.5).value
+        self.speed_scale = self.declare_parameter('speed_scale', 0.5).value
         # 가속 스텝 (감속은 즉시). main.py와 동일하게 사이클당 0.1
-        self.accel_step = self.declare_parameter("accel_step", 0.1).value
+        self.accel_step = self.declare_parameter('accel_step', 0.1).value
         # 이 시간 이상 /lane_offset이 없으면 정지 명령을 낸다
-        self.stale_after_s = self.declare_parameter("stale_after_s", 0.5).value
+        self.stale_after_s = self.declare_parameter('stale_after_s', 0.5).value
 
         # ── 제어 상태 ────────────────────────────────────────────────────
         self.prev_offset = 0.0
@@ -65,18 +65,18 @@ class LaneDriveOnly(Node):
         )
 
         self.motor_pub = self.create_publisher(
-            Float32MultiArray, "xycar_motor", command_qos
+            Float32MultiArray, 'xycar_motor', command_qos
         )
         self.offset_sub = self.create_subscription(
-            Int16, "lane_offset", self.lane_offset_callback, offset_qos
+            Int16, 'lane_offset', self.lane_offset_callback, offset_qos
         )
 
         self.create_timer(0.02, self.control_cycle)
         self.get_logger().info(
-            "lane_drive_only 시작: /lane_offset -> /xycar_motor "
-            f"(kp={self.kp}, kd={self.kd}, "
-            f"speed={self.min_speed * self.speed_scale:.1f}"
-            f"~{self.max_speed * self.speed_scale:.1f})"
+            'lane_drive_only 시작: /lane_offset -> /xycar_motor '
+            f'(kp={self.kp}, kd={self.kd}, '
+            f'speed={self.min_speed * self.speed_scale:.1f}'
+            f'~{self.max_speed * self.speed_scale:.1f})'
         )
 
     def _now(self) -> float:
@@ -141,5 +141,5 @@ def main(args=None):
             rclpy.shutdown()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

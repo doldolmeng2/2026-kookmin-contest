@@ -7,11 +7,11 @@
 #   - 하드웨어 드라이버 (카메라, LiDAR) 런치 파일 미포함
 #     → bag 파일이 /image_raw, /scan 등 토픽을 직접 재생하기 때문
 #   - joy_node, xycar_ultrasonic 미포함 (하드웨어 없음)
-#   - main_node의 모터 명령을 /bag_test/xycar_motor로 격리
+#   - main_node의 모터 명령을 /kmu_main_offline/xycar_motor로 격리
 #
 # 시작되는 노드:
 #   main_node, rubbercone_node,
-#   resize_node, lane_node, object_yolo_node, object_node
+#   lane_node, object_yolo_node, object_node
 #
 # 신호등 인식은 traffic_light 패키지(traffic_node)가 아니라 object_detection
 # 패키지(object_yolo_node.py + object_node)가 직접 한다. traffic_node를 같이
@@ -23,8 +23,10 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -37,7 +39,7 @@ def generate_launch_description():
     # ── 런치 인수: main_node 초기 모드 / mission test entry ────────────────
     mode_arg = DeclareLaunchArgument(
         'mode',
-        default_value='0',
+        default_value='1',
         description=(
             '초기 모드 번호: 0=WAIT_GREEN, 1=LANE, 2=CONE, '
             '3=FIXED, 4=OVERTAKE, 5=SHORTCUT'
@@ -53,7 +55,7 @@ def generate_launch_description():
     lane_target = LaunchConfiguration('lane_target')
     test_profile_arg = DeclareLaunchArgument(
         'test_profile',
-        default_value='0',
+        default_value='2',
         description=(
             '격리된 bag-test 시작 번호 '
             '(0=race, 1=wait_green, 2=lane_center, 3=lane_1, '
@@ -61,12 +63,31 @@ def generate_launch_description():
         )
     )
     test_profile = LaunchConfiguration('test_profile')
+    live_drive_arg = DeclareLaunchArgument(
+        'live_drive', default_value='false', choices=('false', 'true'),
+        description='Publish to the physical motor topic only when explicitly enabled',
+    )
+    live_drive = LaunchConfiguration('live_drive')
+    udp_motor_bridge_arg = DeclareLaunchArgument(
+        'udp_motor_bridge', default_value='false', choices=('false', 'true'),
+        description='Forward live motor output to the ROS1 UDP receiver only when enabled',
+    )
+    udp_motor_bridge = LaunchConfiguration('udp_motor_bridge')
     show_debug_arg = DeclareLaunchArgument(
         'show_debug',
         default_value='false',
         description='상태 OpenCV 창 표시 여부'
     )
     show_debug = LaunchConfiguration('show_debug')
+    pidnet_model_arg = DeclareLaunchArgument(
+        'pidnet_model',
+        default_value=os.path.join(
+            get_package_share_directory('segmentation_tools'),
+            'model', 'pidnet_s_best.pt',
+        ),
+        description='PIDNet-S checkpoint path'
+    )
+    pidnet_model = LaunchConfiguration('pidnet_model')
     rubbercone_offset_filter_alpha_arg = DeclareLaunchArgument(
         'rubbercone_offset_filter_alpha',
         default_value='0.80',
@@ -151,23 +172,50 @@ def generate_launch_description():
         )
     )
     object_enable_gui = LaunchConfiguration('object_enable_gui')
+    detector_model_path_arg = DeclareLaunchArgument(
+        'detector_model_path', default_value=''
+    )
+    detector_model_path = LaunchConfiguration('detector_model_path')
+    traffic_classifier_model_path_arg = DeclareLaunchArgument(
+        'traffic_classifier_model_path', default_value=''
+    )
+    traffic_classifier_model_path = LaunchConfiguration(
+        'traffic_classifier_model_path'
+    )
+    perception_camera_topic_arg = DeclareLaunchArgument(
+        'perception_camera_topic', default_value='/resized_image'
+    )
+    perception_camera_topic = LaunchConfiguration('perception_camera_topic')
 
     # ── 소프트웨어 노드 (하드웨어 드라이버 제외) ────────────────────────────
-    main_node = Node(
+    main_parameters = [{
+        'mode': mode,
+        'lane_target': lane_target,
+        'test_profile': ParameterValue(test_profile, value_type=str),
+        'show_debug': show_debug,
+        'use_sim_time': True,
+    }]
+    isolated_main_node = Node(
         package='main',
         executable='main_node',
         name='main_node',
         output='screen',
-        parameters=[{
-            'mode': mode,
-            'lane_target': lane_target,
-            'test_profile': test_profile,
-            'show_debug': show_debug,
-            # bag --loop 재생 시 /clock 역행을 감지해 FSM을 초기화한다.
-            # 반드시 `ros2 bag play ... --clock` 과 함께 사용할 것.
-            'use_sim_time': True,
-        }],
-        remappings=[('xycar_motor', '/bag_test/xycar_motor')],
+        parameters=main_parameters,
+        remappings=[('xycar_motor', '/kmu_main_offline/xycar_motor')],
+        condition=UnlessCondition(live_drive),
+    )
+    live_main_node = Node(
+        package='main', executable='main_node', name='main_node', output='screen',
+        parameters=main_parameters,
+        condition=IfCondition(live_drive),
+    )
+    live_motor_bridge = Node(
+        package='main', executable='udp_motor_bridge', name='udp_motor_bridge',
+        output='screen',
+        condition=IfCondition(PythonExpression([
+            "'", live_drive, "' == 'true' and '", udp_motor_bridge,
+            "' == 'true'",
+        ])),
     )
     rubbercone_node = Node(
         package='rubbercone',
@@ -189,11 +237,19 @@ def generate_launch_description():
             'enable_gui': rubbercone_enable_gui,
         }],
     )
-    resize_node = Node(
-        package='image_resize',
-        executable='resize_node',
-        name='resize_node',
+    pidnet_node = Node(
+        package='segmentation_tools',
+        executable='pidnet_inference',
+        name='pidnet_inference_node',
         output='screen',
+        parameters=[{
+            'model_path': pidnet_model,
+            'input_topic': '/resized_image',
+            'mask_topic': '/lane_segmentation_mask',
+            'class_topic': '/pidnet_class_map',
+            'lane_classes': [1, 2, 3],
+            'device': 'auto',
+        }],
     )
     lane_node = Node(
         package='lane_detection',
@@ -207,7 +263,12 @@ def generate_launch_description():
         executable='object_yolo_node.py',
         name='object_yolo_node',
         output='screen',
-        parameters=[object_detection_config, {'use_sim_time': True}],
+        parameters=[object_detection_config, {
+            'detector_model_path': detector_model_path,
+            'traffic_classifier_model_path': traffic_classifier_model_path,
+            'camera_topic': perception_camera_topic,
+            'use_sim_time': True,
+        }],
     )
     object_node = Node(
         package='object_detection',
@@ -219,12 +280,27 @@ def generate_launch_description():
             'use_sim_time': True,
         }],
     )
+    preflight_node = Node(
+        package='main',
+        executable='kmu_preflight',
+        name='bag_preflight',
+        output='screen',
+        parameters=[{
+            'required_topics': ['/lane_offset', '/scan', '/object_info'],
+            'motor_output_topic': '/kmu_main_offline/xycar_motor',
+            'require_motor_subscriber': False,
+            'use_sim_time': True,
+        }],
+    )
 
     return LaunchDescription([
         mode_arg,
         lane_target_arg,
         test_profile_arg,
+        live_drive_arg,
+        udp_motor_bridge_arg,
         show_debug_arg,
+        pidnet_model_arg,
         rubbercone_offset_filter_alpha_arg,
         rubbercone_end_missing_frames_arg,
         rubbercone_scan_max_range_arg,
@@ -238,10 +314,16 @@ def generate_launch_description():
         rubbercone_offset_limit_arg,
         rubbercone_enable_gui_arg,
         object_enable_gui_arg,
-        main_node,
+        detector_model_path_arg,
+        traffic_classifier_model_path_arg,
+        perception_camera_topic_arg,
+        isolated_main_node,
+        live_main_node,
+        live_motor_bridge,
         rubbercone_node,
-        resize_node,
+        pidnet_node,
         lane_node,
         object_yolo_node,
         object_node,
+        preflight_node,
     ])

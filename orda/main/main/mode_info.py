@@ -30,8 +30,8 @@ _EXTERNAL_MODE_CODES = {
 def external_mode_code(mode: Any) -> Optional[ExternalModeInfoCode]:
     """Return the approved external code, or ``None`` for internal states.
 
-    FINISH and STOP deliberately have no external value yet. Main therefore
-    does not publish a fabricated ``/mode_info`` value while either is active.
+    FINISH deliberately has no external value. Main therefore does not publish
+    a fabricated ``/mode_info`` value while it is active.
     """
 
     if not isinstance(mode, Mode):
@@ -55,20 +55,19 @@ def lane_info_value(lane: Any) -> int:
 class LegacyLaneCommandCode(IntEnum):
     """Values consumed only by the existing lane detector implementation."""
 
-    STOP = 0
+    HOLD = 0
     CONE_DRIVE = 1
     LANE_DRIVE = 3
     LANE_CHANGE = 5
 
 
 _LEGACY_LANE_CODES = {
-    Mode.WAIT_GREEN: LegacyLaneCommandCode.STOP,
+    Mode.WAIT_GREEN: LegacyLaneCommandCode.HOLD,
     Mode.LANE_DRIVE: LegacyLaneCommandCode.LANE_DRIVE,
     Mode.CONE_DRIVE: LegacyLaneCommandCode.CONE_DRIVE,
     # SHORTCUT uses the ordinary lane detector for steering.
     Mode.SHORTCUT: LegacyLaneCommandCode.LANE_DRIVE,
-    Mode.FINISH: LegacyLaneCommandCode.STOP,
-    Mode.STOP: LegacyLaneCommandCode.STOP,
+    Mode.FINISH: LegacyLaneCommandCode.HOLD,
 }
 
 
@@ -87,7 +86,7 @@ def lane_command_data(
         and lane in (0, 1, 2)
     )
     lane_value = lane if valid_lane else 0
-    code = _LEGACY_LANE_CODES.get(mode, LegacyLaneCommandCode.STOP)
+    code = _LEGACY_LANE_CODES.get(mode, LegacyLaneCommandCode.HOLD)
     if mode in (Mode.FIXED_AVOID, Mode.OVERTAKE):
         code = (
             LegacyLaneCommandCode.LANE_CHANGE

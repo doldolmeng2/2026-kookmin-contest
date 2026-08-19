@@ -200,12 +200,12 @@ def test_safety_stop_consumes_cone_end_without_dispatching_or_reusing_reset():
 
     assert stopped.observation.cone_end_flag is True
     assert stopped.transition.source is Mode.CONE_DRIVE
-    assert stopped.transition.target is Mode.STOP
+    assert stopped.transition.target is Mode.CONE_DRIVE
     assert stopped.cone_session_active_command is None
     assert dispatch_cone_session_state(stopped, published.append) is False
     assert holding.transition.changed is False
     assert holding.cone_session_active_command is None
-    assert recovered.transition.source is Mode.STOP
+    assert recovered.transition.source is Mode.CONE_DRIVE
     assert recovered.transition.target is Mode.CONE_DRIVE
     assert recovered.cone_session_active_command is None
     assert dispatch_cone_session_state(recovered, published.append) is False
@@ -269,7 +269,7 @@ def test_stop_transition_never_dispatches_cone_phase():
     stopped = adapter.step(1.0, fault_reason="test fault")
     published = []
 
-    assert stopped.transition.target is Mode.STOP
+    assert stopped.transition.target is Mode.LANE_DRIVE
     assert stopped.cone_session_active_command is None
     assert dispatch_cone_session_state(stopped, published.append) is False
     assert published == []
@@ -484,18 +484,18 @@ def test_stale_lane_input_commits_safety_stop_and_zero_control():
         lane=candidate(1.0, 5.0, 1.0),
     )
 
-    assert cycle.transition.target is Mode.STOP
+    assert cycle.transition.target is Mode.LANE_DRIVE
     assert cycle.safety.must_stop is True
-    assert cycle.control.source is ControlSource.STOP
+    assert cycle.control.source is ControlSource.HOLD
 
 
 def test_stop_recovery_waits_for_real_inputs_not_just_the_hold_timer():
-    """STOP 복귀는 타이머가 아니라 입력 회복을 봐야 한다.
+    """hold 복귀는 타이머가 아니라 입력 회복을 봐야 한다.
 
-    예전에는 runtime_safety_monitor() 에 STOP 상태의 필수 입력이 등록돼 있지
+    예전에는 runtime_safety_monitor() 에 hold 상태의 필수 입력이 등록돼 있지
     않아 inputs_ready 가 항상 True 였고, 복귀가 사실상 0.5초 타이머였다.
-    실측 bag 에서 STOP 구간 길이가 전부 0.50~0.52초로 똑같고, 복귀 직후 다시
-    STOP 으로 떨어지기를 28번 반복한 이유다.
+    실측 bag 에서 hold 구간 길이가 전부 0.50~0.52초로 똑같고, 복귀 직후 다시
+    hold 으로 떨어지기를 28번 반복한 이유다.
     """
 
     adapter = RaceRuntimeAdapter(
@@ -506,15 +506,15 @@ def test_stop_recovery_waits_for_real_inputs_not_just_the_hold_timer():
     adapter.record_lane_offset(0, 1.0)
     adapter.record_scan(1.0)
 
-    # 인지 유실 -> STOP
+    # 인지 유실 -> hold
     stopped = adapter.step(2.2, lane=candidate(1.0, 5.0, 2.2))
-    assert stopped.transition.target is Mode.STOP
+    assert stopped.transition.target is Mode.LANE_DRIVE
 
     # 입력이 안 돌아오는 동안에는 아무리 기다려도 복귀하지 않는다.
     for now in (3.0, 4.0, 5.0):
         held = adapter.step(now, lane=candidate(1.0, 5.0, now))
         assert held.safety.inputs_ready is False
-        assert adapter.fsm.state is Mode.STOP
+        assert adapter.fsm.state is Mode.LANE_DRIVE
 
     # 입력이 돌아오면 유지 시간(0.5초)을 채운 뒤 복귀한다.
     for now in (5.2, 5.4, 5.6, 5.8):
@@ -541,7 +541,7 @@ def test_stale_cone_command_stops_motor_without_bypassing_exit_handshake():
     assert cycle.transition.changed is False
     assert adapter.fsm.state is Mode.CONE_DRIVE
     assert cycle.safety.must_stop is False
-    assert cycle.control.source is ControlSource.STOP
+    assert cycle.control.source is ControlSource.HOLD
 
 
 @pytest.mark.parametrize(
@@ -563,7 +563,7 @@ def test_unwired_future_states_ignore_typed_events_and_select_stop(mode):
 
     assert cycle.transition.changed is False
     assert adapter.fsm.state is mode
-    assert cycle.control.source is ControlSource.STOP
+    assert cycle.control.source is ControlSource.HOLD
 
 
 def test_shortcut_uses_fresh_lane_control_while_waiting_for_cnn_exit():

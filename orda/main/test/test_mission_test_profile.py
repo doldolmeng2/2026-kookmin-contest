@@ -185,8 +185,8 @@ def test_profile_start_does_not_weaken_safety_stop_priority():
 
     cycle = runtime.step(10.1, fault_reason="synthetic profile fault")
 
-    assert cycle.transition.target is Mode.STOP
-    assert cycle.control.source is ControlSource.STOP
+    assert cycle.transition.target is Mode.FIXED_AVOID
+    assert cycle.control.source is ControlSource.HOLD
     assert runtime.context.stop_reason == "external fault: synthetic profile fault"
 
 
@@ -204,9 +204,14 @@ def test_bag_launch_exposes_profile_without_weakening_motor_isolation():
     production_source = PRODUCTION_LAUNCH.read_text(encoding="utf-8")
 
     assert "DeclareLaunchArgument(\n        'test_profile'" in bag_source
-    assert "default_value='0'" in bag_source
-    assert "'test_profile': test_profile" in bag_source
-    assert "('xycar_motor', '/bag_test/xycar_motor')" in bag_source
+    assert "default_value='2'" in bag_source
+    assert "test_profile = LaunchConfiguration('test_profile')" in bag_source
+    assert "from launch_ros.parameter_descriptions import ParameterValue" in bag_source
+    assert "'test_profile': ParameterValue(test_profile, value_type=str)" in bag_source
+    assert "test_profile_arg," in bag_source
+    assert "('xycar_motor', '/kmu_main_offline/xycar_motor')" in bag_source
+    assert "'live_drive', default_value='false'" in bag_source
+    assert "'udp_motor_bridge', default_value='false'" in bag_source
     assert "test_profile" not in production_source
 
 
