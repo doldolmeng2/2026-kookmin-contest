@@ -7,14 +7,20 @@ setup(
     version='0.0.0',
     packages=find_packages(exclude=['test']),
     data_files=[
-        ('share/ament_index/resource_index/packages',
-            ['resource/' + package_name]),
+        (
+            'share/ament_index/resource_index/packages',
+            ['resource/' + package_name],
+        ),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', [
-       'launch/module_drive.py',     # 지금 만든 파일
-       'launch/module_drive_bag_test.py',
-       'launch/module_drive_mission_test.py',
-    ]),
+        (
+            'share/' + package_name + '/launch',
+            [
+                'launch/module_drive.py',
+                'launch/module_drive_bag_test.py',
+                'launch/module_drive_mission_test.py',
+                'launch/module_lane_only.py',
+            ],
+        ),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -26,6 +32,7 @@ setup(
     entry_points={
         'console_scripts': [
             'main_node = main.main:main',
+            'kmu_preflight = main.preflight:main',
         ],
     },
 )

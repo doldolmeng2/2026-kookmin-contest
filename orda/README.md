@@ -158,20 +158,12 @@ PPT에 있는 토픽은 **공식 외부 인터페이스**, PPT에 없는 토픽�
     pub: /resized_image                 (sensor_msgs/Image, 640×360)      [유지]
 
 [인지]
-  traffic_node
-    sub: /resized_image
-    pub: /traffic_detection             (std_msgs/Int32)                  [내부]
-         0 = 인식 못함
-         1 = 정지   (빨강, 주황)
-         2 = 직진   (녹색)
-         3 = 좌회전 (녹색 + 좌회전 화살표 동시 점등 → 지름길 진입)
-
   rubbercone_node
     sub: /scan
     pub: /rubbercone_offset             (std_msgs/Int32MultiArray)        [PPT 공식]
          [offset, end_flag]
          /rubbercone_info               (std_msgs/Int32MultiArray)        [내부 상세]
-         [offset, end_flag, confidence]
+         [offset, end_flag, confidence, entry_ready]
          confidence: 경로 추정 신뢰도 (0~100)
 
   lane_node
@@ -186,9 +178,19 @@ PPT에 있는 토픽은 **공식 외부 인터페이스**, PPT에 없는 토픽�
   object_yolo_node (Python ONNX Runtime)
     sub: /resized_image
     pub: /object_yolo                   (std_msgs/Float32MultiArray, 20 필드) [내부]
+         /traffic_detection             (std_msgs/Int32)                  [내부]
          [fixed 10필드 슬롯, moving 10필드 슬롯]
          슬롯: [detected, object_type, confidence, box_size, box_cx, box_cy,
                 box_x, box_y, box_w, box_h]
+    train-10 detector가 같은 프레임의 신호등 candidate crop을 만들고,
+    light1 classifier가 0=green, 1=left, 2=orange, 3=red를 분류한다.
+    최종 mapping은 green→2, left→3, orange/red→1, 없음/불확실/오류→0이다.
+
+  road_surface_node
+    sub: /pidnet_class_map              (sensor_msgs/Image)
+    pub: /road_surface                  (std_msgs/Int32, 0/1/2)
+    PIDNet class 4/5 ratio와 최대 connected component를 parameterized ROI에서
+    판정한다. normal bag separation 전에는 threshold를 명시해야만 시작한다.
 
   object_node (C++ LiDAR/차선 융합)
     sub: /scan, /resized_image, /lane_fit, /object_yolo, /traffic_detection
@@ -219,7 +221,7 @@ PPT에 있는 토픽은 **공식 외부 인터페이스**, PPT에 없는 토픽�
          [legacy_lane_mode, internal_lane]
 ```
 
-PPT 외 보조 노드는 `traffic_node`와 `object_yolo_node` 두 개다. 별도
+PPT 외 보조 인지는 `object_yolo_node`와 `road_surface_node`다. 별도
 `interface_adapter_node`는 만들지 않았다. `/object_info` 집계는 `object_node`가 직접,
 공식 모드와 lane detector 호환 명령의 분리는 `main_node`와 launch remap이 직접 맡는다.
 
@@ -230,11 +232,11 @@ PPT 외 보조 노드는 `traffic_node`와 `object_yolo_node` 두 개다. 별도
 | `/object_info` | `Int32MultiArray [신호등, 고정 객체 차선, 이동 객체 차선]` | Object Detection이 신호등·고정·이동 객체를 한 공식 메시지에서 동시에 표현 |
 | `/object_info_raw` | 기존 12필드 상세값 | Main의 거리·박스·분류 기반 판단을 보존하는 내부 이중 발행 |
 | `/rubbercone_offset` | `[offset, end_flag]` | PPT 공식 2필드 계약 |
-| `/rubbercone_info` | `[offset, end_flag, confidence]` | 기존 라바콘 진입 디바운스를 보존하는 내부 이중 발행 |
+| `/rubbercone_info` | `[offset, end_flag, confidence, entry_ready]` | producer가 승인한 진입 edge를 보존하는 내부 이중 발행 |
 | `/mode_info` | `Int16`, 코드 `0..5` | PPT의 모드 인터페이스. `FINISH`/`STOP`은 팀 코드가 정해질 때까지 발행하지 않음 |
 | `/lane_info` | `Int16`, `1=1차선, 2=2차선, 3=중앙` | PPT의 차선 인터페이스 |
 | `/internal/lane_command` | `[legacy_lane_mode, internal_lane]` | 기존 lane detector의 배열 계약을 launch remap으로 격리하여 차선 알고리즘은 수정하지 않음 |
-| `/traffic_detection` | `Int32` 4상태 | traffic_node와 object_node 사이의 내부 신호등 YOLO 결과 |
+| `/traffic_detection` | `Int32` 4상태 | same-frame detector crop classifier와 object_node 사이의 내부 결과 |
 | `/object_yolo` | 고정·이동 객체별 10필드 슬롯 | Python ONNX 결과를 C++ 차선 융합 노드로 전달 |
 | `/lane_fit` | `[m, b]` | 객체 박스를 1·2차선으로 분류하는 내부 회귀선 |
 | `/lane_change_state` | `[changing, success]` | FIXED/OVERTAKE 차선 변경 완료 피드백 |
@@ -251,7 +253,14 @@ PPT 외 보조 노드는 `traffic_node`와 `object_yolo_node` 두 개다. 별도
 이동 객체가 동시에 보이면 각 종류에서 기존 정책대로 가장 큰 박스(가장 가까운 객체)를
 하나씩 선택하므로 어느 한 종류도 다른 종류 때문에 사라지지 않는다.
 
-#### 고정장애물 YOLO 모델 (`best.onnx`)
+#### Competition detector/classifier assets
+
+Production은 package share의 `model/train-10/best.onnx`와
+`model/classify/light1/weights/best.onnx`를 기본으로 사용하며 launch argument로만
+override한다. 두 파일의 class metadata가 고정 계약과 다르면 fail-fast한다. 저장소의
+기존 단일 클래스 `best.onnx`는 아래 legacy 자산이며 train-10 대체물로 사용하지 않는다.
+
+#### Legacy 고정장애물 YOLO 모델 (`best.onnx`)
 
 고정장애물(빨간 차량)을 검출하도록 재학습했다. 학습 데이터는 `rosbag2_fixed_obstacles_*`
 6개에서 뽑은 658장(박스 463개 + 차량이 없는 프레임 200장)이다. 차량이 없는 프레임의
@@ -261,10 +270,8 @@ PPT 외 보조 노드는 `traffic_node`와 `object_yolo_node` 두 개다. 별도
   후처리는 Python ONNX Runtime으로 옮겼고 `(1,C,N)`/`(1,N,C)` 및 동적 클래스 수를
   처리한다. 클래스 매핑은 `config/object_detection.yaml`의 정수 배열
   `fixed_class_ids`와 `moving_class_ids`로 관리한다(예: `[0]`, `[1, 2]`).
-- 현재 YAML에는 `fixed_class_ids: [0]`만 확정되어 있고 `moving_class_ids`는 설정하지
-  않았다. 따라서 20필드 동시 표현 경로는 구현되어 있지만, 팀의 이동 객체 포함 모델과
-  정확한 클래스 ID 매핑을 받기 전까지 실차 `/object_info[2]`는 `0`이다. 클래스 ID를
-  임의로 추정하지 않는다.
+- Production YAML은 train-10 계약대로 `fixed_class_ids: [0]`,
+  `moving_class_ids: [1]`을 사용한다. 단일 클래스 legacy weight에는 적용하지 않는다.
 - 검증 성능 mAP50 0.995 / precision 0.999 / recall 1.000
 - 전처리는 **레터박스**(비율 유지 + 회색 114 패딩)를 쓴다. 640×360 원본을 640×640으로
   늘리면 세로가 1.78배 왜곡되는데 YOLOv8 은 레터박스로 학습되므로 어긋난다.

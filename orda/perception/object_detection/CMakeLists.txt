@@ -8,6 +8,7 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -15,7 +16,8 @@ find_package(OpenCV REQUIRED)
 find_package(cv_bridge REQUIRED)
 
 add_executable(object_node src/object_detection.cpp)
-ament_target_dependencies(object_node rclcpp std_msgs sensor_msgs cv_bridge)
+ament_target_dependencies(
+  object_node ament_index_cpp rclcpp std_msgs sensor_msgs cv_bridge)
 
 target_include_directories(object_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -36,6 +38,8 @@ install(PROGRAMS
 install(FILES
   best.onnx
   best_simplified.onnx
+  model/train10_detector_best.onnx
+  model/light1_classifier_best.onnx
   DESTINATION share/${PROJECT_NAME}/model)
 
 install(DIRECTORY config

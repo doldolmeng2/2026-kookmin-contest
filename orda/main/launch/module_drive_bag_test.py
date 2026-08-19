@@ -7,10 +7,10 @@
 #   - 하드웨어 드라이버 (카메라, LiDAR) 런치 파일 미포함
 #     → bag 파일이 /image_raw, /scan 등 토픽을 직접 재생하기 때문
 #   - joy_node, xycar_ultrasonic 미포함 (하드웨어 없음)
-#   - main_node의 모터 명령을 /bag_test/xycar_motor로 격리
+#   - main_node의 모터 명령을 /kmu_main_offline/xycar_motor로 격리
 #
 # 시작되는 노드:
-#   main_node, traffic_node, rubbercone_node,
+#   main_node, rubbercone_node,
 #   resize_node, lane_node, object_node
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -63,6 +63,15 @@ def generate_launch_description():
         description='상태 OpenCV 창 표시 여부'
     )
     show_debug = LaunchConfiguration('show_debug')
+    pidnet_model_arg = DeclareLaunchArgument(
+        'pidnet_model',
+        default_value=os.path.join(
+            get_package_share_directory('segmentation_tools'),
+            'model', 'pidnet_s_best.pt',
+        ),
+        description='PIDNet-S checkpoint path'
+    )
+    pidnet_model = LaunchConfiguration('pidnet_model')
     rubbercone_offset_filter_alpha_arg = DeclareLaunchArgument(
         'rubbercone_offset_filter_alpha',
         default_value='0.80',
@@ -147,6 +156,20 @@ def generate_launch_description():
         )
     )
     object_enable_gui = LaunchConfiguration('object_enable_gui')
+    detector_model_path_arg = DeclareLaunchArgument(
+        'detector_model_path', default_value=''
+    )
+    detector_model_path = LaunchConfiguration('detector_model_path')
+    traffic_classifier_model_path_arg = DeclareLaunchArgument(
+        'traffic_classifier_model_path', default_value=''
+    )
+    traffic_classifier_model_path = LaunchConfiguration(
+        'traffic_classifier_model_path'
+    )
+    perception_camera_topic_arg = DeclareLaunchArgument(
+        'perception_camera_topic', default_value='/resized_image'
+    )
+    perception_camera_topic = LaunchConfiguration('perception_camera_topic')
 
     # ── 소프트웨어 노드 (하드웨어 드라이버 제외) ────────────────────────────
     main_node = Node(
@@ -163,13 +186,7 @@ def generate_launch_description():
             # 반드시 `ros2 bag play ... --clock` 과 함께 사용할 것.
             'use_sim_time': True,
         }],
-        remappings=[('xycar_motor', '/bag_test/xycar_motor')],
-    )
-    traffic_node = Node(
-        package='traffic_light',
-        executable='traffic_node',
-        name='traffic_node',
-        output='screen',
+        remappings=[('xycar_motor', '/kmu_main_offline/xycar_motor')],
     )
     rubbercone_node = Node(
         package='rubbercone',
@@ -197,6 +214,20 @@ def generate_launch_description():
         name='resize_node',
         output='screen',
     )
+    pidnet_node = Node(
+        package='segmentation_tools',
+        executable='pidnet_inference',
+        name='pidnet_inference_node',
+        output='screen',
+        parameters=[{
+            'model_path': pidnet_model,
+            'input_topic': '/resized_image',
+            'mask_topic': '/lane_segmentation_mask',
+            'class_topic': '/pidnet_class_map',
+            'lane_classes': [1],
+            'device': 'auto',
+        }],
+    )
     lane_node = Node(
         package='lane_detection',
         executable='lane_node',
@@ -209,7 +240,12 @@ def generate_launch_description():
         executable='object_yolo_node.py',
         name='object_yolo_node',
         output='screen',
-        parameters=[object_detection_config, {'use_sim_time': True}],
+        parameters=[object_detection_config, {
+            'detector_model_path': detector_model_path,
+            'traffic_classifier_model_path': traffic_classifier_model_path,
+            'camera_topic': perception_camera_topic,
+            'use_sim_time': True,
+        }],
     )
     object_node = Node(
         package='object_detection',
@@ -218,6 +254,18 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'enable_gui': object_enable_gui,
+            'use_sim_time': True,
+        }],
+    )
+    preflight_node = Node(
+        package='main',
+        executable='kmu_preflight',
+        name='bag_preflight',
+        output='screen',
+        parameters=[{
+            'required_topics': ['/lane_offset', '/scan', '/object_info'],
+            'motor_output_topic': '/kmu_main_offline/xycar_motor',
+            'require_motor_subscriber': False,
             'use_sim_time': True,
         }],
     )
@@ -240,11 +288,15 @@ def generate_launch_description():
         rubbercone_offset_limit_arg,
         rubbercone_enable_gui_arg,
         object_enable_gui_arg,
+        detector_model_path_arg,
+        traffic_classifier_model_path_arg,
+        perception_camera_topic_arg,
         main_node,
-        traffic_node,
         rubbercone_node,
         resize_node,
+        pidnet_node,
         lane_node,
         object_yolo_node,
         object_node,
+        preflight_node,
     ])

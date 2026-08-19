@@ -11,7 +11,7 @@ ros2 launch manual_drive manual_drive.py \
   live_drive:=false
 ```
 
-This publishes only on `/manual_test/xycar_motor`. The default
+This publishes only on `/kmu_main_offline/xycar_motor`. The default
 `deadman_button:=-1` is intentionally STOP-only because this repository does
 not define a verified Xbox button index.
 

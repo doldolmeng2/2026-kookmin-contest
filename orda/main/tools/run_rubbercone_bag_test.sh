@@ -3,7 +3,7 @@
 #
 # This harness never starts a hardware driver and never replays recorded motor,
 # detector, lane, traffic, or diagnostic topics.  The production main node's
-# output remains remapped to /bag_test/xycar_motor by module_drive_bag_test.py.
+# output remains remapped to /kmu_main_offline/xycar_motor.
 
 set -Eeuo pipefail
 
@@ -270,13 +270,13 @@ stdbuf -oL -eL ros2 launch main module_drive_bag_test.py \
     >"${LAUNCH_LOG}" 2>&1 &
 LAUNCH_PID=$!
 
-wait_for_publisher_count /bag_test/xycar_motor 1 15
+wait_for_publisher_count /kmu_main_offline/xycar_motor 1 15
 wait_for_log "FSM WAIT_GREEN -> LANE_DRIVE: green signal debounced" 15
 
 stop_process "${SCAN_MOCK_PID}"
 SCAN_MOCK_PID=""
 
-ros2 topic echo /bag_test/xycar_motor std_msgs/msg/Float32MultiArray \
+ros2 topic echo /kmu_main_offline/xycar_motor std_msgs/msg/Float32MultiArray \
     --field data >"${MOTOR_LOG}" 2>&1 &
 MOTOR_ECHO_PID=$!
 ros2 topic echo /rubbercone_info std_msgs/msg/Int32MultiArray \
@@ -298,7 +298,7 @@ BAG_PLAY_PID=$!
 wait_for_log "FSM LANE_DRIVE -> CONE_DRIVE: cone entry confirmed" 20
 
 # Capture a non-zero command only after the FSM has committed CONE_DRIVE.
-timeout 5s ros2 topic echo /bag_test/xycar_motor \
+timeout 5s ros2 topic echo /kmu_main_offline/xycar_motor \
     std_msgs/msg/Float32MultiArray --field data --once \
     --filter 'len(m) >= 2 and (abs(float(m[0])) > 1e-6 or abs(float(m[1])) > 1e-6)' \
     >"${CONE_MOTOR_SAMPLE}" 2>&1
@@ -307,7 +307,7 @@ wait_for_log "FSM CONE_DRIVE -> LANE_DRIVE: fresh cone end flag" 20
 
 # A committed transition is not enough by itself: prove that the continuing
 # fresh lane-offset mock is selected after the direct lane-drive return.
-timeout 5s ros2 topic echo /bag_test/xycar_motor \
+timeout 5s ros2 topic echo /kmu_main_offline/xycar_motor \
     std_msgs/msg/Float32MultiArray --field data --once \
     --filter 'len(m) >= 2 and (abs(float(m[0])) > 1e-6 or abs(float(m[1])) > 1e-6)' \
     >"${POST_CONE_LANE_MOTOR_SAMPLE}" 2>&1

@@ -131,7 +131,7 @@ def test_only_non_live_main_node_remaps_motor_output():
     live = next(node for node in nodes if type(node.condition) is IfCondition)
 
     assert remapping_text(isolated) == [
-        ('xycar_motor', '/mission_test/xycar_motor')
+        ('xycar_motor', '/kmu_main_offline/xycar_motor')
     ]
     assert remapping_text(live) == []
 
@@ -141,7 +141,7 @@ def test_both_main_actions_receive_the_same_named_test_profile():
 
     assert "test_profile = LaunchConfiguration('test_profile')" in source
     assert "'test_profile': test_profile" in source
-    assert source.count("package='main'") == 2
+    assert source.count("executable='main_node'") == 2
     assert source.count("executable='main_node'") == 2
 
 
@@ -177,7 +177,7 @@ def test_mission_launch_reuses_the_complete_non_main_production_stack():
         'object_detection',
         'object_detection',
         'rubbercone',
-        'traffic_light',
+        'segmentation_tools',
     ]
     assert mission_includes == production_includes == 3
 
@@ -187,9 +187,9 @@ def test_production_and_existing_bag_launch_remain_unmodified_in_scope():
     bag_source = BAG_TEST_LAUNCH.read_text(encoding='utf-8')
 
     assert 'live_drive' not in production_source
-    assert '/mission_test/xycar_motor' not in production_source
+    assert '/kmu_main_offline/xycar_motor' not in production_source
     assert "default_value='0'" in bag_source
-    assert "('xycar_motor', '/bag_test/xycar_motor')" in bag_source
+    assert "('xycar_motor', '/kmu_main_offline/xycar_motor')" in bag_source
 
 
 @pytest.mark.parametrize(

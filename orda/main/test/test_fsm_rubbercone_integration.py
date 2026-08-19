@@ -241,10 +241,13 @@ def test_object_class_mapping_is_loaded_from_installed_yaml():
 
     assert "object_yolo_node:" in config
     assert "fixed_class_ids: [0]" in config
-    assert "# 예: moving_class_ids: [1]" in config
+    assert "moving_class_ids: [1]" in config
+    assert "traffic_classifier_model_path" in config
     assert "install(DIRECTORY config" in cmake
-    assert "parameters=[object_detection_config]" in production
-    assert "parameters=[object_detection_config, {'use_sim_time': True}]" in bag_test
+    assert "parameters=[object_detection_config, {" in production
+    assert "parameters=[object_detection_config, {" in bag_test
+    assert "'traffic_classifier_model_path': traffic_classifier_model_path" in production
+    assert "'traffic_classifier_model_path': traffic_classifier_model_path" in bag_test
 
 
 def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
@@ -265,11 +268,11 @@ def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
     }
     assert packages == {
         "main",
-        "traffic_light",
         "rubbercone",
         "image_resize",
         "lane_detection",
         "object_detection",
+        "segmentation_tools",
     }
 
     main_call = next(
@@ -286,7 +289,9 @@ def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
         for keyword in main_call.keywords
         if keyword.arg == "remappings"
     )
-    assert remappings == [("xycar_motor", "/bag_test/xycar_motor")]
+    assert remappings == [
+        ("xycar_motor", "/kmu_main_offline/xycar_motor")
+    ]
 
     assert not any(
         isinstance(node, ast.Call)
@@ -328,7 +333,7 @@ def test_rubbercone_bag_runner_enforces_safe_scan_only_playback():
     assert "post_cone_lane_motor_sample.log" in source
     assert "--topics /scan /xycar_motor" not in source
     assert "--topics /scan /rubbercone_info" not in source
-    assert "/bag_test/xycar_motor" in source
+    assert "/kmu_main_offline/xycar_motor" in source
     assert "FSM LANE_DRIVE -> CONE_DRIVE: cone entry confirmed" in source
     assert "xycar_camera" not in source
     assert "xycar_lidar" not in source

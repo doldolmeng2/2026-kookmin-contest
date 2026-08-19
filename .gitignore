@@ -17,6 +17,9 @@ __pycache__/
 *.pt
 *.pth
 *.engine
+# The verified competition deploy checkpoint is intentionally versioned;
+# training checkpoints remain ignored by the wildcard above.
+!segmentation_tools/model/pidnet_s_best.pt
 
 # ── 편집기 임시 파일 ────────────────────────────────────────
 .*.sw[op]

@@ -8,6 +8,7 @@ endif()
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -23,7 +24,7 @@ add_executable(lane_node
 add_executable(hls_hsv_tuner_node src/hls_hsv_tuner.cpp)
 
 # ROS2 의존성 연결
-ament_target_dependencies(lane_node rclcpp std_msgs sensor_msgs cv_bridge)
+ament_target_dependencies(lane_node ament_index_cpp rclcpp std_msgs sensor_msgs cv_bridge)
 ament_target_dependencies(hls_hsv_tuner_node rclcpp sensor_msgs cv_bridge)
 
 # include 경로 추가
@@ -67,5 +68,6 @@ if(BUILD_TESTING)
 endif()
 
 install(DIRECTORY include/ DESTINATION include)
+install(FILES lane_detection_parameter.json DESTINATION share/${PROJECT_NAME})
 
 ament_package()

@@ -50,6 +50,14 @@ def _is_production_main_node(action):
     )
 
 
+def _is_production_preflight(action):
+    return (
+        isinstance(action, Node)
+        and action.node_package == 'main'
+        and action.node_executable == 'kmu_preflight'
+    )
+
+
 def generate_launch_description():
     test_profile_arg = DeclareLaunchArgument(
         'test_profile',
@@ -85,7 +93,7 @@ def generate_launch_description():
         name='main_node',
         output='screen',
         parameters=main_parameters,
-        remappings=[('xycar_motor', '/mission_test/xycar_motor')],
+        remappings=[('xycar_motor', '/kmu_main_offline/xycar_motor')],
         condition=UnlessCondition(live_drive),
     )
     live_main_node = Node(
@@ -96,6 +104,30 @@ def generate_launch_description():
         parameters=main_parameters,
         condition=IfCondition(live_drive),
     )
+    isolated_preflight = Node(
+        package='main',
+        executable='kmu_preflight',
+        name='mission_test_preflight',
+        output='screen',
+        parameters=[{
+            'required_topics': ['/lane_offset', '/scan', '/object_info'],
+            'motor_output_topic': '/kmu_main_offline/xycar_motor',
+            'require_motor_subscriber': False,
+        }],
+        condition=UnlessCondition(live_drive),
+    )
+    live_preflight = Node(
+        package='main',
+        executable='kmu_preflight',
+        name='mission_live_preflight',
+        output='screen',
+        parameters=[{
+            'required_topics': ['/lane_offset', '/scan', '/object_info'],
+            'motor_output_topic': '/xycar_motor',
+            'require_motor_subscriber': True,
+        }],
+        condition=IfCondition(live_drive),
+    )
 
     production = _production_launch_description()
     entities = []
@@ -104,6 +136,8 @@ def generate_launch_description():
         if _is_production_main_node(action):
             entities.extend((isolated_main_node, live_main_node))
             replaced_main_nodes += 1
+        elif _is_production_preflight(action):
+            entities.extend((isolated_preflight, live_preflight))
         else:
             entities.append(action)
 

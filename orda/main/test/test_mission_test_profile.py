@@ -206,7 +206,7 @@ def test_bag_launch_exposes_profile_without_weakening_motor_isolation():
     assert "DeclareLaunchArgument(\n        'test_profile'" in bag_source
     assert "default_value='0'" in bag_source
     assert "'test_profile': test_profile" in bag_source
-    assert "('xycar_motor', '/bag_test/xycar_motor')" in bag_source
+    assert "('xycar_motor', '/kmu_main_offline/xycar_motor')" in bag_source
     assert "test_profile" not in production_source
 
 
