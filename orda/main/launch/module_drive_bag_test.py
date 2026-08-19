@@ -11,7 +11,11 @@
 #
 # 시작되는 노드:
 #   main_node, rubbercone_node,
-#   resize_node, lane_node, object_node
+#   lane_node, object_yolo_node, object_node
+#
+# 신호등 인식은 traffic_light 패키지(traffic_node)가 아니라 object_detection
+# 패키지(object_yolo_node.py + object_node)가 직접 한다. traffic_node를 같이
+# 띄우면 /traffic_boxes 퍼블리셔가 겹친다 — 절대 같이 띄우지 말 것.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os

@@ -9,6 +9,7 @@ import rclpy
 from rclpy.context import Context
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rcl_interfaces.msg import ParameterDescriptor
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import (
     Bool,
@@ -157,7 +158,11 @@ class MainNode(Node):
 
         self.declare_parameter("mode", 0)
         self.declare_parameter("lane_target", LaneTarget.CENTER.value)
-        self.declare_parameter("test_profile", MissionTestProfile.RACE.value)
+        self.declare_parameter(
+            "test_profile",
+            MissionTestProfile.RACE.value,
+            ParameterDescriptor(dynamic_typing=True),
+        )
         self.declare_parameter("show_debug", False)
         test_profile = parse_test_profile(
             self.get_parameter("test_profile").value

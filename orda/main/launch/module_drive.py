@@ -4,13 +4,17 @@
 # 역할: 자율주행 전체 시스템 런치 파일 (실제 Xycar 하드웨어 구동용)
 #
 # 시작되는 노드 목록:
-#   main_node       - 상태 머신 및 모터 제어 (main 패키지)
-#   object_yolo_node- 장애물 검출 + same-frame 신호등 crop 분류
-#   rubbercone_node - 라바콘 구간 LiDAR 오프셋 (rubbercone 패키지)
-#   resize_node     - 카메라 영상 640×360 리사이즈 (image_resize 패키지)
-#   lane_node       - 차선 검출 및 오프셋 발행 (lane_detection 패키지)
-#   object_node     - 장애물 검출 (object_detection 패키지)
-#   joy_node        - Xbox 컨트롤러 입력 (joy 패키지)
+#   main_node        - 상태 머신 및 모터 제어 (main 패키지)
+#   rubbercone_node  - 라바콘 구간 LiDAR 오프셋 (rubbercone 패키지)
+#   resize_node      - 카메라 영상 640×360 리사이즈 (image_resize 패키지)
+#   lane_node        - 차선 검출 및 오프셋 발행 (lane_detection 패키지)
+#   object_yolo_node - ONNX Runtime 차량/신호등 추론 (object_detection 패키지)
+#   object_node      - 장애물 검출 + 신호등 상태 판정 (object_detection 패키지)
+#   joy_node         - Xbox 컨트롤러 입력 (joy 패키지)
+#
+# 신호등 인식은 traffic_light 패키지(traffic_node)가 아니라 object_detection
+# 패키지가 직접 한다. traffic_node를 같이 띄우면 /traffic_boxes 퍼블리셔가
+# 겹친다 — 절대 같이 띄우지 말 것.
 #
 # 포함되는 런치 파일:
 #   xycar_cam.launch.py       - 카메라 드라이버
