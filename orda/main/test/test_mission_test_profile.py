@@ -204,9 +204,14 @@ def test_bag_launch_exposes_profile_without_weakening_motor_isolation():
     production_source = PRODUCTION_LAUNCH.read_text(encoding="utf-8")
 
     assert "DeclareLaunchArgument(\n        'test_profile'" in bag_source
-    assert "default_value='0'" in bag_source
-    assert "'test_profile': test_profile" in bag_source
+    assert "default_value='2'" in bag_source
+    assert "test_profile = LaunchConfiguration('test_profile')" in bag_source
+    assert "from launch_ros.parameter_descriptions import ParameterValue" in bag_source
+    assert "'test_profile': ParameterValue(test_profile, value_type=str)" in bag_source
+    assert "test_profile_arg," in bag_source
     assert "('xycar_motor', '/kmu_main_offline/xycar_motor')" in bag_source
+    assert "'live_drive', default_value='false'" in bag_source
+    assert "'udp_motor_bridge', default_value='false'" in bag_source
     assert "test_profile" not in production_source
 
 

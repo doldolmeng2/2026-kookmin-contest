@@ -40,6 +40,7 @@ import os
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch.launch_description_sources import (
     AnyLaunchDescriptionSource,
@@ -201,6 +202,22 @@ def generate_launch_description():
         description='Main motor output; production default is the fixed contract',
     )
     motor_output_topic = LaunchConfiguration('motor_output_topic')
+    enable_ultrasonic_arg = DeclareLaunchArgument(
+        'enable_ultrasonic', default_value='false', choices=('false', 'true'),
+        description='Start the unused ultrasonic producer only when explicitly requested',
+    )
+    enable_ultrasonic = LaunchConfiguration('enable_ultrasonic')
+    lidar_port_arg = DeclareLaunchArgument(
+        'lidar_port',
+        default_value='/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0',
+        description='Stable CP2102 LiDAR device path overriding the YAML port',
+    )
+    lidar_port = LaunchConfiguration('lidar_port')
+    udp_motor_bridge_arg = DeclareLaunchArgument(
+        'udp_motor_bridge', default_value='true', choices=('false', 'true'),
+        description='Forward the selected motor output to the local ROS1 UDP receiver',
+    )
+    udp_motor_bridge = LaunchConfiguration('udp_motor_bridge')
 
     # ── 소프트웨어 노드 ──────────────────────────────────────────────────────
     main_node = Node(
@@ -214,6 +231,11 @@ def generate_launch_description():
             'show_debug': show_debug,
         }],
         remappings=[('xycar_motor', motor_output_topic)],
+    )
+    motor_bridge_node = Node(
+        package='main', executable='udp_motor_bridge', name='udp_motor_bridge',
+        output='screen', remappings=[('xycar_motor', motor_output_topic)],
+        condition=IfCondition(udp_motor_bridge),
     )
     rubbercone_node = Node(
         package='rubbercone',
@@ -251,7 +273,7 @@ def generate_launch_description():
             'input_topic': '/resized_image',
             'mask_topic': '/lane_segmentation_mask',
             'class_topic': '/pidnet_class_map',
-            'lane_classes': [1],
+            'lane_classes': [1, 2, 3],
             'device': 'auto',
         }],
     )
@@ -323,7 +345,8 @@ def generate_launch_description():
                 get_package_share_directory('xycar_lidar'),
                 'launch/xycar_lidar.launch.py'
             )
-        )
+        ),
+        launch_arguments={'port': lidar_port}.items(),
     )
     # 초음파
     ultrasonic_launch = IncludeLaunchDescription(
@@ -332,13 +355,15 @@ def generate_launch_description():
                 get_package_share_directory('xycar_ultrasonic'),
                 'launch/xycar_ultrasonic.launch.py'
             )
-        )
+        ),
+        condition=IfCondition(enable_ultrasonic),
     )
 
     return LaunchDescription([
         mode_arg,
         lane_target_arg,
         show_debug_arg,
+        pidnet_model_arg,
         rubbercone_offset_filter_alpha_arg,
         rubbercone_end_missing_frames_arg,
         rubbercone_scan_max_range_arg,
@@ -356,7 +381,11 @@ def generate_launch_description():
         traffic_classifier_model_path_arg,
         perception_camera_topic_arg,
         motor_output_topic_arg,
+        enable_ultrasonic_arg,
+        lidar_port_arg,
+        udp_motor_bridge_arg,
         main_node,
+        motor_bridge_node,
         rubbercone_node,
         resize_node,
         pidnet_node,

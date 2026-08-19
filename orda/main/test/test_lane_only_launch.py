@@ -62,6 +62,17 @@ def test_lane_only_live_profile_supplies_camera_and_scan_drivers():
     assert all(type(include.condition) is IfCondition for include in includes)
 
 
+def test_lane_only_has_one_live_only_udp_bridge():
+    bridges = [
+        entity for entity in description().entities
+        if isinstance(entity, Node)
+        and entity.node_package == "main"
+        and entity.node_executable == "udp_motor_bridge"
+    ]
+    assert len(bridges) == 1
+    assert type(bridges[0].condition) is IfCondition
+
+
 def test_lane_only_keeps_production_main_safety_and_one_line_preflight():
     nodes = [
         entity for entity in description().entities if isinstance(entity, Node)

@@ -10,7 +10,7 @@ from launch.launch_description_sources import (
     AnyLaunchDescriptionSource,
     PythonLaunchDescriptionSource,
 )
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -20,6 +20,7 @@ OFFLINE_MOTOR_TOPIC = "/kmu_main_offline/xycar_motor"
 def generate_launch_description():
     live_drive = LaunchConfiguration("live_drive")
     show_debug = LaunchConfiguration("show_debug")
+    udp_motor_bridge = LaunchConfiguration("udp_motor_bridge")
 
     arguments = [
         DeclareLaunchArgument(
@@ -32,6 +33,10 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument("show_debug", default_value="false"),
+        DeclareLaunchArgument(
+            "udp_motor_bridge", default_value="true", choices=("false", "true"),
+            description="Forward live lane-only motor output to the ROS1 UDP receiver",
+        ),
     ]
     parameters = [{"mode": 1, "show_debug": show_debug}]
     isolated_main = Node(
@@ -50,6 +55,14 @@ def generate_launch_description():
         output="screen",
         parameters=parameters,
         condition=IfCondition(live_drive),
+    )
+    live_motor_bridge = Node(
+        package="main", executable="udp_motor_bridge", name="udp_motor_bridge",
+        output="screen",
+        condition=IfCondition(PythonExpression([
+            "'", live_drive, "' == 'true' and '", udp_motor_bridge,
+            "' == 'true'",
+        ])),
     )
     resize_node = Node(
         package="image_resize",
@@ -110,6 +123,7 @@ def generate_launch_description():
         *arguments,
         isolated_main,
         live_main,
+        live_motor_bridge,
         resize_node,
         lane_node,
         preflight,

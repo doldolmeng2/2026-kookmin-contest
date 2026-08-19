@@ -20,6 +20,7 @@ setup(
     maintainer_email='maintainer@example.com',
     description='ROS 2 bag color-filter tuning and PIDNet dataset annotation tools',
     license='MIT',
+    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'apply_roi_mask = segmentation_tools.apply_roi_mask:main',

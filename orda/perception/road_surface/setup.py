@@ -21,6 +21,7 @@ setup(
     maintainer_email="hyerica.orda@gmail.com",
     description="PIDNet class-map road-surface semantic producer",
     license="MIT",
+    tests_require=["pytest"],
     entry_points={
         "console_scripts": [
             "road_surface_node = road_surface.road_surface_node:main",

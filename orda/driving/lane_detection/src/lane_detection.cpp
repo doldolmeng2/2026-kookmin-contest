@@ -62,85 +62,86 @@ public:
     // Config 파라미터를 멤버 변수로 초기화하고,
     // ROS 토픽 구독/발행 및 BEV 호모그래피 행렬을 설정한다.
     // ─────────────────────────────────────────────────────────────────────
-    LaneDetector(const Config& config)
-    : Node("lane_detector_node"), config_(config),
-      lane_mode_(config_.lane_mode),
-      frame_width_(config_.frame_width),
-      frame_height_(config_.frame_height),
-      roi_top_width_   (static_cast<int>(frame_width_  * config_.roi_top_width_coefficient)),
-      roi_bottom_width_(static_cast<int>(frame_width_  * config_.roi_bottom_width_coefficient)),
-      roi_top_y_       (static_cast<int>(frame_height_ * config_.roi_top_y_coefficient)),
-      roi_bottom_y_    (static_cast<int>(frame_height_ * config_.roi_bottom_y_coefficient)),
-      center_reference_lane_one_(config_.center_reference_lane_one),
-      center_reference_lane_two_(config_.center_reference_lane_two),
-      lane_change_tracker_(config_.lane_change_tol_straight,
-                           config_.lane_change_tol_curve,
-                           config_.lane_change_tol_change,
-                           config_.lane_change_streak_need,
-                           config_.lane_change_m_split)
-    {
+  LaneDetector(const Config & config)
+  : Node("lane_detector_node"), config_(config),
+    lane_mode_(config_.lane_mode),
+    frame_width_(config_.frame_width),
+    frame_height_(config_.frame_height),
+    roi_top_width_   (static_cast<int>(frame_width_ * config_.roi_top_width_coefficient)),
+    roi_bottom_width_(static_cast<int>(frame_width_ * config_.roi_bottom_width_coefficient)),
+    roi_top_y_       (static_cast<int>(frame_height_ * config_.roi_top_y_coefficient)),
+    roi_bottom_y_    (static_cast<int>(frame_height_ * config_.roi_bottom_y_coefficient)),
+    center_reference_lane_one_(config_.center_reference_lane_one),
+    center_reference_lane_two_(config_.center_reference_lane_two),
+    lane_change_tracker_(config_.lane_change_tol_straight,
+      config_.lane_change_tol_curve,
+      config_.lane_change_tol_change,
+      config_.lane_change_streak_need,
+      config_.lane_change_m_split)
+  {
         // QoS 프로파일
         // - qos_sensor: 영상/센서처럼 최신성 우선, 유실 허용 (Best Effort)
         // - qos_fast:   수치 토픽용, Best Effort + Volatile (latch 없음)
-        auto qos_sensor = rclcpp::SensorDataQoS().best_effort();
-        auto qos_fast   = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
+    auto qos_sensor = rclcpp::SensorDataQoS().best_effort();
+    auto qos_fast = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
 
         // 카메라 영상 구독: /resized_image (BGR8)
-        image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+    image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
             "/resized_image", qos_sensor,
             std::bind(&LaneDetector::imageCallback, this, std::placeholders::_1)
-        );
+    );
 
         // 모드/차선 정보 구독: /mode_info [mode, lane]
         //   mode: 3=차선주행, 5=차선변경
         //   lane: 0=1차선,    1=2차선
-        mode_sub_ = this->create_subscription<std_msgs::msg::Int32MultiArray>(
+    mode_sub_ = this->create_subscription<std_msgs::msg::Int32MultiArray>(
             "/mode_info", qos_fast,
             std::bind(&LaneDetector::modeCallback, this, std::placeholders::_1)
-        );
+    );
 
         // 모터 명령 구독: /xycar_motor [조향각, 속도]
         // "Vehicle Dynamics" 디버그 창 시각화에만 사용한다.
-        motor_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+    motor_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
             "/xycar_motor", qos_fast,
             std::bind(&LaneDetector::motorCallback, this, std::placeholders::_1)
-        );
+    );
 
         // 오프셋 발행: /lane_offset (픽셀 단위 Int16)
-        offset_pub_ = this->create_publisher<std_msgs::msg::Int16>("/lane_offset", qos_fast);
+    offset_pub_ = this->create_publisher<std_msgs::msg::Int16>("/lane_offset", qos_fast);
 
         // 현재 프레임 차선 피팅 유효성 발행
-        validity_pub_ = this->create_publisher<std_msgs::msg::Bool>("/lane_valid", qos_fast);
+    validity_pub_ = this->create_publisher<std_msgs::msg::Bool>("/lane_valid", qos_fast);
 
         // 차선 회귀 파라미터 발행: /lane_fit ([m, b], 프레임 좌표계)
-        fit_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/lane_fit", qos_fast);
+    fit_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/lane_fit", qos_fast);
 
         // 차선 변경 상태 발행: /lane_change_state ([변경중여부, 성공여부])
-        lane_change_state_pub_ = this->create_publisher<std_msgs::msg::Int32MultiArray>(
+    lane_change_state_pub_ = this->create_publisher<std_msgs::msg::Int32MultiArray>(
             "/lane_change_state", qos_fast);
 
         // 실측 현재 차선 발행: /lane_position (-1=미확정, 0=중앙, 1=왼쪽, 2=오른쪽)
         // /lane_change_state 가 "변경이 끝났다"는 이벤트라면, 이쪽은 매 프레임
         // "지금 어느 차선인가"를 알려주는 연속값이다. 둘은 성격이 달라 공존한다.
-        lane_position_pub_ = this->create_publisher<std_msgs::msg::Int16>(
+    lane_position_pub_ = this->create_publisher<std_msgs::msg::Int16>(
             "/lane_position", qos_fast);
 
         // BEV 호모그래피 행렬 계산 (ROI 사다리꼴 → 직사각형)
-        buildHomography();
+    buildHomography();
 
         // ref 비율 스무딩 전환 초기화
-        smooth_enabled_ = config_.change_ref_smoothly;
-        if (config_.lane_ref_transition_duration_sec > 0.0)
-            ref_transition_duration_sec_ = config_.lane_ref_transition_duration_sec;
-
-        if (smooth_enabled_) {
-            ref_ratio_current_     = getTargetRefForMode(lane_mode_);
-            ref_ratio_start_       = ref_ratio_current_;
-            ref_ratio_target_      = ref_ratio_current_;
-            ref_start_time_        = this->now();
-            ref_transition_active_ = false;
-        }
+    smooth_enabled_ = config_.change_ref_smoothly;
+    if (config_.lane_ref_transition_duration_sec > 0.0) {
+      ref_transition_duration_sec_ = config_.lane_ref_transition_duration_sec;
     }
+
+    if (smooth_enabled_) {
+      ref_ratio_current_ = getTargetRefForMode(lane_mode_);
+      ref_ratio_start_ = ref_ratio_current_;
+      ref_ratio_target_ = ref_ratio_current_;
+      ref_start_time_ = this->now();
+      ref_transition_active_ = false;
+    }
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // (1) 노란 차선 전처리
@@ -149,83 +150,92 @@ public:
     // 모폴로지 연산(닫힘 → 열림) 후 Canny 엣지를 검출하여 반환한다.
     // ROI 사다리꼴 마스크를 먼저 적용해 관심 영역 외부를 제외한다.
     // ─────────────────────────────────────────────────────────────────────
-    Mat preprocessYellow(const Mat& frame) {
+  Mat preprocessYellow(const Mat & frame)
+  {
         // ROI 마스크 적용
-        Mat roi_mask = trapezoidMask(frame.size());
-        Mat roi_frame;
-        frame.copyTo(roi_frame, roi_mask);
+    Mat roi_mask = trapezoidMask(frame.size());
+    Mat roi_frame;
+    frame.copyTo(roi_frame, roi_mask);
 
         // 색공간 변환: HLS, HSV, YCrCb
-        Mat hls, hsv, ycrcb;
-        cvtColor(roi_frame, hls,   COLOR_BGR2HLS);
-        cvtColor(roi_frame, hsv,   COLOR_BGR2HSV);
-        cvtColor(roi_frame, ycrcb, COLOR_BGR2YCrCb);  // 채널 순서: [Y, Cr, Cb]
+    Mat hls, hsv, ycrcb;
+    cvtColor(roi_frame, hls, COLOR_BGR2HLS);
+    cvtColor(roi_frame, hsv, COLOR_BGR2HSV);
+    cvtColor(roi_frame, ycrcb, COLOR_BGR2YCrCb);      // 채널 순서: [Y, Cr, Cb]
 
         // 각 색공간에서 노란색 범위 마스크 생성
-        Mat y_hls, y_hsv, y_ycc, y_mask;
-        inRange(hls,
-                Scalar(config_.yellow_hls_min_h, config_.yellow_hls_min_l, config_.yellow_hls_min_s),
-                Scalar(config_.yellow_hls_max_h, config_.yellow_hls_max_l, config_.yellow_hls_max_s),
+    Mat y_hls, y_hsv, y_ycc, y_mask;
+    inRange(hls,
+                Scalar(config_.yellow_hls_min_h, config_.yellow_hls_min_l,
+      config_.yellow_hls_min_s),
+                Scalar(config_.yellow_hls_max_h, config_.yellow_hls_max_l,
+      config_.yellow_hls_max_s),
                 y_hls);
 
-        inRange(hsv,
-                Scalar(config_.yellow_hsv_min_h, config_.yellow_hsv_min_s, config_.yellow_hsv_min_v),
-                Scalar(config_.yellow_hsv_max_h, config_.yellow_hsv_max_s, config_.yellow_hsv_max_v),
+    inRange(hsv,
+                Scalar(config_.yellow_hsv_min_h, config_.yellow_hsv_min_s,
+      config_.yellow_hsv_min_v),
+                Scalar(config_.yellow_hsv_max_h, config_.yellow_hsv_max_s,
+      config_.yellow_hsv_max_v),
                 y_hsv);
 
         // YCrCb: OpenCV 채널 순서가 [Y, Cr, Cb]임에 주의
-        inRange(ycrcb,
-                Scalar(config_.yellow_ycrcb_min_y,  config_.yellow_ycrcb_min_cr, config_.yellow_ycrcb_min_cb),
-                Scalar(config_.yellow_ycrcb_max_y,  config_.yellow_ycrcb_max_cr, config_.yellow_ycrcb_max_cb),
+    inRange(ycrcb,
+                Scalar(config_.yellow_ycrcb_min_y, config_.yellow_ycrcb_min_cr,
+      config_.yellow_ycrcb_min_cb),
+                Scalar(config_.yellow_ycrcb_max_y, config_.yellow_ycrcb_max_cr,
+      config_.yellow_ycrcb_max_cb),
                 y_ycc);
 
         // YCrCb 채널 합산 디버그 시각화 (debug_lane_view 설정 시)
-        if (config_.debug_view && config_.debug_lane_view) {
-            std::vector<cv::Mat> ch;
-            split(ycrcb, ch);
-            imshow("YCrCb channels", (ch[0] + ch[1] + ch[2]) / 3);
-        }
+    if (config_.debug_view && config_.debug_lane_view) {
+      std::vector<cv::Mat> ch;
+      split(ycrcb, ch);
+      imshow("YCrCb channels", (ch[0] + ch[1] + ch[2]) / 3);
+    }
 
         // 세 색공간 마스크의 교집합 계산
-        bitwise_and(y_hls, y_hsv, y_mask);
-        bitwise_and(y_mask, y_ycc, y_mask);
+    bitwise_and(y_hls, y_hsv, y_mask);
+    bitwise_and(y_mask, y_ycc, y_mask);
 
         // 매우 어두운 픽셀(Y ≤ 5) 억제: 검정 영역이 재유입되는 현상 방지
-        {
-            std::vector<cv::Mat> ch;
-            split(ycrcb, ch);
-            cv::Mat y_gate = ch[0] > 5;
-            y_gate.convertTo(y_gate, CV_8U, 255);
-            bitwise_and(y_mask, y_gate, y_mask);
-        }
+    {
+      std::vector<cv::Mat> ch;
+      split(ycrcb, ch);
+      cv::Mat y_gate = ch[0] > 5;
+      y_gate.convertTo(y_gate, CV_8U, 255);
+      bitwise_and(y_mask, y_gate, y_mask);
+    }
 
         // 모폴로지: 닫힘(구멍 메우기) → 열림(잔여 노이즈 제거)
-        Mat k_close = getStructuringElement(MORPH_RECT,
-                        Size(config_.kernel_yellow_closing_size, config_.kernel_yellow_closing_size));
-        Mat k_open  = getStructuringElement(MORPH_RECT,
-                        Size(config_.kernel_yellow_opening_size, config_.kernel_yellow_opening_size));
-        morphologyEx(y_mask, y_mask, MORPH_CLOSE, k_close);
-        morphologyEx(y_mask, y_mask, MORPH_OPEN,  k_open);
+    Mat k_close = getStructuringElement(MORPH_RECT,
+                        Size(config_.kernel_yellow_closing_size,
+      config_.kernel_yellow_closing_size));
+    Mat k_open = getStructuringElement(MORPH_RECT,
+                        Size(config_.kernel_yellow_opening_size,
+      config_.kernel_yellow_opening_size));
+    morphologyEx(y_mask, y_mask, MORPH_CLOSE, k_close);
+    morphologyEx(y_mask, y_mask, MORPH_OPEN, k_open);
 
         // 가우시안 블러 + Canny 엣지 검출 (노란색 마스크 범위 내에서만)
-        Mat gray, blurred, masked_gray, edges;
-        cvtColor(roi_frame, gray, COLOR_BGR2GRAY);
-        GaussianBlur(gray, blurred,
+    Mat gray, blurred, masked_gray, edges;
+    cvtColor(roi_frame, gray, COLOR_BGR2GRAY);
+    GaussianBlur(gray, blurred,
                      Size(config_.gaussian_blur_kernel_size, config_.gaussian_blur_kernel_size), 0);
 
         // 마스크를 3×3 팽창하여 엣지 검출 범위를 조금 확장
-        Mat y_mask_dil;
-        Mat k3 = getStructuringElement(MORPH_RECT, Size(3, 3));
-        dilate(y_mask, y_mask_dil, k3);
+    Mat y_mask_dil;
+    Mat k3 = getStructuringElement(MORPH_RECT, Size(3, 3));
+    dilate(y_mask, y_mask_dil, k3);
 
-        blurred.copyTo(masked_gray, y_mask_dil);
-        Canny(masked_gray, edges,
+    blurred.copyTo(masked_gray, y_mask_dil);
+    Canny(masked_gray, edges,
               config_.canny_yellow_low_threshold, config_.canny_yellow_high_threshold);
 
         // 최종 마스크로 엣지 이미지를 다시 제한
-        bitwise_and(edges, edges, edges, y_mask);
-        return edges;
-    }
+    bitwise_and(edges, edges, edges, y_mask);
+    return edges;
+  }
 
 
     // ─────────────────────────────────────────────────────────────────────
@@ -234,34 +244,35 @@ public:
     // ROI 사다리꼴(원본 좌표) → 직사각형(BEV 좌표) 투시변환 행렬 H_ 와
     // 역변환 행렬 H_inv_ 를 계산하여 멤버에 저장한다.
     // ─────────────────────────────────────────────────────────────────────
-    void buildHomography() {
-        int cx = frame_width_ / 2;
+  void buildHomography()
+  {
+    int cx = frame_width_ / 2;
 
         // 원본 사다리꼴 꼭짓점 순서: 좌상, 우상, 우하, 좌하
-        Point2f src[4] = {
-            Point2f(cx - roi_top_width_/2,    static_cast<float>(roi_top_y_)),
-            Point2f(cx + roi_top_width_/2,    static_cast<float>(roi_top_y_)),
-            Point2f(cx + roi_bottom_width_/2, static_cast<float>(roi_bottom_y_)),
-            Point2f(cx - roi_bottom_width_/2, static_cast<float>(roi_bottom_y_))
-        };
+    Point2f src[4] = {
+      Point2f(cx - roi_top_width_ / 2, static_cast<float>(roi_top_y_)),
+      Point2f(cx + roi_top_width_ / 2, static_cast<float>(roi_top_y_)),
+      Point2f(cx + roi_bottom_width_ / 2, static_cast<float>(roi_bottom_y_)),
+      Point2f(cx - roi_bottom_width_ / 2, static_cast<float>(roi_bottom_y_))
+    };
 
         // BEV 결과 크기 결정
-        int bev_w = roi_bottom_width_;
-        if (bev_w <= 0) bev_w = std::max(roi_top_width_, frame_width_);
-        int bev_h = std::max(1, roi_bottom_y_ - roi_top_y_);
-        bev_size_ = Size(bev_w, bev_h);
+    int bev_w = roi_bottom_width_;
+    if (bev_w <= 0) {bev_w = std::max(roi_top_width_, frame_width_);}
+    int bev_h = std::max(1, roi_bottom_y_ - roi_top_y_);
+    bev_size_ = Size(bev_w, bev_h);
 
         // BEV 직사각형 꼭짓점 순서: 좌상, 우상, 우하, 좌하
-        Point2f dst[4] = {
-            Point2f(0.f,         0.f),
-            Point2f(bev_w - 1.f, 0.f),
-            Point2f(bev_w - 1.f, bev_h - 1.f),
-            Point2f(0.f,         bev_h - 1.f)
-        };
+    Point2f dst[4] = {
+      Point2f(0.f, 0.f),
+      Point2f(bev_w - 1.f, 0.f),
+      Point2f(bev_w - 1.f, bev_h - 1.f),
+      Point2f(0.f, bev_h - 1.f)
+    };
 
-        H_     = getPerspectiveTransform(src, dst);
-        H_inv_ = H_.inv();  // 역변환: BEV → 원본 프레임
-    }
+    H_ = getPerspectiveTransform(src, dst);
+    H_inv_ = H_.inv();      // 역변환: BEV → 원본 프레임
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // (3-a) 수평 노이즈 행 억제
@@ -283,92 +294,92 @@ public:
     //   x_min / x_max           : corridor 가로 범위
     //   vis                     : 디버그 캔버스 (nullptr이면 비활성)
     // ─────────────────────────────────────────────────────────────────────
-    bool suppressHorizontalNoiseRows(const cv::Mat& bev_in,
-                                     cv::Mat& bev_out,
-                                     int horizontal_noise_width,
-                                     float corridor_ratio_thresh,
-                                     int y_start,
-                                     int y_end,
-                                     int band_h,
-                                     int extra_pad_rows,
-                                     int x_min,
-                                     int x_max,
-                                     cv::Mat* vis = nullptr)
-    {
-        CV_Assert(bev_in.type() == CV_8UC1);
-        const int H = bev_in.rows, W = bev_in.cols;
+  bool suppressHorizontalNoiseRows(
+    const cv::Mat & bev_in,
+    cv::Mat & bev_out,
+    int horizontal_noise_width,
+    float corridor_ratio_thresh,
+    int y_start,
+    int y_end,
+    int band_h,
+    int extra_pad_rows,
+    int x_min,
+    int x_max,
+    cv::Mat * vis = nullptr)
+  {
+    CV_Assert(bev_in.type() == CV_8UC1);
+    const int H = bev_in.rows, W = bev_in.cols;
 
-        bev_out = bev_in.clone();
+    bev_out = bev_in.clone();
 
         // 파라미터 경계 보정
-        y_start        = std::max(0, y_start);
-        y_end          = (y_end <= 0 || y_end > H) ? H : y_end;
-        band_h         = std::max(1, band_h);
-        extra_pad_rows = std::max(0, extra_pad_rows);
-        x_min          = std::max(0, x_min);
-        x_max          = std::min(W - 1, x_max);
-        if (y_start >= y_end || x_min > x_max) return false;
+    y_start = std::max(0, y_start);
+    y_end = (y_end <= 0 || y_end > H) ? H : y_end;
+    band_h = std::max(1, band_h);
+    extra_pad_rows = std::max(0, extra_pad_rows);
+    x_min = std::max(0, x_min);
+    x_max = std::min(W - 1, x_max);
+    if (y_start >= y_end || x_min > x_max) {return false;}
 
-        const int corridor_w = x_max - x_min + 1;
-        const int corridor_h = y_end  - y_start;
+    const int corridor_w = x_max - x_min + 1;
+    const int corridor_h = y_end - y_start;
 
         // corridor 전체 흰 픽셀 수 (비율 조건의 분모)
-        int corridor_total_whites = 0;
-        if (corridor_w > 0 && corridor_h > 0) {
-            cv::Mat corridor_roi = bev_in(cv::Rect(x_min, y_start, corridor_w, corridor_h));
-            corridor_total_whites = cv::countNonZero(corridor_roi);
-        }
+    int corridor_total_whites = 0;
+    if (corridor_w > 0 && corridor_h > 0) {
+      cv::Mat corridor_roi = bev_in(cv::Rect(x_min, y_start, corridor_w, corridor_h));
+      corridor_total_whites = cv::countNonZero(corridor_roi);
+    }
 
-        bool suppressed_any = false;
+    bool suppressed_any = false;
 
-        for (int y = y_start; y <= y_end - band_h; ++y) {
-            int best = 0, run = 0;
+    for (int y = y_start; y <= y_end - band_h; ++y) {
+      int best = 0, run = 0;
 
             // band_h 줄을 세로 OR한 가상 1행에서 연속 흰 픽셀 최대 길이 측정
-            for (int x = x_min; x < x_max; ++x) {
-                bool on = false;
-                for (int dy = 0; dy < band_h; ++dy) {
-                    if (bev_in.at<uchar>(y + dy, x) > 0) { on = true; break; }
-                }
-                if (on) { run++; best = std::max(best, run); }
-                else    { run = 0; }
-            }
+      for (int x = x_min; x < x_max; ++x) {
+        bool on = false;
+        for (int dy = 0; dy < band_h; ++dy) {
+          if (bev_in.at<uchar>(y + dy, x) > 0) {on = true; break;}
+        }
+        if (on) {run++; best = std::max(best, run);} else {run = 0;}
+      }
 
             // 비율 조건: 밴드 내 흰 픽셀 수 / corridor 전체 흰 픽셀 수 >= 임계값
-            bool ratio_noise = false;
-            if (corridor_total_whites > 0) {
-                cv::Mat band_roi    = bev_in(cv::Rect(x_min, y, corridor_w, band_h));
-                int     band_whites = cv::countNonZero(band_roi);
-                float   ratio       = static_cast<float>(band_whites)
-                                    / static_cast<float>(corridor_total_whites);
-                ratio_noise = (ratio >= corridor_ratio_thresh);
-            }
+      bool ratio_noise = false;
+      if (corridor_total_whites > 0) {
+        cv::Mat band_roi = bev_in(cv::Rect(x_min, y, corridor_w, band_h));
+        int     band_whites = cv::countNonZero(band_roi);
+        float   ratio = static_cast<float>(band_whites) /
+          static_cast<float>(corridor_total_whites);
+        ratio_noise = (ratio >= corridor_ratio_thresh);
+      }
 
             // 두 조건 모두 충족하면 해당 행 범위를 0으로 삭제
-            if (best >= horizontal_noise_width && ratio_noise) {
-                const int y0 = std::max(y_start, y - extra_pad_rows);
-                const int y1 = std::min(H, y + band_h + extra_pad_rows);
+      if (best >= horizontal_noise_width && ratio_noise) {
+        const int y0 = std::max(y_start, y - extra_pad_rows);
+        const int y1 = std::min(H, y + band_h + extra_pad_rows);
 
-                for (int yy = y0; yy < y1; ++yy) {
-                    uchar* row = bev_out.ptr<uchar>(yy);
-                    std::memset(row + x_min, 0, (x_max - x_min + 1));
-                }
-
-                if (vis && !vis->empty()) {
-                    cv::rectangle(*vis,
-                                  cv::Rect(x_min, y0, x_max - x_min + 1, y1 - y0),
-                                  cv::Scalar(0, 0, 255), cv::FILLED);
-                }
-
-                suppressed_any = true;
-
-                // 패딩 끝 이후로 스캔 위치 이동 (중복 검출 방지)
-                y = std::min(y1, y_end - band_h + 1) - 1;
-            }
+        for (int yy = y0; yy < y1; ++yy) {
+          uchar * row = bev_out.ptr<uchar>(yy);
+          std::memset(row + x_min, 0, (x_max - x_min + 1));
         }
 
-        return suppressed_any;
+        if (vis && !vis->empty()) {
+          cv::rectangle(*vis,
+                                  cv::Rect(x_min, y0, x_max - x_min + 1, y1 - y0),
+                                  cv::Scalar(0, 0, 255), cv::FILLED);
+        }
+
+        suppressed_any = true;
+
+                // 패딩 끝 이후로 스캔 위치 이동 (중복 검출 방지)
+        y = std::min(y1, y_end - band_h + 1) - 1;
+      }
     }
+
+    return suppressed_any;
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // (3-b) 수직 열 밴드 노이즈 억제
@@ -388,76 +399,79 @@ public:
     //   half_w      : 밴드 삭제 시 좌우 추가 여유 (px)
     //   vis         : 디버그 캔버스 (nullptr이면 비활성)
     // ─────────────────────────────────────────────────────────────────────
-    bool suppressColumnBands(const cv::Mat& bev_in,
-                             cv::Mat& bev_out,
-                             int x_min, int x_max,
-                             int y_start, int y_end,
-                             int band_w,
-                             int min_pixels,
-                             float peak_ratio,
-                             int half_w,
-                             cv::Mat* vis = nullptr)
-    {
-        CV_Assert(bev_in.type() == CV_8UC1);
-        const int H = bev_in.rows, W = bev_in.cols;
+  bool suppressColumnBands(
+    const cv::Mat & bev_in,
+    cv::Mat & bev_out,
+    int x_min, int x_max,
+    int y_start, int y_end,
+    int band_w,
+    int min_pixels,
+    float peak_ratio,
+    int half_w,
+    cv::Mat * vis = nullptr)
+  {
+    CV_Assert(bev_in.type() == CV_8UC1);
+    const int H = bev_in.rows, W = bev_in.cols;
 
-        x_min   = std::max(0, x_min);
-        x_max   = std::min(W - 1, x_max);
-        y_start = std::max(0, y_start);
-        y_end   = (y_end <= 0 || y_end > H) ? H : y_end;
-        band_w  = std::max(1, band_w);
-        half_w  = std::max(0, half_w);
+    x_min = std::max(0, x_min);
+    x_max = std::min(W - 1, x_max);
+    y_start = std::max(0, y_start);
+    y_end = (y_end <= 0 || y_end > H) ? H : y_end;
+    band_w = std::max(1, band_w);
+    half_w = std::max(0, half_w);
 
-        bev_out = bev_in.clone();
-        if (x_min > x_max || y_start >= y_end) return false;
+    bev_out = bev_in.clone();
+    if (x_min > x_max || y_start >= y_end) {return false;}
 
         // ROI 영역의 열(세로) 픽셀 합 계산
-        cv::Mat roi = bev_in(cv::Rect(x_min, y_start, x_max - x_min + 1, y_end - y_start));
-        cv::Mat nz  = (roi > 0);
-        cv::Mat colSum32S;
-        cv::reduce(nz, colSum32S, 0, cv::REDUCE_SUM, CV_32S);
+    cv::Mat roi = bev_in(cv::Rect(x_min, y_start, x_max - x_min + 1, y_end - y_start));
+    cv::Mat nz = (roi > 0);
+    cv::Mat colSum32S;
+    cv::reduce(nz, colSum32S, 0, cv::REDUCE_SUM, CV_32S);
 
         // 전체 열 중 최대 픽셀 수
-        int maxVal = 0;
-        for (int i = 0; i < colSum32S.cols; ++i)
-            maxVal = std::max(maxVal, colSum32S.at<int>(0, i) / 255);
+    int maxVal = 0;
+    for (int i = 0; i < colSum32S.cols; ++i) {
+      maxVal = std::max(maxVal, colSum32S.at<int>(0, i) / 255);
+    }
 
-        bool any = false;
+    bool any = false;
 
         // band_w 폭 단위로 검사
-        for (int i = 0; i < colSum32S.cols; i += band_w) {
-            int x_band_start = x_min + i;
-            int x_band_end   = std::min(x_max, x_band_start + band_w - 1);
+    for (int i = 0; i < colSum32S.cols; i += band_w) {
+      int x_band_start = x_min + i;
+      int x_band_end = std::min(x_max, x_band_start + band_w - 1);
 
-            int bandPix = 0;
-            for (int j = i; j < i + band_w && j < colSum32S.cols; ++j)
-                bandPix += colSum32S.at<int>(0, j) / 255;
+      int bandPix = 0;
+      for (int j = i; j < i + band_w && j < colSum32S.cols; ++j) {
+        bandPix += colSum32S.at<int>(0, j) / 255;
+      }
 
-            bool cond_abs = (bandPix >= min_pixels);
-            bool cond_rel = (peak_ratio > 0.f) ? (bandPix >= maxVal * peak_ratio) : true;
+      bool cond_abs = (bandPix >= min_pixels);
+      bool cond_rel = (peak_ratio > 0.f) ? (bandPix >= maxVal * peak_ratio) : true;
 
-            if (cond_abs && cond_rel) {
+      if (cond_abs && cond_rel) {
                 // 삭제 구간: 밴드 + 좌우 half_w 여유
-                int xl = std::max(0,    x_band_start - half_w);
-                int xr = std::min(W-1, x_band_end   + half_w);
+        int xl = std::max(0, x_band_start - half_w);
+        int xr = std::min(W - 1, x_band_end + half_w);
 
-                for (int yy = y_start; yy < y_end; ++yy) {
-                    uchar* row = bev_out.ptr<uchar>(yy);
-                    std::memset(row + xl, 0, (xr - xl + 1));
-                }
-
-                if (vis && !vis->empty()) {
-                    cv::rectangle(*vis,
-                                  cv::Rect(xl, y_start, xr - xl + 1, y_end - y_start),
-                                  cv::Scalar(0, 0, 255), cv::FILLED);
-                }
-
-                any = true;
-            }
+        for (int yy = y_start; yy < y_end; ++yy) {
+          uchar * row = bev_out.ptr<uchar>(yy);
+          std::memset(row + xl, 0, (xr - xl + 1));
         }
 
-        return any;
+        if (vis && !vis->empty()) {
+          cv::rectangle(*vis,
+                                  cv::Rect(xl, y_start, xr - xl + 1, y_end - y_start),
+                                  cv::Scalar(0, 0, 255), cv::FILLED);
+        }
+
+        any = true;
+      }
     }
+
+    return any;
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // (4) 슬라이딩 윈도우 직선 피팅
@@ -479,168 +493,169 @@ public:
     // 출력:
     //   LineFit {m, b}: x = m*y + b 형태의 직선 파라미터
     // ─────────────────────────────────────────────────────────────────────
-    LineFit fitLaneFromBEV(const Mat& bev_binary, bool& ok, cv::Mat* dbg_out = nullptr) {
-        ok = false;
+  LineFit fitLaneFromBEV(const Mat & bev_binary, bool & ok, cv::Mat * dbg_out = nullptr)
+  {
+    ok = false;
 
-        const int h = bev_binary.rows, w = bev_binary.cols;
+    const int h = bev_binary.rows, w = bev_binary.cols;
 
         // ── 1) corridor 범위 계산 ───────────────────────────────────────
         // 현재 차선 모드의 ref_ratio로 기준 x(ref_x_)를 결정하고
         // corridor_width만큼 좌우로 탐색 범위를 제한한다.
-        float ref_ratio = std::clamp(getActiveRefRatio(), 0.0f, 1.0f);
-        ref_x_ = static_cast<int>(std::round(ref_ratio * w));
+    float ref_ratio = std::clamp(getActiveRefRatio(), 0.0f, 1.0f);
+    ref_x_ = static_cast<int>(std::round(ref_ratio * w));
 
-        int x_min = std::max(0,   ref_x_ - static_cast<int>(config_.corridor_width / 2));
-        int x_max = std::min(w-1, ref_x_ + static_cast<int>(config_.corridor_width / 2));
-        int histW = x_max - x_min + 1;
-        if (histW <= 2) { x_min = 0; x_max = w - 1; histW = w; }
+    int x_min = std::max(0, ref_x_ - static_cast<int>(config_.corridor_width / 2));
+    int x_max = std::min(w - 1, ref_x_ + static_cast<int>(config_.corridor_width / 2));
+    int histW = x_max - x_min + 1;
+    if (histW <= 2) {x_min = 0; x_max = w - 1; histW = w;}
 
         // ── 2) 가중 히스토그램으로 시작점(base_x) 결정 ─────────────────
         // 하단 70% 영역에서 corridor 범위의 열별 픽셀 합 계산 후,
         // ref_x_ 근처에 가우시안 가중치를 곱하여 최댓값 열을 시작점으로 선택
-        int y_start_hist = std::min(std::max(static_cast<int>(h * 0.3), 0), h - 1);
-        cv::Mat hist_roi = bev_binary(cv::Rect(x_min, y_start_hist, histW, h - y_start_hist));
-        cv::Mat nz       = (hist_roi > 0);
-        cv::Mat colSum;
-        cv::reduce(nz, colSum, 0, cv::REDUCE_SUM, CV_32S);
+    int y_start_hist = std::min(std::max(static_cast<int>(h * 0.3), 0), h - 1);
+    cv::Mat hist_roi = bev_binary(cv::Rect(x_min, y_start_hist, histW, h - y_start_hist));
+    cv::Mat nz = (hist_roi > 0);
+    cv::Mat colSum;
+    cv::reduce(nz, colSum, 0, cv::REDUCE_SUM, CV_32S);
 
-        std::vector<int> hist(histW);
-        for (int i = 0; i < histW; ++i) hist[i] = colSum.at<int>(0, i) / 255;
+    std::vector<int> hist(histW);
+    for (int i = 0; i < histW; ++i) {hist[i] = colSum.at<int>(0, i) / 255;}
 
         // sigma_ratio가 작을수록 ref 근처만 강하게 밀어줌(보수적 시작점)
         // w_min을 0.3~0.7 사이로 조절하면 멀리 있어도 완전히 무시되지 않음
-        const float sigma_ratio  = (config_.ref_hist_sigma_ratio > 0.f) ?
-                                    config_.ref_hist_sigma_ratio : 0.35f;
-        const float w_min        = (config_.ref_hist_min_weight > 0.f &&
-                                    config_.ref_hist_min_weight < 1.f) ?
-                                    config_.ref_hist_min_weight : 0.50f;
-        const float sigma_pixels = std::max(1.f, sigma_ratio * static_cast<float>(histW));
-        const float two_sigma2   = 2.f * sigma_pixels * sigma_pixels;
+    const float sigma_ratio = (config_.ref_hist_sigma_ratio > 0.f) ?
+      config_.ref_hist_sigma_ratio : 0.35f;
+    const float w_min = (config_.ref_hist_min_weight > 0.f &&
+      config_.ref_hist_min_weight < 1.f) ?
+      config_.ref_hist_min_weight : 0.50f;
+    const float sigma_pixels = std::max(1.f, sigma_ratio * static_cast<float>(histW));
+    const float two_sigma2 = 2.f * sigma_pixels * sigma_pixels;
 
-        std::vector<float> weighted_hist(histW);
-        for (int i = 0; i < histW; ++i) {
-            int   x = x_min + i;
-            float d = static_cast<float>(std::abs(x - ref_x_));
-            float w = w_min + (1.f - w_min) * std::exp(-(d*d) / two_sigma2);
-            weighted_hist[i] = static_cast<float>(hist[i]) * w;
-        }
+    std::vector<float> weighted_hist(histW);
+    for (int i = 0; i < histW; ++i) {
+      int   x = x_min + i;
+      float d = static_cast<float>(std::abs(x - ref_x_));
+      float w = w_min + (1.f - w_min) * std::exp(-(d * d) / two_sigma2);
+      weighted_hist[i] = static_cast<float>(hist[i]) * w;
+    }
 
-        int base_x   = ref_x_;
-        auto it_w    = std::max_element(weighted_hist.begin(), weighted_hist.end());
-        const float bestValW = (it_w != weighted_hist.end()) ? *it_w : 0.f;
+    int base_x = ref_x_;
+    auto it_w = std::max_element(weighted_hist.begin(), weighted_hist.end());
+    const float bestValW = (it_w != weighted_hist.end()) ? *it_w : 0.f;
 
-        if (bestValW > 0.f) {
-            int base_x_rel = static_cast<int>(std::distance(weighted_hist.begin(), it_w));
-            base_x = x_min + base_x_rel;
-        } else {
+    if (bestValW > 0.f) {
+      int base_x_rel = static_cast<int>(std::distance(weighted_hist.begin(), it_w));
+      base_x = x_min + base_x_rel;
+    } else {
             // 신호 없음: 이전 프레임 피팅 하단값 또는 ref_x_ 사용
-            if (has_prev_center_fit_) {
-                int x_prev_bottom = static_cast<int>(prev_center_fit_.m * (h - 1) + prev_center_fit_.b);
-                base_x = std::clamp(x_prev_bottom, x_min, x_max);
-            } else {
-                base_x = std::clamp(ref_x_, x_min, x_max);
-            }
-        }
+      if (has_prev_center_fit_) {
+        int x_prev_bottom = static_cast<int>(prev_center_fit_.m * (h - 1) + prev_center_fit_.b);
+        base_x = std::clamp(x_prev_bottom, x_min, x_max);
+      } else {
+        base_x = std::clamp(ref_x_, x_min, x_max);
+      }
+    }
 
         // ── 3) 디버그 캔버스 준비 ───────────────────────────────────────
-        cv::Mat dbg;
-        if (dbg_out) {
-            cv::cvtColor(bev_binary, dbg, cv::COLOR_GRAY2BGR);
+    cv::Mat dbg;
+    if (dbg_out) {
+      cv::cvtColor(bev_binary, dbg, cv::COLOR_GRAY2BGR);
             // ref_x_: 초록 수직선
-            cv::line(dbg, {ref_x_, 0}, {ref_x_, h-1}, {0, 255, 0}, 1);
+      cv::line(dbg, {ref_x_, 0}, {ref_x_, h - 1}, {0, 255, 0}, 1);
             // corridor 좌우 경계: 파란 점선
-            for (int y = 0; y < h; y += 6) {
-                dbg.at<cv::Vec3b>(y, std::clamp(x_min, 0, w-1)) = {255, 0, 0};
-                dbg.at<cv::Vec3b>(y, std::clamp(x_max, 0, w-1)) = {255, 0, 0};
-            }
+      for (int y = 0; y < h; y += 6) {
+        dbg.at<cv::Vec3b>(y, std::clamp(x_min, 0, w - 1)) = {255, 0, 0};
+        dbg.at<cv::Vec3b>(y, std::clamp(x_max, 0, w - 1)) = {255, 0, 0};
+      }
             // base_x: 보라색 마커
-            cv::line(dbg, {base_x, h-1}, {base_x, h-21}, {255, 0, 255}, 2);
-        }
+      cv::line(dbg, {base_x, h - 1}, {base_x, h - 21}, {255, 0, 255}, 2);
+    }
 
         // ── 4) 슬라이딩 윈도우로 포인트 수집 ──────────────────────────
         // 아래에서 위로 윈도우를 올리며 non-zero 픽셀을 수집한다.
         // minpix 이상 발견 시 다음 윈도우 중심을 평균 x로 재조정(recenter)한다.
-        const int    num_windows = std::max(2, config_.sliding_window_num_windows);
-        const int    margin      = std::max(5, config_.sliding_window_margin);
-        const size_t minpix      = std::max<size_t>(5, config_.sliding_window_minpix);
-        const int    win_h       = h / num_windows;
+    const int    num_windows = std::max(2, config_.sliding_window_num_windows);
+    const int    margin = std::max(5, config_.sliding_window_margin);
+    const size_t minpix = std::max<size_t>(5, config_.sliding_window_minpix);
+    const int    win_h = h / num_windows;
 
-        vector<Point> pts;
-        int x_current = base_x;
+    vector<Point> pts;
+    int x_current = base_x;
 
-        for (int i = 0; i < num_windows; ++i) {
-            int y_low  = std::max(0, h - (i+1)*win_h);
-            int y_high = std::min(h, h -  i   *win_h);
-            int xl     = std::max(0, x_current - margin);
-            int xr     = std::min(w, x_current + margin);
+    for (int i = 0; i < num_windows; ++i) {
+      int y_low = std::max(0, h - (i + 1) * win_h);
+      int y_high = std::min(h, h - i * win_h);
+      int xl = std::max(0, x_current - margin);
+      int xr = std::min(w, x_current + margin);
 
-            vector<int> xs;  // 이번 윈도우에서 발견된 픽셀들의 x 좌표
-            for (int yy = y_low; yy < y_high; ++yy) {
-                const uchar* row = bev_binary.ptr<uchar>(yy);
-                for (int xx = xl; xx < xr; ++xx) {
-                    if (row[xx] > 0) { pts.emplace_back(xx, yy); xs.push_back(xx); }
-                }
-            }
-
-            bool recentered = false;
-            if (xs.size() >= minpix) {
-                // 픽셀이 충분하면 다음 윈도우 중심을 평균 x로 재조정
-                int sum = std::accumulate(xs.begin(), xs.end(), 0);
-                x_current  = sum / static_cast<int>(xs.size());
-                recentered = true;
-            }
-            x_current = std::min(std::max(x_current, x_min), x_max);
-
-            if (dbg_out) {
-                cv::Scalar boxColor = recentered ? cv::Scalar(0,255,255) : cv::Scalar(0,165,255);
-                cv::rectangle(dbg, {xl, y_low}, {xr, y_high}, boxColor, 2);
-                cv::drawMarker(dbg, {x_current, (y_low+y_high)/2},
-                               {255,255,255}, cv::MARKER_CROSS, 10, 1);
-            }
+      vector<int> xs;        // 이번 윈도우에서 발견된 픽셀들의 x 좌표
+      for (int yy = y_low; yy < y_high; ++yy) {
+        const uchar * row = bev_binary.ptr<uchar>(yy);
+        for (int xx = xl; xx < xr; ++xx) {
+          if (row[xx] > 0) {pts.emplace_back(xx, yy); xs.push_back(xx);}
         }
+      }
+
+      bool recentered = false;
+      if (xs.size() >= minpix) {
+                // 픽셀이 충분하면 다음 윈도우 중심을 평균 x로 재조정
+        int sum = std::accumulate(xs.begin(), xs.end(), 0);
+        x_current = sum / static_cast<int>(xs.size());
+        recentered = true;
+      }
+      x_current = std::min(std::max(x_current, x_min), x_max);
+
+      if (dbg_out) {
+        cv::Scalar boxColor = recentered ? cv::Scalar(0, 255, 255) : cv::Scalar(0, 165, 255);
+        cv::rectangle(dbg, {xl, y_low}, {xr, y_high}, boxColor, 2);
+        cv::drawMarker(dbg, {x_current, (y_low + y_high) / 2},
+          {255, 255, 255}, cv::MARKER_CROSS, 10, 1);
+      }
+    }
 
         // ── 5) 포인트 부족 시 이전 프레임 값으로 fallback ──────────────
-        if (pts.size() < 10) {
-            ok = false;
-            if (dbg_out && has_prev_center_fit_) {
-                float m = prev_center_fit_.m, b = prev_center_fit_.b;
-                cv::line(dbg,
-                         {std::clamp((int)(m*0    + b), 0, w-1), 0},
-                         {std::clamp((int)(m*(h-1)+ b), 0, w-1), h-1},
-                         {200, 200, 200}, 1);
-            }
-            if (dbg_out) *dbg_out = std::move(dbg);
-            return has_prev_center_fit_ ? prev_center_fit_ : LineFit{0.f, 0.f};
-        }
+    if (pts.size() < 10) {
+      ok = false;
+      if (dbg_out && has_prev_center_fit_) {
+        float m = prev_center_fit_.m, b = prev_center_fit_.b;
+        cv::line(dbg,
+          {std::clamp((int)(m * 0 + b), 0, w - 1), 0},
+          {std::clamp((int)(m * (h - 1) + b), 0, w - 1), h - 1},
+          {200, 200, 200}, 1);
+      }
+      if (dbg_out) {*dbg_out = std::move(dbg);}
+      return has_prev_center_fit_ ? prev_center_fit_ : LineFit{0.f, 0.f};
+    }
 
         // ── 6) 최소자승 직선 피팅: x = m*y + b (SVD 방식) ─────────────
         // 설계행렬 X(Nx2): 각 행 = [y_i, 1]
         // 타겟벡터 Y(Nx1): 각 행 = x_i
         // 해 θ = [m, b] 를 SVD로 수치 안정적으로 계산
-        Mat X(pts.size(), 2, CV_32F), Y(pts.size(), 1, CV_32F);
-        for (size_t i = 0; i < pts.size(); ++i) {
-            float yf = static_cast<float>(pts[i].y);
-            X.at<float>(i, 0) = yf;
-            X.at<float>(i, 1) = 1.f;
-            Y.at<float>(i, 0) = static_cast<float>(pts[i].x);
-        }
-        Mat coeff;
-        solve(X, Y, coeff, DECOMP_SVD);
+    Mat X(pts.size(), 2, CV_32F), Y(pts.size(), 1, CV_32F);
+    for (size_t i = 0; i < pts.size(); ++i) {
+      float yf = static_cast<float>(pts[i].y);
+      X.at<float>(i, 0) = yf;
+      X.at<float>(i, 1) = 1.f;
+      Y.at<float>(i, 0) = static_cast<float>(pts[i].x);
+    }
+    Mat coeff;
+    solve(X, Y, coeff, DECOMP_SVD);
 
-        LineFit fit{ coeff.at<float>(0,0), coeff.at<float>(1,0) };
-        ok = true;
+    LineFit fit{coeff.at<float>(0, 0), coeff.at<float>(1, 0)};
+    ok = true;
 
         // ── 7) 최종 선 디버그 표시 ─────────────────────────────────────
-        if (dbg_out) {
-            float m = fit.m, b = fit.b;
-            cv::line(dbg,
-                     {std::clamp((int)(m*0    + b), 0, w-1), 0},
-                     {std::clamp((int)(m*(h-1)+ b), 0, w-1), h-1},
-                     {0, 255, 0}, 2);
-            *dbg_out = std::move(dbg);
-        }
-        return fit;
+    if (dbg_out) {
+      float m = fit.m, b = fit.b;
+      cv::line(dbg,
+        {std::clamp((int)(m * 0 + b), 0, w - 1), 0},
+        {std::clamp((int)(m * (h - 1) + b), 0, w - 1), h - 1},
+        {0, 255, 0}, 2);
+      *dbg_out = std::move(dbg);
     }
+    return fit;
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // (5) 기준선 대비 오프셋 계산
@@ -652,86 +667,90 @@ public:
     //   + : 중앙선이 기준선보다 오른쪽 (차량이 우측 편향 → 좌조향 필요)
     //   - : 중앙선이 기준선보다 왼쪽
     // ─────────────────────────────────────────────────────────────────────
-    float calcOffsetFromCenterLine(const LineFit& lf, int bev_width) const {
+  float calcOffsetFromCenterLine(const LineFit & lf, int bev_width) const
+  {
         // 근거리 우선 샘플링: BEV 높이의 30% 및 80% 지점
-        float y1 = bev_size_.height * 0.3f;
-        float y2 = bev_size_.height * 0.8f;
+    float y1 = bev_size_.height * 0.3f;
+    float y2 = bev_size_.height * 0.8f;
 
-        float x1     = lf.m * y1 + lf.b;
-        float x2     = lf.m * y2 + lf.b;
-        float x_mean = 0.5f * (x1 + x2);
+    float x1 = lf.m * y1 + lf.b;
+    float x2 = lf.m * y2 + lf.b;
+    float x_mean = 0.5f * (x1 + x2);
 
-        float ref_ratio = std::clamp(getActiveRefRatio(), 0.0f, 1.0f);
-        float x_ref     = ref_ratio * static_cast<float>(bev_width);
+    float ref_ratio = std::clamp(getActiveRefRatio(), 0.0f, 1.0f);
+    float x_ref = ref_ratio * static_cast<float>(bev_width);
 
-        return (x_mean - x_ref);
-    }
+    return  x_mean - x_ref;
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // ROI 사다리꼴 마스크 생성
     // roi_*_ 좌표로 정의된 사다리꼴 내부를 흰색(255)으로 채운 마스크를 반환한다.
     // ─────────────────────────────────────────────────────────────────────
-    Mat trapezoidMask(Size sz) const {
-        Mat mask(sz, CV_8UC1, Scalar(0));
-        int cx = frame_width_ / 2;
-        Point pts[1][4] = {{
-            Point(cx - roi_top_width_/2,    roi_top_y_),    // 좌상
-            Point(cx + roi_top_width_/2,    roi_top_y_),    // 우상
-            Point(cx + roi_bottom_width_/2, roi_bottom_y_), // 우하
-            Point(cx - roi_bottom_width_/2, roi_bottom_y_)  // 좌하
-        }};
-        const Point* ppt[1] = { pts[0] };
-        int npt[] = {4};
-        fillPoly(mask, ppt, npt, 1, Scalar(255));
-        return mask;
-    }
+  Mat trapezoidMask(Size sz) const
+  {
+    Mat mask(sz, CV_8UC1, Scalar(0));
+    int cx = frame_width_ / 2;
+    Point pts[1][4] = {{
+      Point(cx - roi_top_width_ / 2, roi_top_y_),           // 좌상
+      Point(cx + roi_top_width_ / 2, roi_top_y_),           // 우상
+      Point(cx + roi_bottom_width_ / 2, roi_bottom_y_),     // 우하
+      Point(cx - roi_bottom_width_ / 2, roi_bottom_y_)      // 좌하
+    }};
+    const Point * ppt[1] = {pts[0]};
+    int npt[] = {4};
+    fillPoly(mask, ppt, npt, 1, Scalar(255));
+    return mask;
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // ROI 사다리꼴 디버그 시각화
     // 원본 프레임 위에 ROI 사다리꼴 외곽선(빨강) + 반투명 오버레이를 그린다.
     // ─────────────────────────────────────────────────────────────────────
-    void drawROIPolygon(Mat& frame) const {
-        int cx = frame_width_ / 2;
-        vector<Point> pts = {
-            Point(cx - roi_top_width_/2,    roi_top_y_),
-            Point(cx + roi_top_width_/2,    roi_top_y_),
-            Point(cx + roi_bottom_width_/2, roi_bottom_y_),
-            Point(cx - roi_bottom_width_/2, roi_bottom_y_)
-        };
-        polylines(frame, pts, true, Scalar(0, 0, 255), 2);
+  void drawROIPolygon(Mat & frame) const
+  {
+    int cx = frame_width_ / 2;
+    vector<Point> pts = {
+      Point(cx - roi_top_width_ / 2, roi_top_y_),
+      Point(cx + roi_top_width_ / 2, roi_top_y_),
+      Point(cx + roi_bottom_width_ / 2, roi_bottom_y_),
+      Point(cx - roi_bottom_width_ / 2, roi_bottom_y_)
+    };
+    polylines(frame, pts, true, Scalar(0, 0, 255), 2);
 
         // 반투명 빨간색 채우기 (20% 알파)
-        Mat overlay = frame.clone();
-        fillPoly(overlay, vector<vector<Point>>{pts}, Scalar(0, 0, 255));
-        addWeighted(overlay, 0.2, frame, 0.8, 0, frame);
-    }
+    Mat overlay = frame.clone();
+    fillPoly(overlay, vector<vector<Point>>{pts}, Scalar(0, 0, 255));
+    addWeighted(overlay, 0.2, frame, 0.8, 0, frame);
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // 오프셋 슬라이더 시각화
     // 화면 상단에 오프셋 크기를 막대+점으로 표시하고 모드/값 텍스트를 출력한다.
     // ─────────────────────────────────────────────────────────────────────
-    Mat drawOffsetSlider(const Mat& bgr, float offset_px, LaneMode mode) const {
-        int sw = frame_width_, sh = 50;
-        Mat slider(sh, sw, CV_8UC3, Scalar(50, 50, 50));
-        int cx = sw / 2;
-        line(slider, Point(cx, 0), Point(cx, sh-1), Scalar(150, 150, 150), 1);
+  Mat drawOffsetSlider(const Mat & bgr, float offset_px, LaneMode mode) const
+  {
+    int sw = frame_width_, sh = 50;
+    Mat slider(sh, sw, CV_8UC3, Scalar(50, 50, 50));
+    int cx = sw / 2;
+    line(slider, Point(cx, 0), Point(cx, sh - 1), Scalar(150, 150, 150), 1);
 
         // 오프셋 크기에 비례한 점 위치 표시
-        int dot_x = cx + static_cast<int>(std::round(offset_px));
-        dot_x = std::clamp(dot_x, 0, sw - 1);
-        circle(slider, Point(dot_x, sh/2), 6, Scalar(0, 0, 255), FILLED);
+    int dot_x = cx + static_cast<int>(std::round(offset_px));
+    dot_x = std::clamp(dot_x, 0, sw - 1);
+    circle(slider, Point(dot_x, sh / 2), 6, Scalar(0, 0, 255), FILLED);
 
-        string mode_str   = (mode == LaneMode::CENTER)   ? "Mode: Center"
-                          : (mode == LaneMode::LANE_ONE) ? "Mode: 1-Lane" : "Mode: 2-Lane";
-        string offset_str = "Offset(px): " + std::to_string(static_cast<int>(std::round(offset_px)));
-        putText(slider, mode_str,   Point(10, 20), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(220,220,220), 1);
-        putText(slider, offset_str, Point(10, 42), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(220,220,220), 1);
+    string mode_str = (mode == LaneMode::CENTER) ? "Mode: Center" :
+      (mode == LaneMode::LANE_ONE) ? "Mode: 1-Lane" : "Mode: 2-Lane";
+    string offset_str = "Offset(px): " + std::to_string(static_cast<int>(std::round(offset_px)));
+    putText(slider, mode_str, Point(10, 20), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(220, 220, 220), 1);
+    putText(slider, offset_str, Point(10, 42), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(220, 220, 220), 1);
 
         // 슬라이더를 원본 영상 위에 세로로 이어붙임
-        Mat out;
-        vconcat(slider, bgr, out);
-        return out;
-    }
+    Mat out;
+    vconcat(slider, bgr, out);
+    return out;
+  }
 
   // ─────────────────────────────────────────────────────────────────────
   // 토픽 발행 + 디버그 시각화
@@ -758,8 +777,9 @@ public:
     LineFit fit_frame{0.f, 0.f};
     if (mapped) {
       float dy = P1.y - P0.y;
-      if (std::abs(dy) < 1e-6f)
+      if (std::abs(dy) < 1e-6f) {
         dy = (dy >= 0 ? 1e-6f : -1e-6f);
+      }
       fit_frame.m = (P1.x - P0.x) / dy;
       fit_frame.b = P0.x - fit_frame.m * P0.y;
     }
@@ -782,8 +802,9 @@ public:
     }
 
     // 슬라이딩 윈도우 BEV 디버그 창 표시
-    if (debug_view_ && show_dbg && dbg_from_fit && !dbg_from_fit->empty())
+    if (debug_view_ && show_dbg && dbg_from_fit && !dbg_from_fit->empty()) {
       cv::imshow("SlidingWindows", *dbg_from_fit);
+    }
 
     // 오프셋 슬라이더 창 표시 (debug_lane_view 설정 시)
     // waitKey는 debug_lane_view와 무관하게 호출해야 한다. HighGUI 이벤트 펌프
@@ -807,7 +828,7 @@ public:
   // ─────────────────────────────────────────────────────────────────────
   bool bevLineToFrame(const LineFit & lf, cv::Point2f & p_frame0, cv::Point2f & p_frame1)
   {
-    if (bev_size_.width <= 1 || bev_size_.height <= 1 || H_inv_.empty()) return false;
+    if (bev_size_.width <= 1 || bev_size_.height <= 1 || H_inv_.empty()) {return false;}
 
     float y0 = 0.0f;
     float y1 = static_cast<float>(bev_size_.height - 1);
@@ -834,14 +855,16 @@ public:
     // 회전된 사각형(바퀴 등)을 그리기 위한 헬퍼: center 기준 angle_deg만큼
     // 회전한 (w x h) 크기의 사각형 꼭짓점 4개를 계산해 채운다.
     // ─────────────────────────────────────────────────────────────────────
-    static void fillRotatedRect(cv::Mat& canvas, cv::Point2f center, float w, float h,
-                                 float angle_deg, cv::Scalar color) {
-        cv::RotatedRect rr(center, cv::Size2f(w, h), angle_deg);
-        cv::Point2f pts[4];
-        rr.points(pts);
-        std::vector<cv::Point> poly = { pts[0], pts[1], pts[2], pts[3] };
-        cv::fillConvexPoly(canvas, poly, color, cv::LINE_AA);
-    }
+  static void fillRotatedRect(
+    cv::Mat & canvas, cv::Point2f center, float w, float h,
+    float angle_deg, cv::Scalar color)
+  {
+    cv::RotatedRect rr(center, cv::Size2f(w, h), angle_deg);
+    cv::Point2f pts[4];
+    rr.points(pts);
+    std::vector<cv::Point> poly = {pts[0], pts[1], pts[2], pts[3]};
+    cv::fillConvexPoly(canvas, poly, color, cv::LINE_AA);
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // "Vehicle Dynamics" 디버그 창: 차량 중심(스키매틱) 기준 조향/속도 시각화
@@ -850,70 +873,71 @@ public:
     // 표시하고(뒷바퀴는 고정), 속도는 옆의 숫자+막대 게이지로 표시한다.
     // 정성적 근사 표시이며 물리적으로 보정된 값이 아니다.
     // ─────────────────────────────────────────────────────────────────────
-    cv::Mat drawVehicleDynamicsView() const {
-        const int W = 300, H = 300;
-        cv::Mat canvas(H, W, CV_8UC3, cv::Scalar(30, 30, 30));
+  cv::Mat drawVehicleDynamicsView() const
+  {
+    const int W = 300, H = 300;
+    cv::Mat canvas(H, W, CV_8UC3, cv::Scalar(30, 30, 30));
 
-        const cv::Point center(110, H / 2);
-        const int body_w = 70, body_h = 130;
-        const int wheel_w = 14, wheel_h = 32;
-        const int half_w = body_w / 2, half_h = body_h / 2;
+    const cv::Point center(110, H / 2);
+    const int body_w = 70, body_h = 130;
+    const int wheel_w = 14, wheel_h = 32;
+    const int half_w = body_w / 2, half_h = body_h / 2;
 
         // ── 1) 차체 (위에서 내려다본 모습, 전방 = 위쪽) ─────────────────
-        cv::rectangle(canvas,
+    cv::rectangle(canvas,
                       cv::Rect(center.x - half_w, center.y - half_h, body_w, body_h),
                       cv::Scalar(0, 165, 255), cv::FILLED, cv::LINE_AA);
-        cv::rectangle(canvas,
+    cv::rectangle(canvas,
                       cv::Rect(center.x - half_w, center.y - half_h, body_w, body_h),
                       cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
         // 전방 표시 삼각형
-        std::vector<cv::Point> nose = {
-            {center.x,          center.y - half_h - 12},
-            {center.x - 10,     center.y - half_h + 2},
-            {center.x + 10,     center.y - half_h + 2},
-        };
-        cv::fillConvexPoly(canvas, nose, cv::Scalar(0, 255, 255), cv::LINE_AA);
+    std::vector<cv::Point> nose = {
+      {center.x, center.y - half_h - 12},
+      {center.x - 10, center.y - half_h + 2},
+      {center.x + 10, center.y - half_h + 2},
+    };
+    cv::fillConvexPoly(canvas, nose, cv::Scalar(0, 255, 255), cv::LINE_AA);
 
         // ── 2) 뒷바퀴 (고정, 차체와 평행) ───────────────────────────────
-        fillRotatedRect(canvas, {float(center.x - half_w), float(center.y + half_h - wheel_h/2.f)},
+    fillRotatedRect(canvas, {float(center.x - half_w), float(center.y + half_h - wheel_h / 2.f)},
                          wheel_w, wheel_h, 0.f, cv::Scalar(40, 40, 40));
-        fillRotatedRect(canvas, {float(center.x + half_w), float(center.y + half_h - wheel_h/2.f)},
+    fillRotatedRect(canvas, {float(center.x + half_w), float(center.y + half_h - wheel_h / 2.f)},
                          wheel_w, wheel_h, 0.f, cv::Scalar(40, 40, 40));
 
         // ── 3) 앞바퀴 (조향각만큼 실제로 회전) ───────────────────────────
         // steer_cmd를 그대로 도(degree)처럼 취급해 ±45도 범위로 클램프 후 표시 (실측 변환식 없음)
-        const float steer_deg_display = std::clamp(last_steer_cmd_, -45.f, 45.f);
-        fillRotatedRect(canvas, {float(center.x - half_w), float(center.y - half_h + wheel_h/2.f)},
+    const float steer_deg_display = std::clamp(last_steer_cmd_, -45.f, 45.f);
+    fillRotatedRect(canvas, {float(center.x - half_w), float(center.y - half_h + wheel_h / 2.f)},
                          wheel_w, wheel_h, steer_deg_display, cv::Scalar(0, 255, 255));
-        fillRotatedRect(canvas, {float(center.x + half_w), float(center.y - half_h + wheel_h/2.f)},
+    fillRotatedRect(canvas, {float(center.x + half_w), float(center.y - half_h + wheel_h / 2.f)},
                          wheel_w, wheel_h, steer_deg_display, cv::Scalar(0, 255, 255));
 
-        {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "Steer: %.1f", last_steer_cmd_);
-            putText(canvas, buf, Point(10, H - 34), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1);
-        }
+    {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "Steer: %.1f", last_steer_cmd_);
+      putText(canvas, buf, Point(10, H - 34), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1);
+    }
 
         // ── 4) 속도 게이지 (막대 + 수치) ─────────────────────────────────
-        const int gauge_x = 210, gauge_y = 40, gauge_w = 24, gauge_h = 200;
-        cv::rectangle(canvas, cv::Rect(gauge_x, gauge_y, gauge_w, gauge_h),
+    const int gauge_x = 210, gauge_y = 40, gauge_w = 24, gauge_h = 200;
+    cv::rectangle(canvas, cv::Rect(gauge_x, gauge_y, gauge_w, gauge_h),
                       cv::Scalar(200, 200, 200), 1, cv::LINE_AA);
-        float ratio = std::clamp(last_speed_cmd_ / std::max(1.f, speed_gauge_max_), 0.f, 1.f);
-        int   fill_h = static_cast<int>(std::round(gauge_h * ratio));
-        cv::rectangle(canvas, cv::Rect(gauge_x, gauge_y + gauge_h - fill_h, gauge_w, fill_h),
+    float ratio = std::clamp(last_speed_cmd_ / std::max(1.f, speed_gauge_max_), 0.f, 1.f);
+    int   fill_h = static_cast<int>(std::round(gauge_h * ratio));
+    cv::rectangle(canvas, cv::Rect(gauge_x, gauge_y + gauge_h - fill_h, gauge_w, fill_h),
                       cv::Scalar(0, 255, 0), cv::FILLED);
-        {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "Speed: %.1f", last_speed_cmd_);
-            putText(canvas, buf, Point(gauge_x - 15, gauge_y - 10),
+    {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "Speed: %.1f", last_speed_cmd_);
+      putText(canvas, buf, Point(gauge_x - 15, gauge_y - 10),
                     FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1);
-        }
+    }
 
-        putText(canvas, "Vehicle-centered schematic (approx)", Point(10, H - 10),
+    putText(canvas, "Vehicle-centered schematic (approx)", Point(10, H - 10),
                 FONT_HERSHEY_SIMPLEX, 0.4, Scalar(150, 150, 150), 1);
 
-        return canvas;
-    }
+    return canvas;
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // 차선 변경 성공 감지 및 /lane_change_state 발행
@@ -924,125 +948,129 @@ public:
     //
     // 발행 형식: [변경중여부(0/1), 성공여부(0/1)]
     // ─────────────────────────────────────────────────────────────────────
-    void updateLaneChangeState(bool valid, const LineFit& center_fit, float offset) {
-        const auto feedback = lane_change_tracker_.update(
+  void updateLaneChangeState(bool valid, const LineFit & center_fit, float offset)
+  {
+    const auto feedback = lane_change_tracker_.update(
             valid,
             center_fit.m,
             offset);
 
-        std_msgs::msg::Int32MultiArray st;
-        st.data = {feedback.changing, feedback.success};
-        lane_change_state_pub_->publish(st);
-    }
+    std_msgs::msg::Int32MultiArray st;
+    st.data = {feedback.changing, feedback.success};
+    lane_change_state_pub_->publish(st);
+  }
 
     // 차선 모드에 대응하는 목표 ref 비율(0~1) 반환
-    float getTargetRefForMode(LaneMode m) const {
-        float r;
-        if (m == LaneMode::CENTER) {
+  float getTargetRefForMode(LaneMode m) const
+  {
+    float r;
+    if (m == LaneMode::CENTER) {
             // 중앙 주행: 두 차선 기준값의 중간. 별도 설정 키가 필요 없다.
-            r = 0.5f * (center_reference_lane_one_ + center_reference_lane_two_);
-        } else {
-            r = (m == LaneMode::LANE_ONE) ? center_reference_lane_one_
-                                          : center_reference_lane_two_;
-        }
-        return std::clamp(r, 0.0f, 1.0f);
+      r = 0.5f * (center_reference_lane_one_ + center_reference_lane_two_);
+    } else {
+      r = (m == LaneMode::LANE_ONE) ? center_reference_lane_one_ :
+        center_reference_lane_two_;
     }
+    return std::clamp(r, 0.0f, 1.0f);
+  }
 
     // 스무딩 ON이면 보간 중인 ref 비율, OFF면 목표 비율 즉시 반환
-    float getActiveRefRatio() const {
-        return smooth_enabled_ ? ref_ratio_current_ : getTargetRefForMode(lane_mode_);
-    }
+  float getActiveRefRatio() const
+  {
+    return smooth_enabled_ ? ref_ratio_current_ : getTargetRefForMode(lane_mode_);
+  }
 
     // ref 선형 보간 전환 시작: 현재값 → 새 모드 목표값을 duration 동안 선형 보간
-    void startRefTransition(LaneMode new_mode) {
-        if (!smooth_enabled_) return;
-        ref_ratio_start_       = ref_ratio_current_;
-        ref_ratio_target_      = getTargetRefForMode(new_mode);
-        ref_start_time_        = this->now();
-        ref_transition_active_ = true;
-    }
+  void startRefTransition(LaneMode new_mode)
+  {
+    if (!smooth_enabled_) {return;}
+    ref_ratio_start_ = ref_ratio_current_;
+    ref_ratio_target_ = getTargetRefForMode(new_mode);
+    ref_start_time_ = this->now();
+    ref_transition_active_ = true;
+  }
 
     // 매 프레임 호출하여 ref_ratio_current_를 선형 보간 갱신
-    void updateRefRatio() {
-        if (!smooth_enabled_ || !ref_transition_active_) return;
-        const double t = (this->now() - ref_start_time_).seconds();
-        if (t >= ref_transition_duration_sec_) {
-            ref_ratio_current_     = ref_ratio_target_;
-            ref_transition_active_ = false;
-            return;
-        }
-        const double dur = std::max(1e-6, ref_transition_duration_sec_);
-        const float  a   = static_cast<float>(t / dur);  // 0~1 보간 계수
-        ref_ratio_current_ = ref_ratio_start_ + (ref_ratio_target_ - ref_ratio_start_) * a;
+  void updateRefRatio()
+  {
+    if (!smooth_enabled_ || !ref_transition_active_) {return;}
+    const double t = (this->now() - ref_start_time_).seconds();
+    if (t >= ref_transition_duration_sec_) {
+      ref_ratio_current_ = ref_ratio_target_;
+      ref_transition_active_ = false;
+      return;
     }
-
+    const double dur = std::max(1e-6, ref_transition_duration_sec_);
+    const float  a = static_cast<float>(t / dur);        // 0~1 보간 계수
+    ref_ratio_current_ = ref_ratio_start_ + (ref_ratio_target_ - ref_ratio_start_) * a;
+  }
 
 private:
     // ── ROS 통신 객체 ───────────────────────────────────────────────────
-    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr        image_sub_;
-    rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr mode_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr motor_sub_;
-    rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr              offset_pub_;
-    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr               validity_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr  fit_pub_;
-    rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr    lane_change_state_pub_;
-    rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr              lane_position_pub_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr        image_sub_;
+  rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr mode_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr motor_sub_;
+  rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr              offset_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr               validity_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr  fit_pub_;
+  rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr    lane_change_state_pub_;
+  rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr              lane_position_pub_;
 
     // ── 실측 현재 차선 판정 상태 (인지 기반, 제어 목표와 무관) ──────────
-    int detected_lane_  = -1;  // 확정된 실측 차선 (-1=미확정)
-    int pending_lane_   = -1;  // 디바운스 중인 후보 차선
-    int pending_streak_ = 0;   // 후보 차선 연속 프레임 수
-    static constexpr int   LANE_DETECT_STREAK_NEED_ = 5;           // 확정에 필요한 연속 프레임 수
-    static constexpr float LANE_CLASSIFY_DEADZONE_RATIO_ = 0.05f;  // 애매한 경계 임계값
+  int detected_lane_ = -1;     // 확정된 실측 차선 (-1=미확정)
+  int pending_lane_ = -1;      // 디바운스 중인 후보 차선
+  int pending_streak_ = 0;     // 후보 차선 연속 프레임 수
+  static constexpr int   LANE_DETECT_STREAK_NEED_ = 5;             // 확정에 필요한 연속 프레임 수
+  static constexpr float LANE_CLASSIFY_DEADZONE_RATIO_ = 0.05f;    // 애매한 경계 임계값
 
     // ── 조향/속도 명령 시각화 (정성적 근사, 실측 휠베이스/조향각 보정값 아님) ──
-    float last_steer_cmd_  = 0.f;  // /xycar_motor에서 수신한 마지막 조향 명령
-    float last_speed_cmd_  = 0.f;  // /xycar_motor에서 수신한 마지막 속도 명령
-    float speed_gauge_max_ = 31.f; // 속도 게이지 만땅 기준값 (control.py LANE_DRIVE max_speed와 동일)
+  float last_steer_cmd_ = 0.f;     // /xycar_motor에서 수신한 마지막 조향 명령
+  float last_speed_cmd_ = 0.f;     // /xycar_motor에서 수신한 마지막 속도 명령
+  float speed_gauge_max_ = 31.f;   // 속도 게이지 만땅 기준값 (control.py LANE_DRIVE max_speed와 동일)
 
     // ── 설정 파라미터 ───────────────────────────────────────────────────
-    Config   config_;
-    LaneMode lane_mode_;
-    int frame_width_, frame_height_;
-    int roi_top_width_, roi_bottom_width_;
-    int roi_top_y_,     roi_bottom_y_;
-    float center_reference_lane_one_;
-    float center_reference_lane_two_;
+  Config   config_;
+  LaneMode lane_mode_;
+  int frame_width_, frame_height_;
+  int roi_top_width_, roi_bottom_width_;
+  int roi_top_y_, roi_bottom_y_;
+  float center_reference_lane_one_;
+  float center_reference_lane_two_;
 
     // ── BEV 투시변환 행렬 ───────────────────────────────────────────────
-    cv::Mat  H_;        // 사다리꼴 → BEV 정변환
-    cv::Mat  H_inv_;    // BEV → 원본 프레임 역변환
-    cv::Size bev_size_;
+  cv::Mat  H_;          // 사다리꼴 → BEV 정변환
+  cv::Mat  H_inv_;      // BEV → 원본 프레임 역변환
+  cv::Size bev_size_;
 
     // ── 이전 프레임 fallback 정보 ───────────────────────────────────────
-    LineFit prev_center_fit_{0.f, 0.f};
-    bool    has_prev_center_fit_ = false;
-    float   prev_offset_         = 0.f;
-    int     ref_x_               = 0;
+  LineFit prev_center_fit_{0.f, 0.f};
+  bool    has_prev_center_fit_ = false;
+  float   prev_offset_ = 0.f;
+  int     ref_x_ = 0;
 
     // ── 디버그 제어 ─────────────────────────────────────────────────────
-    int  frame_count_  = 0;
-    int  debug_stride_ = 1;   // 디버그 출력 주기 (1이면 매 프레임)
-    bool debug_view_   = config_.debug_view;
+  int  frame_count_ = 0;
+  int  debug_stride_ = 1;     // 디버그 출력 주기 (1이면 매 프레임)
+  bool debug_view_ = config_.debug_view;
     // false면 보조 차선 디버그 창을 숨기고 SlidingWindows / Mask-Yellow 만 남긴다.
     // debug_view_ 가 false면 이 값과 무관하게 모든 창이 꺼진다.
-    bool debug_lane_view_ = config_.debug_lane_view;
+  bool debug_lane_view_ = config_.debug_lane_view;
     // "Vehicle Dynamics" 창 마지막 표시 시각 (10 Hz 제한용)
-    rclcpp::Time last_dynamics_draw_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_dynamics_draw_{0, 0, RCL_ROS_TIME};
 
     // ── 모드/차선 상태 ──────────────────────────────────────────────────
-    int  current_mode_ = 0;
-    int  current_lane_ = 0;
-    lane_detection::LaneChangeStateTracker lane_change_tracker_;
+  int  current_mode_ = 0;
+  int  current_lane_ = 0;
+  lane_detection::LaneChangeStateTracker lane_change_tracker_;
 
     // ── ref 비율 스무딩 전환 변수 ───────────────────────────────────────
-    bool         smooth_enabled_              = config_.change_ref_smoothly;
-    float        ref_ratio_current_           = 0.f;  // 현재 보간 중인 ref 비율
-    float        ref_ratio_start_             = 0.f;  // 전환 시작 시점 값
-    float        ref_ratio_target_            = 0.f;  // 전환 목표 값
-    rclcpp::Time ref_start_time_;
-    bool         ref_transition_active_       = false;
-    double       ref_transition_duration_sec_ = 0.8;  // 전환 소요 시간 (초)
+  bool         smooth_enabled_ = config_.change_ref_smoothly;
+  float        ref_ratio_current_ = 0.f;              // 현재 보간 중인 ref 비율
+  float        ref_ratio_start_ = 0.f;                // 전환 시작 시점 값
+  float        ref_ratio_target_ = 0.f;               // 전환 목표 값
+  rclcpp::Time ref_start_time_;
+  bool         ref_transition_active_ = false;
+  double       ref_transition_duration_sec_ = 0.8;    // 전환 소요 시간 (초)
 
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1056,49 +1084,50 @@ private:
     // (5) 오프셋 계산 및 히스토리 갱신
     // (6) 토픽 발행 + 디버그 출력
     // ─────────────────────────────────────────────────────────────────────
-    void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg) {
-        if (smooth_enabled_) updateRefRatio();
+  void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg)
+  {
+    if (smooth_enabled_) {updateRefRatio();}
 
         // (0) ROS 이미지 → OpenCV BGR Mat
-        cv_bridge::CvImagePtr cv_ptr;
-        try {
-            cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
-        } catch (cv_bridge::Exception& e) {
-            RCLCPP_ERROR(get_logger(), "cv_bridge 오류: %s", e.what());
-            return;
-        }
-        Mat frame = cv_ptr->image;
-        if (frame.empty()) return;
+    cv_bridge::CvImagePtr cv_ptr;
+    try {
+      cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+    } catch (cv_bridge::Exception & e) {
+      RCLCPP_ERROR(get_logger(), "cv_bridge 오류: %s", e.what());
+      return;
+    }
+    Mat frame = cv_ptr->image;
+    if (frame.empty()) {return;}
 
         // ROI 사다리꼴 디버그 시각화 (debug_lane_view 설정 시)
-        if (debug_view_ && debug_lane_view_) {
-            Mat frame_roi_vis = frame.clone();
-            drawROIPolygon(frame_roi_vis);
-            imshow("ROI Polygon", frame_roi_vis);
-        }
+    if (debug_view_ && debug_lane_view_) {
+      Mat frame_roi_vis = frame.clone();
+      drawROIPolygon(frame_roi_vis);
+      imshow("ROI Polygon", frame_roi_vis);
+    }
 
         // (1) 노란 차선 전처리: ROI 내 노란 엣지 픽셀 추출
-        Mat yellow_edges = preprocessYellow(frame);
-        if (debug_view_) imshow("Mask-Yellow", yellow_edges);
+    Mat yellow_edges = preprocessYellow(frame);
+    if (debug_view_) {imshow("Mask-Yellow", yellow_edges);}
 
         // (2) BEV 투시변환: 사다리꼴 → 직사각형
-        Mat bev_yellow;
-        warpPerspective(yellow_edges, bev_yellow, H_, bev_size_,
+    Mat bev_yellow;
+    warpPerspective(yellow_edges, bev_yellow, H_, bev_size_,
                         INTER_LINEAR, BORDER_CONSTANT, Scalar(0));
-        if (debug_view_ && debug_lane_view_) imshow("BEV-Yellow", bev_yellow);
+    if (debug_view_ && debug_lane_view_) {imshow("BEV-Yellow", bev_yellow);}
 
         // (3) 노이즈 억제 준비: corridor 범위 및 디버그 캔버스 준비
-        const int y_start_chk = (int)std::round(bev_size_.height * 0.0f);
-        const int y_end_chk   = (int)std::round(bev_size_.height * 1.0f);
-        int x_min = ref_x_ - static_cast<int>(config_.corridor_width / 2);
-        int x_max = ref_x_ + static_cast<int>(config_.corridor_width / 2);
+    const int y_start_chk = (int)std::round(bev_size_.height * 0.0f);
+    const int y_end_chk = (int)std::round(bev_size_.height * 1.0f);
+    int x_min = ref_x_ - static_cast<int>(config_.corridor_width / 2);
+    int x_max = ref_x_ + static_cast<int>(config_.corridor_width / 2);
 
-        cv::Mat bev_color;
-        cv::cvtColor(bev_yellow, bev_color, cv::COLOR_GRAY2BGR);
+    cv::Mat bev_color;
+    cv::cvtColor(bev_yellow, bev_color, cv::COLOR_GRAY2BGR);
 
         // (3-a) 수평 노이즈 행 억제
-        cv::Mat bev_clean;
-        bool suppressed = suppressHorizontalNoiseRows(
+    cv::Mat bev_clean;
+    bool suppressed = suppressHorizontalNoiseRows(
             bev_yellow, bev_clean,
             config_.horizontal_noise_width,
             config_.horizontal_band_corridor_ratio_thresh,
@@ -1107,15 +1136,15 @@ private:
             config_.horizontal_noise_extra_pad,
             x_min, x_max,
             &bev_color
-        );
-        if (suppressed) bev_yellow = bev_clean;
+    );
+    if (suppressed) {bev_yellow = bev_clean;}
 
         // (3-b) 수직 열 밴드 노이즈 억제
         // vertical_noise_peak_use_corridor: true면 corridor만, false면 전체 폭 검사
-        int cx_min = config_.vertical_noise_peak_use_corridor ? x_min : 0;
-        int cx_max = config_.vertical_noise_peak_use_corridor ? x_max : (bev_size_.width - 1);
-        cv::Mat bev_clean2;
-        bool suppressed2 = suppressColumnBands(
+    int cx_min = config_.vertical_noise_peak_use_corridor ? x_min : 0;
+    int cx_max = config_.vertical_noise_peak_use_corridor ? x_max : (bev_size_.width - 1);
+    cv::Mat bev_clean2;
+    bool suppressed2 = suppressColumnBands(
             bev_yellow, bev_clean2,
             cx_min, cx_max,
             y_start_chk, y_end_chk,
@@ -1124,35 +1153,36 @@ private:
             config_.vertical_noise_peak_ratio,
             config_.vertical_noise_extra_pad_half_width,
             &bev_color
-        );
-        if (suppressed2) bev_yellow = bev_clean2;
+    );
+    if (suppressed2) {bev_yellow = bev_clean2;}
 
-        if (debug_view_ && debug_lane_view_)
-            cv::imshow("BEV-Yellow (suppressed rows/columns in red)", bev_color);
+    if (debug_view_ && debug_lane_view_) {
+      cv::imshow("BEV-Yellow (suppressed rows/columns in red)", bev_color);
+    }
 
         // (4) 슬라이딩 윈도우 직선 피팅
-        frame_count_++;
-        bool show_dbg = debug_view_ && (frame_count_ % debug_stride_ == 0);
+    frame_count_++;
+    bool show_dbg = debug_view_ && (frame_count_ % debug_stride_ == 0);
 
-        bool valid = false;
-        cv::Mat dbg;
-        LineFit center_fit = fitLaneFromBEV(bev_yellow, valid, show_dbg ? &dbg : nullptr);
+    bool valid = false;
+    cv::Mat dbg;
+    LineFit center_fit = fitLaneFromBEV(bev_yellow, valid, show_dbg ? &dbg : nullptr);
 
-        std_msgs::msg::Bool validity_msg;
-        validity_msg.data = valid;
-        validity_pub_->publish(validity_msg);
+    std_msgs::msg::Bool validity_msg;
+    validity_msg.data = valid;
+    validity_pub_->publish(validity_msg);
 
         // (5) 오프셋 계산 및 히스토리 갱신
-        float offset = 0.f;
-        if (valid) {
-            offset               = calcOffsetFromCenterLine(center_fit, bev_size_.width);
-            prev_offset_         = offset;
-            prev_center_fit_     = center_fit;
-            has_prev_center_fit_ = true;
-        } else {
+    float offset = 0.f;
+    if (valid) {
+      offset = calcOffsetFromCenterLine(center_fit, bev_size_.width);
+      prev_offset_ = offset;
+      prev_center_fit_ = center_fit;
+      has_prev_center_fit_ = true;
+    } else {
             // 피팅 실패: 이전 오프셋 재사용, 데이터 없으면 0
-            offset = has_prev_center_fit_ ? prev_offset_ : 0.f;
-        }
+      offset = has_prev_center_fit_ ? prev_offset_ : 0.f;
+    }
 
     // (6) 토픽 발행 + 디버그 출력
     const auto publication_policy = publishAndDebug(
@@ -1166,8 +1196,8 @@ private:
     // 실측 현재 차선 판정 및 /lane_position 발행 (제어 목표와 무관한 인지값)
     if (publication_policy.publish_lane_position) {
       updateAndPublishDetectedLane(center_fit, true);
-  }
     }
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // 노란 중앙선의 BEV 가로 위치 비율로 현재 차선을 분류한다.
@@ -1179,53 +1209,55 @@ private:
     //
     // 반환값: 0=Lane1, 1=Lane2, -1=판정 보류
     // ─────────────────────────────────────────────────────────────────────
-    int classifyLaneFromRatio(float x_ratio) const {
+  int classifyLaneFromRatio(float x_ratio) const
+  {
         // 기본 주행이 중앙이 되면서 중앙도 하나의 상태가 되었다. 세 기준값
         // (1차선 / 중앙 / 2차선) 중 가장 가까운 것을 고른다.
-        const float mid = 0.5f * (center_reference_lane_one_ + center_reference_lane_two_);
+    const float mid = 0.5f * (center_reference_lane_one_ + center_reference_lane_two_);
         // 반환 규약(README): 0=중앙, 1=왼쪽(1차선), 2=오른쪽(2차선)
-        const float d[3] = {
-            std::fabs(x_ratio - mid),                         // 0 = 중앙
-            std::fabs(x_ratio - center_reference_lane_one_),  // 1 = 왼쪽
-            std::fabs(x_ratio - center_reference_lane_two_),  // 2 = 오른쪽
-        };
+    const float d[3] = {
+      std::fabs(x_ratio - mid),                               // 0 = 중앙
+      std::fabs(x_ratio - center_reference_lane_one_),        // 1 = 왼쪽
+      std::fabs(x_ratio - center_reference_lane_two_),        // 2 = 오른쪽
+    };
 
-        int best = 0, second = 1;
-        for (int i = 1; i < 3; ++i) if (d[i] < d[best]) best = i;
-        for (int i = 0; i < 3; ++i)
-            if (i != best && (second == best || d[i] < d[second])) second = i;
+    int best = 0, second = 1;
+    for (int i = 1; i < 3; ++i) {if (d[i] < d[best]) {best = i;}}
+    for (int i = 0; i < 3; ++i) {
+      if (i != best && (second == best || d[i] < d[second])) {second = i;}}
 
         // 1·2등이 비슷하면 경계라 판정을 보류한다. 애매한 프레임이 우연히
         // 연속으로 한쪽에 쏠려 잘못 확정되는 것을 막는다.
-        if (std::fabs(d[second] - d[best]) < LANE_CLASSIFY_DEADZONE_RATIO_) return -1;
-        return best;
-    }
+    if (std::fabs(d[second] - d[best]) < LANE_CLASSIFY_DEADZONE_RATIO_) {return -1;}
+    return best;
+  }
 
     // 디바운스(5프레임 연속) 후 detected_lane_ 갱신 및 /lane_position 발행
-    void updateAndPublishDetectedLane(const LineFit& fit_bev, bool fit_ok) {
-        if (fit_ok && bev_size_.width > 0 && bev_size_.height > 0) {
-            const float x_near =
-                fit_bev.m * static_cast<float>(bev_size_.height - 1) + fit_bev.b;
-            const float ratio = x_near / static_cast<float>(bev_size_.width);
-            const int   cls   = classifyLaneFromRatio(ratio);
+  void updateAndPublishDetectedLane(const LineFit & fit_bev, bool fit_ok)
+  {
+    if (fit_ok && bev_size_.width > 0 && bev_size_.height > 0) {
+      const float x_near =
+        fit_bev.m * static_cast<float>(bev_size_.height - 1) + fit_bev.b;
+      const float ratio = x_near / static_cast<float>(bev_size_.width);
+      const int   cls = classifyLaneFromRatio(ratio);
 
-            if (cls == -1) {
+      if (cls == -1) {
                 // 애매한 프레임: 디바운스 상태를 건드리지 않고 이전 상태 유지
-            } else if (cls == pending_lane_) {
-                ++pending_streak_;
-            } else {
-                pending_lane_   = cls;
-                pending_streak_ = 1;
-            }
-            if (pending_streak_ >= LANE_DETECT_STREAK_NEED_) {
-                detected_lane_ = pending_lane_;
-            }
-        }
-
-        std_msgs::msg::Int16 msg;
-        msg.data = static_cast<int16_t>(detected_lane_);
-        lane_position_pub_->publish(msg);
+      } else if (cls == pending_lane_) {
+        ++pending_streak_;
+      } else {
+        pending_lane_ = cls;
+        pending_streak_ = 1;
+      }
+      if (pending_streak_ >= LANE_DETECT_STREAK_NEED_) {
+        detected_lane_ = pending_lane_;
+      }
     }
+
+    std_msgs::msg::Int16 msg;
+    msg.data = static_cast<int16_t>(detected_lane_);
+    lane_position_pub_->publish(msg);
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // 모드/차선 변경 콜백
@@ -1237,60 +1269,65 @@ private:
     //   - 변경 모드(5) 진입 시 즉시 갱신
     //   - 비(非)3 → 3 전환 시에도 갱신
     // ─────────────────────────────────────────────────────────────────────
-    void modeCallback(const std_msgs::msg::Int32MultiArray::SharedPtr msg) {
-        if (msg->data.size() < 2) return;
+  void modeCallback(const std_msgs::msg::Int32MultiArray::SharedPtr msg)
+  {
+    if (msg->data.size() < 2) {return;}
 
-        const int new_mode  = msg->data[0];
-        const int new_lane  = msg->data[1];
-        const int prev_mode = current_mode_;
-        const bool valid_lane_target = new_lane >= 0 && new_lane <= 2;
+    const int new_mode = msg->data[0];
+    const int new_lane = msg->data[1];
+    const int prev_mode = current_mode_;
+    const bool valid_lane_target = new_lane >= 0 && new_lane <= 2;
 
-        lane_change_tracker_.handleCommand(new_mode, new_lane);
+    lane_change_tracker_.handleCommand(new_mode, new_lane);
 
-        current_mode_ = new_mode;
-        current_lane_ = new_lane;
+    current_mode_ = new_mode;
+    current_lane_ = new_lane;
 
         // lane_mode_ 갱신: 모드 5이거나 비3 → 3 전환 시에만 업데이트
-        LaneMode old_lane_mode = lane_mode_;
-        if (valid_lane_target &&
-            (new_mode == 5 || (prev_mode != 3 && new_mode == 3))) {
-            lane_mode_ = (new_lane == 1) ? LaneMode::LANE_ONE
-                       : (new_lane == 2) ? LaneMode::LANE_TWO
-                                         : LaneMode::CENTER;
-        }
+    LaneMode old_lane_mode = lane_mode_;
+    if (valid_lane_target &&
+      (new_mode == 5 || (prev_mode != 3 && new_mode == 3)))
+    {
+      lane_mode_ = (new_lane == 1) ? LaneMode::LANE_ONE :
+        (new_lane == 2) ? LaneMode::LANE_TWO :
+        LaneMode::CENTER;
+    }
 
         // 차선 모드가 실제로 변경되었으면 ref 전환 시작
-        if (smooth_enabled_ && lane_mode_ != old_lane_mode)
-            startRefTransition(lane_mode_);
-
+    if (smooth_enabled_ && lane_mode_ != old_lane_mode) {
+      startRefTransition(lane_mode_);
     }
+
+  }
 
     // ─────────────────────────────────────────────────────────────────────
     // 모터 명령 콜백: /xycar_motor [조향각, 속도] 수신
     //
     // "Vehicle Dynamics" 디버그 창 시각화에만 사용한다 (제어에 개입하지 않음).
     // ─────────────────────────────────────────────────────────────────────
-    void motorCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
-        if (msg->data.empty()) return;
-        last_steer_cmd_ = msg->data[0];
-        if (msg->data.size() >= 2) last_speed_cmd_ = msg->data[1];
+  void motorCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
+  {
+    if (msg->data.empty()) {return;}
+    last_steer_cmd_ = msg->data[0];
+    if (msg->data.size() >= 2) {last_speed_cmd_ = msg->data[1];}
 
         // 카메라 프레임 콜백을 기다리지 않고 /xycar_motor 수신마다 갱신하되,
         // 표시 주기는 10 Hz 로 제한한다. /xycar_motor 는 제어 주기(50 Hz)로
         // 들어오는데, 그때마다 imshow + waitKey 를 부르면 같은 스레드에서 도는
         // 차선 인지가 그만큼 밀린다. 실측(bag): 카메라 18.8 Hz 입력에
         // /lane_offset 은 5.9 Hz 출력. 눈으로 보는 창은 10 Hz 면 충분하다.
-        if (debug_view_) {
-            const rclcpp::Time stamp = this->get_clock()->now();
-            if (last_dynamics_draw_.nanoseconds() == 0 ||
-                (stamp - last_dynamics_draw_).seconds() >= 0.1 ||
-                (stamp - last_dynamics_draw_).seconds() < 0.0) {
-                last_dynamics_draw_ = stamp;
-                cv::imshow("Vehicle Dynamics", drawVehicleDynamicsView());
-                cv::waitKey(1);
-            }
-        }
+    if (debug_view_) {
+      const rclcpp::Time stamp = this->get_clock()->now();
+      if (last_dynamics_draw_.nanoseconds() == 0 ||
+        (stamp - last_dynamics_draw_).seconds() >= 0.1 ||
+        (stamp - last_dynamics_draw_).seconds() < 0.0)
+      {
+        last_dynamics_draw_ = stamp;
+        cv::imshow("Vehicle Dynamics", drawVehicleDynamicsView());
+        cv::waitKey(1);
+      }
     }
+  }
 };
 
 
@@ -1303,69 +1340,76 @@ private:
 // 설치된 package share의 JSON을 기본으로 사용한다.
 // 다른 설정이 필요하면 --config <경로>로 명시적으로 override할 수 있다.
 // ─────────────────────────────────────────────────────────────────────────────
-static std::string resolve_config_path(int argc, char** argv) {
-    std::vector<std::string> config_path_candidates;
-    try {
-        config_path_candidates.push_back(
-            ament_index_cpp::get_package_share_directory("lane_detection")
-            + "/lane_detection_parameter.json");
-    } catch (const std::exception&) {
+static std::string resolve_config_path(int argc, char ** argv)
+{
+  std::vector<std::string> config_path_candidates;
+  try {
+    config_path_candidates.push_back(
+            ament_index_cpp::get_package_share_directory("lane_detection") +
+              "/lane_detection_parameter.json");
+  } catch (const std::exception &) {
         // An explicit --config remains available in source-only execution.
-    }
+  }
 
-    auto readable = [](const std::string& p) {
-        if (p.empty()) return false;
-        std::ifstream f(p);
-        return f.is_open();
+  auto readable = [](const std::string & p) {
+      if (p.empty()) {return false;}
+      std::ifstream f(p);
+      return f.is_open();
     };
 
-    for (int i = 1; i + 1 < argc; ++i) {
-        if (std::string(argv[i]) == "--config") {
-            const std::string p = argv[i + 1];
-            if (readable(p)) return p;
-            throw std::runtime_error("--config로 지정된 파일을 열 수 없습니다: " + p);
-        }
+  for (int i = 1; i + 1 < argc; ++i) {
+    if (std::string(argv[i]) == "--config") {
+      const std::string p = argv[i + 1];
+      if (readable(p)) {return p;}
+      throw std::runtime_error("--config로 지정된 파일을 열 수 없습니다: " + p);
     }
+  }
 
-    for (const auto& candidate : config_path_candidates)
-        if (readable(candidate)) return candidate;
+  for (const auto & candidate : config_path_candidates) {
+    if (readable(candidate)) {return candidate;}}
 
-    std::string msg = "lane_detection_parameter.json을 찾지 못했습니다. 확인한 경로:";
-    for (const auto& candidate : config_path_candidates) msg += "\n  - " + candidate;
-    msg += "\n--config <경로> 로 직접 지정할 수 있습니다.";
-    throw std::runtime_error(msg);
+  std::string msg = "lane_detection_parameter.json을 찾지 못했습니다. 확인한 경로:";
+  for (const auto & candidate : config_path_candidates) {
+    msg += "\n  - " + candidate;
+  }
+  msg += "\n--config <경로> 로 직접 지정할 수 있습니다.";
+  throw std::runtime_error(msg);
 }
 
 
-int main(int argc, char** argv) {
-    std::cout << "OpenCV 버전: " << CV_VERSION << std::endl;
-    rclcpp::init(argc, argv);
+int main(int argc, char ** argv)
+{
+  std::cout << "OpenCV 버전: " << CV_VERSION << std::endl;
+  rclcpp::init(argc, argv);
 
-    Config config;
-    try {
-        const std::string config_path = resolve_config_path(argc, argv);
-        std::cout << "[lane_detection] 파라미터 파일: " << config_path << std::endl;
-        config = load_config(config_path);
-    } catch (const std::exception& e) {
-        std::cerr << "[lane_detection] 설정 로드 실패: " << e.what() << std::endl;
-        rclcpp::shutdown();
-        return 1;
-    }
+  Config config;
+  try {
+    const std::string config_path = resolve_config_path(argc, argv);
+    std::cout << "[lane_detection] 파라미터 파일: " << config_path << std::endl;
+    config = load_config(config_path);
+  } catch (const std::exception & e) {
+    std::cerr << "[lane_detection] 설정 로드 실패: " << e.what() << std::endl;
+    rclcpp::shutdown();
+    return 1;
+  }
 
     // 로드된 설정값 확인용 로그 (config 수정이 실제로 반영됐는지 디버깅용)
-    std::cout << "===== [lane_detection] 로드된 Config 값 =====" << std::endl;
-    std::cout << "[Config] debug_view = " << config.debug_view << std::endl;
-    std::cout << "[Config] debug_lane_view = " << config.debug_lane_view << std::endl;
-    std::cout << "[Config] roi_top_width_coefficient = " << config.roi_top_width_coefficient << std::endl;
-    std::cout << "[Config] roi_bottom_width_coefficient = " << config.roi_bottom_width_coefficient << std::endl;
-    std::cout << "[Config] sliding_window_num_windows = " << config.sliding_window_num_windows << std::endl;
-    std::cout << "[Config] sliding_window_margin = " << config.sliding_window_margin << std::endl;
-    std::cout << "[Config] sliding_window_minpix = " << config.sliding_window_minpix << std::endl;
-    std::cout << "[Config] corridor_width = " << config.corridor_width << std::endl;
-    std::cout << "==============================================" << std::endl;
+  std::cout << "===== [lane_detection] 로드된 Config 값 =====" << std::endl;
+  std::cout << "[Config] debug_view = " << config.debug_view << std::endl;
+  std::cout << "[Config] debug_lane_view = " << config.debug_lane_view << std::endl;
+  std::cout << "[Config] roi_top_width_coefficient = " << config.roi_top_width_coefficient <<
+    std::endl;
+  std::cout << "[Config] roi_bottom_width_coefficient = " << config.roi_bottom_width_coefficient <<
+    std::endl;
+  std::cout << "[Config] sliding_window_num_windows = " << config.sliding_window_num_windows <<
+    std::endl;
+  std::cout << "[Config] sliding_window_margin = " << config.sliding_window_margin << std::endl;
+  std::cout << "[Config] sliding_window_minpix = " << config.sliding_window_minpix << std::endl;
+  std::cout << "[Config] corridor_width = " << config.corridor_width << std::endl;
+  std::cout << "==============================================" << std::endl;
 
-    auto node = std::make_shared<LaneDetector>(config);
-    rclcpp::spin(node);
-    rclcpp::shutdown();
-    return 0;
+  auto node = std::make_shared<LaneDetector>(config);
+  rclcpp::spin(node);
+  rclcpp::shutdown();
+  return 0;
 }

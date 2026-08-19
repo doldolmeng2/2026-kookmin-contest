@@ -59,7 +59,7 @@ def make_class_visualization(frame, labels):
 
 
 class PIDNetRunner:
-    def __init__(self, model_path, device='auto', width=640, height=360, lane_classes=(1,)):
+    def __init__(self, model_path, device='auto', width=640, height=360, lane_classes=(1, 2, 3)):
         path=Path(model_path).expanduser().resolve()
         if not path.is_file(): raise FileNotFoundError(f'PIDNet checkpoint not found: {path}')
         name=('cuda' if torch.cuda.is_available() else 'cpu') if device=='auto' else device
@@ -101,7 +101,7 @@ class PIDNetInferenceNode(Node):
         self.show_visualization=bool(self.declare_parameter('show_visualization',False).value)
         self.roi_crop_visualization=bool(self.declare_parameter('roi_crop_visualization',True).value)
         width=self.declare_parameter('model_width',640).value; height=self.declare_parameter('model_height',360).value
-        lane_classes=self.declare_parameter('lane_classes',[1]).value
+        lane_classes=self.declare_parameter('lane_classes',[1, 2, 3]).value
         warmup_on_start=bool(self.declare_parameter('warmup_on_start',True).value)
         self.runner=PIDNetRunner(model_path,device,width,height,lane_classes)
         if warmup_on_start:

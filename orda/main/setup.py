@@ -32,6 +32,7 @@ setup(
     entry_points={
         'console_scripts': [
             'main_node = main.main:main',
+            'udp_motor_bridge = main.udp_motor_bridge:main',
             'kmu_preflight = main.preflight:main',
         ],
     },

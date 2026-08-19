@@ -7,8 +7,9 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition, UnlessCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 MISSION_TEST_PROFILES = (
@@ -58,6 +59,14 @@ def _is_production_preflight(action):
     )
 
 
+def _is_production_udp_bridge(action):
+    return (
+        isinstance(action, Node)
+        and action.node_package == 'main'
+        and action.node_executable == 'udp_motor_bridge'
+    )
+
+
 def generate_launch_description():
     test_profile_arg = DeclareLaunchArgument(
         'test_profile',
@@ -79,11 +88,12 @@ def generate_launch_description():
 
     test_profile = LaunchConfiguration('test_profile')
     live_drive = LaunchConfiguration('live_drive')
+    udp_motor_bridge = LaunchConfiguration('udp_motor_bridge')
     mode = LaunchConfiguration('mode')
     show_debug = LaunchConfiguration('show_debug')
     main_parameters = [{
         'mode': mode,
-        'test_profile': test_profile,
+        'test_profile': ParameterValue(test_profile, value_type=str),
         'show_debug': show_debug,
     }]
 
@@ -103,6 +113,14 @@ def generate_launch_description():
         output='screen',
         parameters=main_parameters,
         condition=IfCondition(live_drive),
+    )
+    live_motor_bridge = Node(
+        package='main', executable='udp_motor_bridge', name='udp_motor_bridge',
+        output='screen',
+        condition=IfCondition(PythonExpression([
+            "'", live_drive, "' == 'true' and '", udp_motor_bridge,
+            "' == 'true'",
+        ])),
     )
     isolated_preflight = Node(
         package='main',
@@ -138,6 +156,8 @@ def generate_launch_description():
             replaced_main_nodes += 1
         elif _is_production_preflight(action):
             entities.extend((isolated_preflight, live_preflight))
+        elif _is_production_udp_bridge(action):
+            entities.append(live_motor_bridge)
         else:
             entities.append(action)
 

@@ -251,7 +251,8 @@ def test_object_class_mapping_is_loaded_from_installed_yaml():
 
 
 def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
-    tree = ast.parse(BAG_TEST_LAUNCH.read_text(encoding="utf-8"))
+    source = BAG_TEST_LAUNCH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
     node_calls = [
         node
         for node in ast.walk(tree)
@@ -269,11 +270,19 @@ def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
     assert packages == {
         "main",
         "rubbercone",
-        "image_resize",
         "lane_detection",
         "object_detection",
         "segmentation_tools",
     }
+    assert "image_resize" not in packages
+    assert "executable='resize_node'" not in source
+    assert "'input_topic': '/resized_image'" in source
+    assert not {
+        "xycar_cam", "xycar_lidar", "xycar_ultrasonic"
+    }.intersection(packages)
+    assert "default_value='false'" in source
+    assert "'udp_motor_bridge', default_value='false'" in source
+    assert "' == 'true' and '" in source
 
     main_call = next(
         call
@@ -292,6 +301,7 @@ def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
     assert remappings == [
         ("xycar_motor", "/kmu_main_offline/xycar_motor")
     ]
+    assert "'/xycar_motor'" not in source
 
     assert not any(
         isinstance(node, ast.Call)
