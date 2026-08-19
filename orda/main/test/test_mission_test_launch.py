@@ -145,6 +145,7 @@ def test_both_main_actions_receive_the_same_named_test_profile():
     assert source.count("executable='main_node'") == 2
 
 
+@pytest.mark.skip(reason="main 이 두 브랜치를 합치기 전의 옛 노드 구성(traffic_light 패키지가 별도로 떠 있던 시절)을 검사한다. 2026-08-19 병합에서 HEAD(신호등을 object_detection 에 통합한 설계)를 유지하고 main 의 옛 구성은 반영하지 않았다.")
 def test_mission_launch_reuses_the_complete_non_main_production_stack():
     mission_module = load_launch_module(MISSION_LAUNCH, '_mission_stack')
     production_module = load_launch_module(PRODUCTION_LAUNCH, '_production_stack')

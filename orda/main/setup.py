@@ -14,6 +14,7 @@ setup(
        'launch/module_drive.py',     # 지금 만든 파일
        'launch/module_drive_bag_test.py',
        'launch/module_drive_mission_test.py',
+       'launch/object_detection_test.py',
     ]),
     ],
     install_requires=['setuptools'],

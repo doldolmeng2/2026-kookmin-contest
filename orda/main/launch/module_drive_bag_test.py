@@ -10,8 +10,12 @@
 #   - main_node의 모터 명령을 /bag_test/xycar_motor로 격리
 #
 # 시작되는 노드:
-#   main_node, traffic_node, rubbercone_node,
-#   resize_node, lane_node, object_node
+#   main_node, rubbercone_node,
+#   resize_node, lane_node, object_yolo_node, object_node
+#
+# 신호등 인식은 traffic_light 패키지(traffic_node)가 아니라 object_detection
+# 패키지(object_yolo_node.py + object_node)가 직접 한다. traffic_node를 같이
+# 띄우면 /traffic_boxes 퍼블리셔가 겹친다 — 절대 같이 띄우지 말 것.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -165,12 +169,6 @@ def generate_launch_description():
         }],
         remappings=[('xycar_motor', '/bag_test/xycar_motor')],
     )
-    traffic_node = Node(
-        package='traffic_light',
-        executable='traffic_node',
-        name='traffic_node',
-        output='screen',
-    )
     rubbercone_node = Node(
         package='rubbercone',
         executable='rubbercone_node',
@@ -241,7 +239,6 @@ def generate_launch_description():
         rubbercone_enable_gui_arg,
         object_enable_gui_arg,
         main_node,
-        traffic_node,
         rubbercone_node,
         resize_node,
         lane_node,

@@ -11,11 +11,17 @@ find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(OpenCV REQUIRED)
+# cv_bridge(4.5.4 기준 빌드)와 ABI 가 다른 /usr/local 의 OpenCV 4.11 이 잡히지
+# 않도록 버전을 고정한다. classifyLight() 의 cv::dnn::readNet(light_cls.onnx) 는
+# 4.5.4 에서 문제없이 검증됐다(object_detection.cpp 참고) — 4.11 이 필요했던 건
+# best.onnx YOLO 검출기 쪽인데 그건 use_external_yolo_=true 로 이미 꺼져 있다.
+# 자세한 이유는 image_resize/CMakeLists.txt 참고.
+find_package(OpenCV REQUIRED PATHS /usr/lib/x86_64-linux-gnu/cmake/opencv4 NO_DEFAULT_PATH)
 find_package(cv_bridge REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 
 add_executable(object_node src/object_detection.cpp)
-ament_target_dependencies(object_node rclcpp std_msgs sensor_msgs cv_bridge)
+ament_target_dependencies(object_node rclcpp std_msgs sensor_msgs cv_bridge ament_index_cpp)
 
 target_include_directories(object_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -35,11 +41,8 @@ install(PROGRAMS
 
 install(FILES
   best.onnx
-  best_simplified.onnx
+  light_cls.onnx
   DESTINATION share/${PROJECT_NAME}/model)
-
-install(DIRECTORY config
-  DESTINATION share/${PROJECT_NAME})
 
 install(DIRECTORY include/ DESTINATION include)
 

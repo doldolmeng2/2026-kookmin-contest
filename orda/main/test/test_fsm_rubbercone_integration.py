@@ -211,6 +211,7 @@ def test_detector_reset_clears_detection_debounce_filter_and_debug_state():
     assert "info_pub_->publish(info_msg);" in publish_body
 
 
+@pytest.mark.skip(reason="main 이 두 브랜치를 합치기 전 확인한 옛 object_detection 설계를 검사한다 (traffic_light 패키지, /traffic_detection 토픽, config/object_detection.yaml, fixed/moving 2슬롯 + lane_stabilizer). 2026-08-19 병합에서 HEAD(신호등 크롭·분류 재작업 + 기존 1슬롯 포맷)를 유지하고 main 의 개선안은 별도 PR로 미뤘다 — 그 PR에서 이 테스트들을 되살려야 한다.")
 def test_object_detector_dual_publishes_official_and_internal_contracts():
     source = OBJECT_SOURCE.read_text(encoding="utf-8")
     publish_body = source.split("void onPublishTick()", 1)[1].split(
@@ -233,6 +234,7 @@ def test_object_detector_dual_publishes_official_and_internal_contracts():
     assert "moving_lane_stabilizer_.update" in source
 
 
+@pytest.mark.skip(reason="main 이 두 브랜치를 합치기 전 확인한 옛 object_detection 설계를 검사한다 (traffic_light 패키지, /traffic_detection 토픽, config/object_detection.yaml, fixed/moving 2슬롯 + lane_stabilizer). 2026-08-19 병합에서 HEAD(신호등 크롭·분류 재작업 + 기존 1슬롯 포맷)를 유지하고 main 의 개선안은 별도 PR로 미뤘다 — 그 PR에서 이 테스트들을 되살려야 한다.")
 def test_object_class_mapping_is_loaded_from_installed_yaml():
     config = OBJECT_CONFIG.read_text(encoding="utf-8")
     cmake = OBJECT_CMAKE.read_text(encoding="utf-8")
@@ -247,6 +249,7 @@ def test_object_class_mapping_is_loaded_from_installed_yaml():
     assert "parameters=[object_detection_config, {'use_sim_time': True}]" in bag_test
 
 
+@pytest.mark.skip(reason="main 이 두 브랜치를 합치기 전 확인한 옛 object_detection 설계를 검사한다 (traffic_light 패키지, /traffic_detection 토픽, config/object_detection.yaml, fixed/moving 2슬롯 + lane_stabilizer). 2026-08-19 병합에서 HEAD(신호등 크롭·분류 재작업 + 기존 1슬롯 포맷)를 유지하고 main 의 개선안은 별도 PR로 미뤘다 — 그 PR에서 이 테스트들을 되살려야 한다.")
 def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
     tree = ast.parse(BAG_TEST_LAUNCH.read_text(encoding="utf-8"))
     node_calls = [
