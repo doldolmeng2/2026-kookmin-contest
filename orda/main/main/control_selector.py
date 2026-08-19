@@ -50,11 +50,12 @@ class ControlSelectorConfig:
     끊임없이 튀어나오고 속도가 0으로 리셋됐다.
 
     라바콘 명령(``/rubbercone_info``)은 LiDAR 전용 노드라 카메라 부하와
-    무관하고 10 Hz 로 안정적이므로 0.25초를 유지한다.
+    무관하지만 10 Hz 기준 한 프레임이 약 0.10초라, 2프레임짜리 DDS 지터를
+    끊김으로 보지 않도록 0.35초를 둔다.
     """
 
     max_lane_age_s: float = 0.8
-    max_cone_age_s: float = 0.25
+    max_cone_age_s: float = 0.35
 
     def __post_init__(self) -> None:
         for name, value in (
