@@ -51,13 +51,19 @@ from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
+    object_detection_config = os.path.join(
+        get_package_share_directory('object_detection'),
+        'config',
+        'object_detection.yaml',
+    )
+
     # ── 런치 인수: main_node 초기 모드 ──────────────────────────────────────
     mode_arg = DeclareLaunchArgument(
         'mode',
         default_value='0',
         description=(
-            '초기 모드 번호: 0=INIT, 1=WAIT_TRAFFIC, 2=LANE, 3=CONE, '
-            '4=FIXED, 5=OVERTAKE, 6=SHORTCUT, 7=FINISH, 8=STOP'
+            '초기 모드 번호: 0=WAIT_GREEN, 1=LANE, 2=CONE, '
+            '3=FIXED, 4=OVERTAKE, 5=SHORTCUT'
         )
     )
     mode = LaunchConfiguration('mode')
@@ -152,7 +158,7 @@ def generate_launch_description():
         description=(
             '장애물 검출 디버그 창(CAMERA VIEW / OBJECT DEBUG) 표시 여부. '
             '기본 false. 켜두면 영상 표시가 CPU를 사용해 '
-            '/object_info 와 /lane_offset 이 느려지므로(실측: 카메라 18.8 Hz '
+            '/object_info_raw 와 /lane_offset 이 느려지므로(실측: 카메라 18.8 Hz '
             '입력에 인지 5.9 Hz 출력), 기록 주행·성능 측정 시에는 '
             'object_enable_gui:=false 로 끌 것.'
         )
@@ -202,12 +208,14 @@ def generate_launch_description():
         executable='lane_node',
         name='lane_node',
         output='screen',
+        remappings=[('/mode_info', '/internal/lane_command')],
     )
     object_yolo_node = Node(
         package='object_detection',
         executable='object_yolo_node.py',
         name='object_yolo_node',
         output='screen',
+        parameters=[object_detection_config],
     )
     object_node = Node(
         package='object_detection',

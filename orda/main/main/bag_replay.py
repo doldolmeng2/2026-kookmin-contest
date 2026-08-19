@@ -29,8 +29,7 @@ READ_TOPICS = (
     "/xycar_motor",
     "/scan",
 )
-OPTIONAL_READ_TOPICS = ("/lane_valid",)
-REPLAY_TOPICS = frozenset((*READ_TOPICS, *OPTIONAL_READ_TOPICS))
+REPLAY_TOPICS = frozenset(READ_TOPICS)
 
 EXPECTED_TYPES = {
     "/traffic_detection": "std_msgs/msg/Int32",
@@ -39,17 +38,15 @@ EXPECTED_TYPES = {
     "/mode_info": "std_msgs/msg/Int32MultiArray",
     "/xycar_motor": "std_msgs/msg/Float32MultiArray",
     "/scan": "sensor_msgs/msg/LaserScan",
-    "/lane_valid": "std_msgs/msg/Bool",
 }
 
 _FSM_EVENT_TOPICS = frozenset(
-    {"/traffic_detection", "/rubbercone_info", "/scan", "/lane_valid"}
+    {"/traffic_detection", "/rubbercone_info", "/scan"}
 )
 _MOTION_MODES = frozenset(
     {
         Mode.LANE_DRIVE,
         Mode.CONE_DRIVE,
-        Mode.REJOIN,
         Mode.FIXED_AVOID,
         Mode.OVERTAKE,
         Mode.SHORTCUT,
@@ -57,11 +54,9 @@ _MOTION_MODES = frozenset(
 )
 _ALLOWED_TRANSITIONS = frozenset(
     {
-        (Mode.INIT, Mode.WAIT_GREEN),
         (Mode.WAIT_GREEN, Mode.LANE_DRIVE),
         (Mode.LANE_DRIVE, Mode.CONE_DRIVE),
         (Mode.CONE_DRIVE, Mode.LANE_DRIVE),
-        (Mode.REJOIN, Mode.LANE_DRIVE),  # compatibility-only old bag entry
         (Mode.LANE_DRIVE, Mode.FIXED_AVOID),
         (Mode.FIXED_AVOID, Mode.LANE_DRIVE),
         (Mode.LANE_DRIVE, Mode.OVERTAKE),
@@ -228,21 +223,43 @@ def parse_cone_message(message: Any) -> Dict[str, Any]:
     except TypeError:
         values = []
 
-    if len(values) < 2:
+    if len(values) not in (2, 3, 4):
         return {
             "offset": None,
             "end_flag": None,
             "confidence": None,
+            "entry_ready": None,
             "field_count": len(values),
             "malformed": True,
         }
 
+    try:
+        offset = int(values[0])
+        end_flag = int(values[1])
+        confidence = int(values[2]) if len(values) >= 3 else None
+        entry_ready = int(values[3]) if len(values) == 4 else None
+    except (TypeError, ValueError, OverflowError):
+        return {
+            "offset": None,
+            "end_flag": None,
+            "confidence": None,
+            "entry_ready": None,
+            "field_count": len(values),
+            "malformed": True,
+        }
+
+    malformed = end_flag not in (0, 1)
+    if entry_ready is not None:
+        malformed = malformed or entry_ready not in (0, 1)
+        malformed = malformed or (end_flag == 1 and entry_ready == 1)
+
     return {
-        "offset": int(values[0]),
-        "end_flag": int(values[1]),
-        "confidence": int(values[2]) if len(values) >= 3 else None,
+        "offset": offset,
+        "end_flag": end_flag,
+        "confidence": confidence,
+        "entry_ready": entry_ready,
         "field_count": len(values),
-        "malformed": False,
+        "malformed": malformed,
     }
 
 
@@ -270,14 +287,10 @@ class OfflineBagReplay:
     def __init__(
         self,
         *,
-        start_mode: Mode = Mode.INIT,
-        green_min_consecutive_frames: int = 3,
-        green_min_duration_s: float = 0.0,
+        start_mode: Mode = Mode.WAIT_GREEN,
         cone_entry_config: Optional[ConeEntryConfig] = None,
     ) -> None:
         self.start_mode = Mode(start_mode)
-        self.green_min_consecutive_frames = green_min_consecutive_frames
-        self.green_min_duration_s = green_min_duration_s
         self.using_default_cone_entry_config = cone_entry_config is None
         self.cone_entry_config = cone_entry_config or ConeEntryConfig()
 
@@ -290,8 +303,6 @@ class OfflineBagReplay:
     ) -> Dict[str, Any]:
         fsm = RaceFSM(
             initial_state=self.start_mode,
-            green_min_consecutive_frames=self.green_min_consecutive_frames,
-            green_min_duration_s=self.green_min_duration_s,
             cone_entry_config=self.cone_entry_config,
         )
         context = RaceContext()
@@ -392,7 +403,6 @@ class OfflineBagReplay:
 
             parsed_traffic: Optional[bool] = None
             parsed_cone: Optional[Dict[str, Any]] = None
-            parsed_lane_valid: Optional[bool] = None
             mode_before_trace = fsm.state
 
             if event.topic == "/traffic_detection":
@@ -494,14 +504,6 @@ class OfflineBagReplay:
                 sensor_receipts["scan"] = now
                 scan_timestamps_ns.append(event.timestamp_ns)
 
-            elif event.topic == "/lane_valid":
-                perception_receipts["lane_validity"] = now
-                parsed_lane_valid, warning = parse_traffic_message(event.message)
-                if warning is not None:
-                    warnings.append(
-                        f"{warning} for lane_valid at {event.timestamp_ns} ns"
-                    )
-
             if event.topic in ("/lane_offset", "/mode_info", "/xycar_motor"):
                 if fsm.state is not mode_before_trace:
                     trace_changed_mode_violation = True
@@ -520,16 +522,6 @@ class OfflineBagReplay:
                 ),
                 traffic_message_received_at=(
                     now if event.topic == "/traffic_detection" else None
-                ),
-                lane_valid=(
-                    event.topic == "/lane_valid"
-                    and parsed_lane_valid is True
-                ),
-                lane_valid_received_at=(
-                    now
-                    if event.topic == "/lane_valid"
-                    and parsed_lane_valid is not None
-                    else None
                 ),
                 cone_detected=(
                     event.topic == "/rubbercone_info"
@@ -558,6 +550,14 @@ class OfflineBagReplay:
                     and parsed_cone is not None
                     and not parsed_cone["malformed"]
                     and parsed_cone["end_flag"] is not None
+                    else None
+                ),
+                cone_entry_ready=(
+                    bool(parsed_cone["entry_ready"])
+                    if event.topic == "/rubbercone_info"
+                    and parsed_cone is not None
+                    and not parsed_cone["malformed"]
+                    and parsed_cone["entry_ready"] in (0, 1)
                     else None
                 ),
                 cone_message_received_at=(
@@ -898,17 +898,13 @@ class OfflineBagReplay:
 
     @staticmethod
     def _should_evaluate(mode: Mode, topic: str) -> bool:
-        # Trace-only topics do not create mission event edges. In WAIT_TRAFFIC,
-        # only a new traffic record may advance/reset the green debouncer; this
-        # prevents one cached Bool from being counted again by unrelated data.
+        # Trace-only topics do not create mission event edges. In WAIT_GREEN,
+        # Only a new stable traffic record may advance WAIT_GREEN; unrelated
+        # records must never reuse a cached semantic signal.
         if topic not in _FSM_EVENT_TOPICS:
             return False
         if mode is Mode.WAIT_GREEN:
             return topic == "/traffic_detection"
-        if mode is Mode.REJOIN:
-            return topic == "/lane_valid"
-        if topic == "/lane_valid":
-            return False
         return True
 
     @staticmethod
@@ -938,15 +934,6 @@ class OfflineBagReplay:
                 warnings.append(
                     f"unexpected type for {topic}: expected {expected}, got {actual}"
                 )
-        for topic in OPTIONAL_READ_TOPICS:
-            if topic not in topic_types:
-                continue
-            expected = EXPECTED_TYPES[topic]
-            actual = topic_types[topic]
-            if actual != expected:
-                warnings.append(
-                    f"unexpected type for {topic}: expected {expected}, got {actual}"
-                )
         return warnings
 
     @staticmethod
@@ -956,7 +943,7 @@ class OfflineBagReplay:
             "absence of unsupported Mode transitions",
         ]
         if "/traffic_detection" in topic_types:
-            scope.append("WAIT_TRAFFIC debounce using recorded traffic code edges")
+            scope.append("WAIT_GREEN transition using stable traffic code edges")
         if "/rubbercone_info" in topic_types:
             scope.append("rubbercone candidate/end event timing")
         if "/rubbercone_info" in topic_types and "/scan" in topic_types:
@@ -966,10 +953,6 @@ class OfflineBagReplay:
         if "/rubbercone_info" in topic_types:
             scope.append(
                 "CONE_DRIVE to LANE_DRIVE on a fresh rubbercone 0-to-1 session"
-            )
-        if "/lane_valid" in topic_types:
-            scope.append(
-                "legacy REJOIN to LANE_DRIVE on fresh lane-validity edges"
             )
         if "/scan" in topic_types:
             scope.append("recorded scan receipt gap statistics")
@@ -984,8 +967,6 @@ class OfflineBagReplay:
             "lane validity or lane detector performance from lane_offset",
             "motor adapter behavior or live vehicle motion",
         ]
-        if "/lane_valid" not in topic_types:
-            scope.append("legacy REJOIN to LANE_DRIVE lane-validity debounce")
         if "/traffic_detection" not in topic_types:
             scope.append("recorded start-green debounce")
         if "/rubbercone_info" not in topic_types:

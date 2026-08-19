@@ -18,7 +18,7 @@ BAG_TEST_LAUNCH = ORDA_ROOT / "main" / "launch" / "module_drive_bag_test.py"
 PRODUCTION_LAUNCH = ORDA_ROOT / "main" / "launch" / "module_drive.py"
 
 PROFILE_MODES = {
-    "wait_traffic": Mode.WAIT_TRAFFIC,
+    "wait_green": Mode.WAIT_GREEN,
     "lane": Mode.LANE_DRIVE,
     "lane_one": Mode.LANE_DRIVE,
     "lane_two": Mode.LANE_DRIVE,
@@ -51,7 +51,7 @@ COMPLETION_PROFILES = [
 
 
 def test_race_profile_is_a_noop_and_preserves_normal_startup_contract():
-    fsm = RaceFSM(initial_state=Mode.INIT)
+    fsm = RaceFSM(initial_state=Mode.WAIT_GREEN)
     context = RaceContext()
     runtime = RaceRuntimeAdapter(fsm=fsm, context=context)
 
@@ -59,9 +59,13 @@ def test_race_profile_is_a_noop_and_preserves_normal_startup_contract():
 
     assert runtime.fsm is fsm
     assert runtime.context is context
-    assert runtime.fsm.state is Mode.INIT
+    assert runtime.fsm.state is Mode.WAIT_GREEN
     assert runtime.context.state_entered_at is None
-    assert runtime.step(10.0).transition.target is Mode.WAIT_GREEN
+    assert runtime.step(10.0).transition.changed is False
+
+
+def test_old_wait_traffic_profile_name_is_only_an_input_alias():
+    assert parse_test_profile("wait_traffic") is MissionTestProfile.WAIT_GREEN
 
 
 @pytest.mark.parametrize("profile", list(PROFILE_MODES))
@@ -128,7 +132,6 @@ def test_bootstrap_discards_cached_sensor_perception_and_action_state():
     runtime.record_scan(9.0)
     runtime.record_lane_offset(4, 9.0)
     runtime.record_cone_message([5, 0, 90], 9.0)
-    runtime.record_lane_validity(True, 9.0)
     runtime.record_traffic(True, 9.0)
     runtime.record_route_traffic(
         RouteTrafficSignal.LEFT,
@@ -144,7 +147,6 @@ def test_bootstrap_discards_cached_sensor_perception_and_action_state():
     assert cycle.observation.sensor_received_at == {}
     assert cycle.observation.perception_received_at == {}
     assert cycle.observation.cone_message_received_at is None
-    assert cycle.observation.lane_valid_received_at is None
     assert cycle.observation.traffic_message_received_at is None
     assert cycle.observation.route_traffic_received_at is None
     assert cycle.observation.lane_change_received_at is None

@@ -67,10 +67,7 @@ def cone_observation(now, *, end_flag=False, confidence=90):
 
 
 def test_initial_green_starts_lap_one_without_incrementing_completed_laps():
-    fsm = RaceFSM(
-        initial_state=Mode.WAIT_GREEN,
-        green_min_consecutive_frames=1,
-    )
+    fsm = RaceFSM(initial_state=Mode.WAIT_GREEN)
     context = RaceContext(state_entered_at=1.0)
 
     transition = fsm.step(

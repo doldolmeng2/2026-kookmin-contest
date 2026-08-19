@@ -160,7 +160,7 @@ class ControlSelector:
                 )
             return self._stop(reason)
 
-        if mode in (Mode.INIT, Mode.WAIT_GREEN, Mode.FINISH, Mode.STOP):
+        if mode in (Mode.WAIT_GREEN, Mode.FINISH, Mode.STOP):
             return self._stop(f"{mode.value} requires stop")
 
         return self._stop(f"{mode.value} controller not implemented")
