@@ -18,8 +18,8 @@ if (( $# > 1 )); then
     exit 2
 fi
 
-if [[ ! -f /opt/ros/humble/setup.bash ]]; then
-    echo "ROS Humble setup not found: /opt/ros/humble/setup.bash" >&2
+if [[ ! -f /opt/ros/jazzy/setup.bash ]]; then
+    echo "ROS Jazzy setup not found: /opt/ros/jazzy/setup.bash" >&2
     exit 2
 fi
 if [[ ! -f "${WORKSPACE_ROOT}/install/setup.bash" ]]; then
@@ -33,7 +33,7 @@ fi
 
 # shellcheck disable=SC1091
 set +u
-source /opt/ros/humble/setup.bash
+source /opt/ros/jazzy/setup.bash
 # shellcheck disable=SC1091
 source "${WORKSPACE_ROOT}/install/setup.bash"
 set -u
