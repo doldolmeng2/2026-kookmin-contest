@@ -11,7 +11,9 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(OpenCV REQUIRED)
+# cv_bridge(4.5.4 기준 빌드)와 ABI 가 다른 /usr/local 의 OpenCV 4.11 이 잡히지
+# 않도록 버전을 고정한다. 자세한 이유는 image_resize/CMakeLists.txt 참고.
+find_package(OpenCV REQUIRED PATHS /usr/lib/x86_64-linux-gnu/cmake/opencv4 NO_DEFAULT_PATH)
 find_package(cv_bridge REQUIRED)
 find_package(nlohmann_json REQUIRED)
 

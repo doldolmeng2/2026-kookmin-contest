@@ -148,3 +148,78 @@ def closest_detection(detections: Iterable[Detection]) -> Optional[Detection]:
     """Choose the largest box, matching the existing closest-object policy."""
 
     return max(detections, key=lambda item: item.area, default=None)
+
+
+def crop_with_margin(
+    image: np.ndarray,
+    box: tuple[int, int, int, int],
+    margin: float = 0.15,
+) -> np.ndarray:
+    """신호등 박스에 margin 비율만큼 여백을 붙여 자른다.
+
+    object_detection.cpp 의 classifyLight() 와 자르는 순서·클램핑이 같아야
+    한다. 둘 중 하나만 바뀌면 같은 박스가 노드마다 다른 크롭이 되어, 폴백
+    경로(C++ 직접 분류)와 주 경로(여기)의 판정이 갈린다.
+    """
+
+    x, y, width, height = box
+    grow_x = width * margin * 0.5
+    grow_y = height * margin * 0.5
+    image_height, image_width = image.shape[:2]
+    x1 = int(round(x - grow_x))
+    y1 = int(round(y - grow_y))
+    x2 = int(round(x + width + grow_x))
+    y2 = int(round(y + height + grow_y))
+    x1 = max(0, min(x1, image_width - 1))
+    y1 = max(0, min(y1, image_height - 1))
+    x2 = max(x1 + 1, min(x2, image_width))
+    y2 = max(y1 + 1, min(y2, image_height))
+    return image[y1:y2, x1:x2]
+
+
+def light_blob(crop: np.ndarray, input_size: int = 64) -> np.ndarray:
+    """크롭을 분류기 입력 텐서로 만든다 (정사각 stretch -> RGB -> /255 -> CHW).
+
+    학습 크롭 생성(tools/make_light_crops.py)과 반드시 같은 전처리여야 한다.
+    cv2.dnn.blobFromImage 를 쓰는 건 C++ 폴백 경로와 바이트 단위로 같은 텐서를
+    만들기 위해서다 — 직접 transpose 하면 미묘하게 달라질 여지가 있다.
+    """
+
+    resized = cv2.resize(
+        crop, (input_size, input_size), interpolation=cv2.INTER_CUBIC
+    )
+    return cv2.dnn.blobFromImage(
+        resized,
+        1.0 / 255.0,
+        (input_size, input_size),
+        (0, 0, 0),
+        swapRB=True,
+        crop=False,
+    )
+
+
+def light_geometry_ok(
+    detection: Detection,
+    *,
+    max_aspect: float = 8.0,
+    edge_min_height: int = 20,
+) -> bool:
+    """잘려서 모양이 무너진 신호등 박스인지 본다 (True = 분류해도 되는 모양).
+
+    신호등에 근접하면 하우징이 화면 위로 빠져나가고, 검출기는 보이는 띠만
+    잡는다. 종횡비가 4:1 에서 15:1 까지 무너진 박스를 64x64 정사각으로 늘리면
+    학습 크롭 분포(약 4:1 하우징) 밖이라 분류기가 램프도 없는 띠를 보고 아무
+    클래스나 고른다. 확신도로는 못 거른다 — 그렇게 나온 오답이 0.99 를 넘겼다.
+
+    높이 단독으로는 자르지 않는다. 멀리 있는 신호등은 h 가 10px 대여도 정상이고
+    (이 bag 에서 h<12 인 박스 24개가 전부 정답), 문제가 되는 건 "화면 최상단에
+    붙어 있으면서 납작한" 조합뿐이다.
+    """
+
+    if detection.height <= 0:
+        return False
+    if detection.width / detection.height > max_aspect:
+        return False
+    if detection.y <= 1 and detection.height < edge_min_height:
+        return False
+    return True

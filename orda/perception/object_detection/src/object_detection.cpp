@@ -5,22 +5,34 @@
 //
 // 구독:
 //   /scan              (sensor_msgs/LaserScan)           - LiDAR 거리 데이터 (디버그 표시용)
-//   /resized_image     (sensor_msgs/Image, BGR8)          - 신호등 크롭 분류 원본 + 디버그 영상
+//   /resized_image     (sensor_msgs/Image, BGR8)          - 디버그 영상 + 크롭 분류 폴백 원본
 //   /object_yolo       (std_msgs/Float32MultiArray)       - ONNX Runtime 차량 검출(가장 가까운 1개)
-//   /traffic_boxes     (std_msgs/Float32MultiArray)       - ONNX Runtime 신호등 "위치" 후보 박스(전부)
+//   /traffic_boxes     (std_msgs/Float32MultiArray)       - 신호등 박스 + 크롭 분류 결과(전부)
 //   /lane_fit          (std_msgs/Float32MultiArray [m,b]) - 차선 회귀 결과
 //
-// 신호등 인식은 traffic_node 도, Python 쪽 분류기도 거치지 않고 이 노드가
-// 직접 한다: /traffic_boxes 로 들어오는 박스마다 /resized_image 에서 직접
-// 잘라(ROI 크롭) light_cls.onnx(cv::dnn)로 분류하고, 그 결과를 모아 우선순위
+// 신호등 인식은 traffic_node 를 거치지 않는다. /traffic_boxes 의
+// class_id/confidence 자리에는 object_yolo_node.py 가 **검출에 쓴 바로 그
+// 프레임에서** 박스를 잘라 light_cls.onnx 로 분류한 결과(0=green 1=left_green
+// 2=orange 3=red)와 그 확신도가 실려 온다. 이 노드는 그걸 모아 우선순위
 // (좌회전 > 직진 > 정지) 판정 + 디바운스(debounce_frames 연속)를 계산한다.
 //
-// /traffic_boxes 의 class_id/confidence 는 object_yolo_node.py 검출기가 매긴
-// 값이라 색 판정에는 안 쓴다 — "신호등처럼 생긴 위치" 후보로만 쓰고 실제 색은
-// 위 크롭 분류가 다시 정한다. 검출기의 신호등 클래스 판정은 거리에 따라
-// 뒤집혀 신뢰할 수 없었다(홀드아웃 클래스 정확도 86.9% -> 크롭 분류 98.3%).
-// 분류 확신도가 낮은 박스는 증거로 안 쓴다(light_min_confidence_, 기본 0.90) —
-// 자세한 배경은 README 참고.
+// 크롭·분류를 이 노드에서 하다가 Python 으로 되돌린 이유: 여기서 자를 때
+// 쓰는 last_raw_img_ 는 "가장 최근에 도착한 프레임"이지 그 박스를 만든
+// 프레임이 아니다. 검출기 forward 가 CPU 에서 70ms 대(30fps 기준 2~3프레임)라
+// 신호등에 근접할수록 크롭이 램프 줄을 통째로 비껴갔고, 램프가 안 잡힌
+// 크롭을 분류기가 orange 로 0.99 이상 확신해서 초록불 바로 아래에서 정지(1)
+// 판정이 나왔다. 같은 bag 재현: 같은 프레임이면 orange 최대 0.61(게이트에
+// 걸려 보류), 3프레임 밀리면 0.989, 8프레임이면 0.999.
+//
+// 그래도 classifyLight() 와 light_net_ 은 남겨 뒀다 — class_id 가 음수로
+// 오면(= Python 쪽이 분류기를 못 띄웠으면) 예전처럼 여기서 직접 자른다.
+// 폴백은 프레임이 어긋날 수 있다는 위 한계를 그대로 갖는다.
+//
+// 검출기의 신호등 클래스 판정은 거리에 따라 뒤집혀 신뢰할 수 없었다
+// (홀드아웃 클래스 정확도 86.9% -> 크롭 분류 98.3%). 분류 확신도가 낮은
+// 박스는 증거로 안 쓴다(light_min_confidence_, 기본 0.90). 잘려서 모양이
+// 무너진 박스는 확신도로 못 걸러서 기하 게이트로 따로 자른다
+// (light_max_aspect_, light_edge_min_h_) — 자세한 배경은 README 참고.
 //
 // 발행:
 //   /object_info (std_msgs/Int32MultiArray, 3개 필드) — FSM 이 구독하는
@@ -147,6 +159,22 @@ public:
         // 검증에서 오답과 정답이 확신도로 거의 완전히 갈렸다(정답 25%분위
         // 0.998, 오답 최대 0.889). 자세한 배경은 README 참고.
         light_min_confidence_  = this->declare_parameter<double>("light_min_confidence", 0.90);
+        // ── 신호등 박스 기하 게이트 ─────────────────────────────────────
+        // 신호등에 근접하면 하우징이 화면 위로 빠져나가고, 검출기는 보이는
+        // 띠만 잡는다. 종횡비가 4:1 -> 15:1 까지 무너진 박스를 64x64 정사각
+        // 으로 늘리면 학습 크롭 분포(약 4:1 하우징) 밖이라, 램프도 없는 띠를
+        // 보고 아무 클래스나 고른다. 확신도로는 못 거른다 — 프레임이 어긋난
+        // 크롭에서 나온 오답이 0.99 를 넘겼다.
+        //
+        // bag rosbag2_2026_08_13-13_33_23 의 신호등 검출 391개로 확인:
+        // 이 두 게이트가 걸러낸 박스는 전부 이미 light_min_confidence_ 아래라,
+        // 증거로 쓰이던 박스 343개는 하나도 잃지 않았다. 예전에 기각했던
+        // 종횡비 게이트(2~8:1)는 하한 때문에 정답을 버렸는데 여기는 상한만 둔다.
+        light_max_aspect_      = this->declare_parameter<double>("light_max_aspect", 8.0);
+        // 화면 최상단(y<=1)에 붙은 박스에만 적용하는 최소 높이. 멀리 있는
+        // 신호등은 h 가 10px 대여도 정상이라(같은 bag 에서 h<12 인 24개가 전부
+        // 정답) 높이 단독으로는 자르지 않는다.
+        light_edge_min_h_      = this->declare_parameter<int>("light_edge_min_h", 20);
 
 
         // QoS 프로파일
@@ -484,20 +512,24 @@ private:
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // 신호등 박스 수신 콜백. 박스마다 크롭 분류(classifyLight)를 돌리고,
-    // 그 결과로 표시용 저장(enable_gui 일 때만) + 상태 계산을 여기서 직접
-    // 한다 — traffic_node 도, Python 쪽 분류기도 거치지 않는다.
+    // 신호등 박스 수신 콜백. 표시용 저장(enable_gui 일 때만) + 상태 계산을
+    // 여기서 한다 — traffic_node 는 거치지 않는다.
     //
-    // 메시지 형식: 6개씩 반복 [class_id, confidence, x, y, w, h]. x/y/w/h만
-    // 쓴다 — class_id/confidence 는 object_yolo_node.py 검출기가 매긴 값이라
-    // 신뢰할 수 없다(홀드아웃 클래스 정확도 86.9%, 위치만 100%). 그래서
-    // "신호등처럼 생긴 위치" 후보로만 쓰고, 실제 색 판정은 아래 크롭 분류로
-    // 다시 한다.
+    // 메시지 형식: 6개씩 반복 [class_id, confidence, x, y, w, h]. class_id 와
+    // confidence 는 object_yolo_node.py 가 **검출에 쓴 그 프레임에서** 박스를
+    // 잘라 분류한 결과다(0=green 1=left_green 2=orange 3=red). 검출기가 매긴
+    // 클래스가 아니다 — 그건 거리에 따라 뒤집혀 못 쓴다(홀드아웃 86.9%).
+    // class_id 가 이 범위를 벗어나면 Python 쪽 분류기가 안 떠 있다는 뜻이라,
+    // 예전처럼 여기서 classifyLight() 로 직접 자른다(폴백).
     //
-    // 분류 확신도가 light_min_confidence_ 아래면 그 박스는 증거로 안 쓴다
-    // (raw=0 쪽으로 흘러간다). traffic2~5 bag 검증에서 이 게이트 하나로
-    // 화면 상단에 잘려 붙은 과폭 박스발 오답을 전부 걸렀다 — 자세한 배경은
-    // README 참고.
+    // 게이트 두 단계:
+    //  1) 기하 — 잘려서 모양이 무너진 박스는 분류 결과를 아예 안 본다.
+    //     분류기에 background 클래스가 없어서 램프가 안 잡힌 크롭도 4개 중
+    //     하나를 뱉어야 하고, 그 fallback 이 orange 다(평평한 패치를 넣어도
+    //     orange 가 argmax). orange -> raw=1(정지) 라 초록불 아래에서 선다.
+    //  2) 확신도 — light_min_confidence_ 아래면 증거로 안 쓴다(raw=0 = 보류).
+    //     traffic2~5 bag 검증에서 이 게이트 하나로 오답 26 -> 0 이었고 첫
+    //     정답 시점은 전혀 늦어지지 않았다 — 자세한 배경은 README 참고.
     //
     // 상태 판정 우선순위: 좌회전(3) > 직진(2) > 정지(1) > 없음(0).
     // 좌회전 화살표는 초록 원과 함께 켜지는 경우가 많아, left 를 먼저 봐야
@@ -520,8 +552,44 @@ private:
             cv::Rect box(static_cast<int>(std::lround(x)), static_cast<int>(std::lround(y)),
                          static_cast<int>(std::lround(w)), static_cast<int>(std::lround(h)));
 
+            // (1) 기하 게이트. 발행 쪽(object_yolo_node.py)에서도 같은 판정을
+            // 하지만, 폴백 경로와 예전 발행자를 위해 여기서도 본다.
+            if (box.height <= 0) continue;
+            const double aspect = static_cast<double>(box.width) /
+                                  static_cast<double>(box.height);
+            if (aspect > light_max_aspect_) continue;
+            if (box.y <= 1 && box.height < light_edge_min_h_) continue;
+
+            // (2) 색 판정. 정상 경로는 이미 분류된 값이 실려 온다.
             int index; float score;
-            if (!classifyLight(box, index, score)) continue;
+            const float pre_index = msg->data[i + 0];
+            const float pre_score = msg->data[i + 1];
+            if (std::isfinite(pre_index) && std::isfinite(pre_score) &&
+                pre_index >= 0.f && pre_index <= 3.f) {
+                index = static_cast<int>(std::lround(pre_index));
+                score = pre_score;
+            } else {
+                // Python 쪽 분류기가 안 떠 있다는 뜻이다. 조용히 넘어가면
+                // "동작은 하는데 원래 lag 버그로 조용히 퇴행했다"는 상태를
+                // 아무도 못 알아챈다 — /object_yolo, /traffic_boxes 는 계속
+                // 정상 발행되므로 겉보기엔 시스템이 멀쩡해 보인다.
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 5000,
+                    "신호등 폴백 크롭 분류 사용 중 (Python light_cls.onnx 미로드) "
+                    "— 최신 프레임에서 재크롭이라 프레임 어긋남에 취약합니다.");
+                if (!classifyLight(box, index, score)) {
+                    // 폴백조차 안 되면(light_ok_=false) 신호등 인식이 완전히
+                    // 죽은 것이다 — 이 프레임이 아니라 매 실행마다 계속되는
+                    // 상태이므로 더 크게 알린다.
+                    RCLCPP_ERROR_THROTTLE(
+                        this->get_logger(), *this->get_clock(), 5000,
+                        "신호등 분류기가 Python·C++ 양쪽 다 없어 신호등을 "
+                        "전혀 인식하지 못하고 있습니다 (traffic_state 항상 0).");
+                    continue;
+                }
+            }
+
+            // (3) 확신도 게이트.
             if (score < static_cast<float>(light_min_confidence_)) continue;
 
             results.push_back({box, index, score});
@@ -1202,6 +1270,8 @@ private:
     int    debounce_n_ = 3;   // 신호등 디바운스 프레임 수
     std::string light_classifier_path_;
     double light_crop_margin_    = 0.15;
+    double light_max_aspect_     = 8.0;
+    int    light_edge_min_h_     = 20;
     int    light_input_size_     = 64;
     double light_min_confidence_ = 0.90;
 
