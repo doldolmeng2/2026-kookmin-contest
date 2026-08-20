@@ -48,8 +48,11 @@
 #include <functional>
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include "lane_change_state_tracker.hpp"
 #include "lane_detection/lane_measurement_publication_policy.hpp"
+#include "lane_detection/lane_pipeline_diagnostics.hpp"
+#include "lane_detection/reacquire_histogram.hpp"
 #include "parameter_loader.hpp"
 
 using namespace std;
@@ -97,7 +100,10 @@ public:
     // QoS 프로파일
     // - qos_sensor: 영상/센서처럼 최신성 우선, 유실 허용 (Best Effort)
     // - qos_fast:   수치 토픽용, Best Effort + Volatile (latch 없음)
-    auto qos_sensor = rclcpp::SensorDataQoS().best_effort();
+    // SensorDataQoS()의 기본 깊이는 5다. 마스크가 인지 처리보다 빨리 들어오면
+    // 그만큼 큐에 쌓여 계속 과거 프레임으로 조향하게 되므로 깊이를 1로 두어
+    // 밀린 프레임은 버리고 항상 최신 마스크만 본다.
+    auto qos_sensor = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
     auto qos_fast = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
 
     // PIDNet-S 중앙선 마스크 구독: /lane_segmentation_mask (MONO8, 0 또는 255)
@@ -115,6 +121,8 @@ public:
     debug_view_ = this->declare_parameter<bool>("debug_view", config_.debug_view);
     debug_lane_view_ =
       this->declare_parameter<bool>("debug_lane_view", config_.debug_lane_view);
+    enable_reacquire_full_bev_fallback_ = this->declare_parameter<bool>(
+      "enable_reacquire_full_bev_fallback", false);
     RCLCPP_INFO(
       get_logger(), "디버그 창: debug_view=%s debug_lane_view=%s",
       debug_view_ ? "true" : "false", debug_lane_view_ ? "true" : "false");
@@ -166,6 +174,19 @@ public:
     // "지금 어느 차선인가"를 알려주는 연속값이다. 둘은 성격이 달라 공존한다.
     lane_position_pub_ = this->create_publisher<std_msgs::msg::Int16>(
       "/lane_position", qos_fast);
+
+    // 처리 단계 계측은 명시적으로 켠 진단 replay에서만 생성한다. false 경로는
+    // publisher를 만들지 않고 image callback에도 null 포인터를 전달하므로,
+    // countNonZero·문자열 생성·진단 발행 비용이 production에 들어가지 않는다.
+    diagnostics_enabled_ =
+      this->declare_parameter<bool>("publish_pipeline_diagnostics", false);
+    const std::string diagnostics_topic = this->declare_parameter<std::string>(
+      "pipeline_diagnostics_topic", "/lane_detection/pipeline_diagnostics");
+    if (diagnostics_enabled_) {
+      diagnostics_pub_ =
+        this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+        diagnostics_topic, qos_fast);
+    }
 
     // BEV 호모그래피 행렬 계산 (ROI 사다리꼴 → 직사각형)
     buildHomography();
@@ -449,8 +470,11 @@ public:
   // 버리고 재피팅 → 3) iterations 만큼 반복. 남은 점이 최소 임계치보다
   // 적어지면(=이상치 제거가 과했으면) 그 직전 결과를 그대로 유지한다.
   // ─────────────────────────────────────────────────────────────────────
-  static LineFit fitLineRobust(const vector<Point> & pts, float reject_px, int iterations)
+  static LineFit fitLineRobust(
+    const vector<Point> & pts, float reject_px, int iterations,
+    std::size_t * retained_points = nullptr)
   {
+    if (retained_points) {*retained_points = pts.size();}
     LineFit fit = fitLineSVD(pts);
     if (reject_px <= 0.f || iterations <= 0) {return fit;}
 
@@ -468,9 +492,11 @@ public:
       // 보고) 직전 반복의 피팅을 그대로 쓴다.
       if (inliers.size() < 10 || inliers.size() == kept.size()) {
         kept = std::move(inliers);
+        if (retained_points) {*retained_points = kept.size();}
         break;
       }
       kept = std::move(inliers);
+      if (retained_points) {*retained_points = kept.size();}
       fit = fitLineSVD(kept);
     }
     return fit;
@@ -496,11 +522,18 @@ public:
   // 출력:
   //   LineFit {m, b}: x = m*y + b 형태의 직선 파라미터
   // ─────────────────────────────────────────────────────────────────────
-  LineFit fitLaneFromBEV(const Mat & bev_binary, bool & ok, cv::Mat * dbg_out = nullptr)
+  LineFit fitLaneFromBEV(
+    const Mat & bev_binary, bool & ok,
+    lane_detection::LanePipelineDiagnostics * diagnostics = nullptr,
+    cv::Mat * dbg_out = nullptr)
   {
     ok = false;
 
     const int h = bev_binary.rows, w = bev_binary.cols;
+    if (diagnostics) {
+      diagnostics->consecutive_fail_count_before = consecutive_fail_count_;
+      diagnostics->fit_reacquire_after_frames = config_.fit_reacquire_after_frames;
+    }
 
     // ── 1) corridor 범위 계산 ───────────────────────────────────────
     // 현재 차선 모드의 ref_ratio로 고정 기준 x(ref_x_)를 계산해둔다.
@@ -525,28 +558,33 @@ public:
     const bool anchor_trustworthy =
       has_prev_center_fit_ &&
       consecutive_fail_count_ < config_.fit_reacquire_after_frames;
+    const bool reacquire_active = has_prev_center_fit_ && !anchor_trustworthy;
     if (anchor_trustworthy) {
       anchor_x = static_cast<int>(prev_center_fit_.m * (h - 1) + prev_center_fit_.b);
       anchor_x = std::clamp(anchor_x, 0, w - 1);
+    }
+    if (diagnostics) {
+      diagnostics->ref_x = ref_x_;
+      diagnostics->anchor_x = anchor_x;
+      diagnostics->anchor_from_previous = anchor_trustworthy;
+      diagnostics->reacquire_active = reacquire_active;
     }
 
     int x_min = std::max(0, anchor_x - static_cast<int>(config_.corridor_width / 2));
     int x_max = std::min(w - 1, anchor_x + static_cast<int>(config_.corridor_width / 2));
     int histW = x_max - x_min + 1;
     if (histW <= 2) {x_min = 0; x_max = w - 1; histW = w;}
+    if (diagnostics) {
+      diagnostics->corridor_x_min = x_min;
+      diagnostics->corridor_x_max = x_max;
+      diagnostics->corridor_pixels = static_cast<std::size_t>(
+        cv::countNonZero(bev_binary(cv::Rect(x_min, 0, histW, h))));
+    }
 
     // ── 2) 가중 히스토그램으로 시작점(base_x) 결정 ─────────────────
     // 하단 70% 영역에서 corridor 범위의 열별 픽셀 합 계산 후,
     // anchor_x 근처에 가우시안 가중치를 곱하여 최댓값 열을 시작점으로 선택
     int y_start_hist = std::min(std::max(static_cast<int>(h * 0.3), 0), h - 1);
-    cv::Mat hist_roi = bev_binary(cv::Rect(x_min, y_start_hist, histW, h - y_start_hist));
-    cv::Mat nz = (hist_roi > 0);
-    cv::Mat colSum;
-    cv::reduce(nz, colSum, 0, cv::REDUCE_SUM, CV_32S);
-
-    std::vector<int> hist(histW);
-    for (int i = 0; i < histW; ++i) {hist[i] = colSum.at<int>(0, i) / 255;}
-
     // sigma_ratio가 작을수록 anchor 근처만 강하게 밀어줌(보수적 시작점)
     // w_min을 0.3~0.7 사이로 조절하면 멀리 있어도 완전히 무시되지 않음
     const float sigma_ratio = (config_.ref_hist_sigma_ratio > 0.f) ?
@@ -554,28 +592,18 @@ public:
     const float w_min = (config_.ref_hist_min_weight > 0.f &&
       config_.ref_hist_min_weight < 1.f) ?
       config_.ref_hist_min_weight : 0.50f;
-    const float sigma_pixels = std::max(1.f, sigma_ratio * static_cast<float>(histW));
-    const float two_sigma2 = 2.f * sigma_pixels * sigma_pixels;
-
-    std::vector<float> weighted_hist(histW);
-    for (int i = 0; i < histW; ++i) {
-      int x = x_min + i;
-      float d = static_cast<float>(std::abs(x - anchor_x));
-      float w = w_min + (1.f - w_min) * std::exp(-(d * d) / two_sigma2);
-      weighted_hist[i] = static_cast<float>(hist[i]) * w;
+    const auto histogram_selection = lane_detection::selectReacquireHistogram(
+      bev_binary, x_min, x_max, y_start_hist, anchor_x,
+      sigma_ratio, w_min,
+      reacquire_active && enable_reacquire_full_bev_fallback_);
+    const int base_x = histogram_selection.base_x;
+    const int tracking_x_min = histogram_selection.tracking_x_min;
+    const int tracking_x_max = histogram_selection.tracking_x_max;
+    if (diagnostics) {
+      diagnostics->reacquire_fallback_attempted = histogram_selection.fallback_attempted;
+      diagnostics->reacquire_fallback_candidate = histogram_selection.fallback_candidate;
     }
-
-    int base_x = anchor_x;
-    auto it_w = std::max_element(weighted_hist.begin(), weighted_hist.end());
-    const float bestValW = (it_w != weighted_hist.end()) ? *it_w : 0.f;
-
-    if (bestValW > 0.f) {
-      int base_x_rel = static_cast<int>(std::distance(weighted_hist.begin(), it_w));
-      base_x = x_min + base_x_rel;
-    } else {
-      // 신호 없음: anchor_x(직전 위치 또는 ref_x_) 그대로 유지
-      base_x = std::clamp(anchor_x, x_min, x_max);
-    }
+    if (diagnostics) {diagnostics->base_x = base_x;}
 
     // ── 3) 디버그 캔버스 준비 ───────────────────────────────────────
     cv::Mat dbg;
@@ -626,7 +654,7 @@ public:
         x_current = sum / static_cast<int>(xs.size());
         recentered = true;
       }
-      x_current = std::min(std::max(x_current, x_min), x_max);
+      x_current = std::min(std::max(x_current, tracking_x_min), tracking_x_max);
 
       if (dbg_out) {
         cv::Scalar boxColor = recentered ? cv::Scalar(0, 255, 255) : cv::Scalar(0, 165, 255);
@@ -636,11 +664,16 @@ public:
           {255, 255, 255}, cv::MARKER_CROSS, 10, 1);
       }
     }
+    if (diagnostics) {diagnostics->sliding_points = pts.size();}
 
     // ── 5) 포인트 부족 시 이전 프레임 값으로 fallback ──────────────
     if (pts.size() < 10) {
       ok = false;
       ++consecutive_fail_count_;
+      if (diagnostics) {
+        diagnostics->fit_valid = false;
+        diagnostics->consecutive_fail_count_after = consecutive_fail_count_;
+      }
       if (dbg_out && has_prev_center_fit_) {
         float m = prev_center_fit_.m, b = prev_center_fit_.b;
         cv::line(
@@ -657,11 +690,20 @@ public:
     // 1차 SVD 피팅 후, 그 직선에서 fit_outlier_reject_px 보다 먼 점을
     // 버리고 재피팅하기를 fit_outlier_iterations 회 반복한다. 노이즈를
     // 주운 윈도우 1~2개가 전체 피팅을 흔드는 것을 막는다.
+    std::size_t * retained_points =
+      diagnostics ? &diagnostics->robust_retained_points : nullptr;
+    if (diagnostics) {diagnostics->robust_input_points = pts.size();}
     LineFit fit = fitLineRobust(
       pts, config_.fit_outlier_reject_px,
-      config_.fit_outlier_iterations);
+      config_.fit_outlier_iterations, retained_points);
     ok = true;
     consecutive_fail_count_ = 0;
+    if (diagnostics) {
+      diagnostics->fit_valid = true;
+      diagnostics->reacquire_fallback_success =
+        histogram_selection.fallback_attempted && histogram_selection.fallback_candidate;
+      diagnostics->consecutive_fail_count_after = consecutive_fail_count_;
+    }
 
     // ── 7) 최종 선 디버그 표시 ─────────────────────────────────────
     if (dbg_out) {
@@ -820,6 +862,7 @@ public:
       fit_pub_->publish(fit_msg);
     }
 
+    // 슬라이딩 윈도우 BEV 디버그 창 표시 기능은 아래 통합 모니터에 포함된다.
     // 통합 모니터 창: CAMERA / VEHICLE 2개 패널을 한 창에 그린다.
     // 조향·속도는 /xycar_motor 콜백이 캐시해 둔 최신 값을 쓰므로, 여기서
     // 프레임당 한 번만 그려도 값이 최신이다.
@@ -1135,6 +1178,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr fit_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr lane_change_state_pub_;
   rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr lane_position_pub_;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub_;
 
   // ── 실측 현재 차선 판정 상태 (인지 기반, 제어 목표와 무관) ──────────
   int detected_lane_ = -1;     // 확정된 실측 차선 (-1=미확정)
@@ -1176,6 +1220,8 @@ private:
   // true면 통합 모니터 창에 더해 보조 차선 창들을 추가로 띄운다.
   // debug_view_ 가 false면 이 값과 무관하게 모든 창이 꺼진다.
   bool debug_lane_view_ = config_.debug_lane_view;
+  bool diagnostics_enabled_ = false;
+  bool enable_reacquire_full_bev_fallback_ = false;
   // 통합 모니터 창의 CAMERA 패널에 쓸 최신 원본 프레임.
   // 단일 스레드 spin 이라 콜백 간 경쟁이 없어 별도 락이 필요 없다.
   cv::Mat latest_camera_;
@@ -1217,6 +1263,12 @@ private:
   // ─────────────────────────────────────────────────────────────────────
   void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg)
   {
+    const auto diagnostics_started = diagnostics_enabled_ ?
+      std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::optional<lane_detection::LanePipelineDiagnostics> diagnostics_data;
+    if (diagnostics_enabled_) {diagnostics_data.emplace();}
+    auto * diagnostics = diagnostics_data ? &diagnostics_data.value() : nullptr;
+
     if (smooth_enabled_) {updateRefRatio();}
 
     // (0) PIDNet-S mono8 마스크 → 이진 OpenCV 마스크
@@ -1228,7 +1280,16 @@ private:
       return;
     }
     Mat lane_mask = cv_ptr->image;
-    if (lane_mask.empty()) {return;}
+    if (lane_mask.empty()) {
+      if (diagnostics) {
+        diagnostics->processing_time_us = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - diagnostics_started).count());
+        diagnostics_pub_->publish(
+          lane_detection::makeLanePipelineDiagnostic(msg->header, *diagnostics));
+      }
+      return;
+    }
 
     // 모델 출력 해상도가 JSON의 frame_width/height와 다르면 맞춘다.
     // 이진 마스크이므로 보간은 반드시 최근접(INTER_NEAREST)이어야 한다.
@@ -1236,6 +1297,9 @@ private:
       resize(lane_mask, lane_mask, Size(frame_width_, frame_height_), 0, 0, INTER_NEAREST);
     }
     threshold(lane_mask, lane_mask, 0, 255, THRESH_BINARY);
+    if (diagnostics) {
+      diagnostics->input_mask_pixels = static_cast<std::size_t>(cv::countNonZero(lane_mask));
+    }
 
     // 모니터 CAMERA 패널 오버레이용: 주행 트라페조이드 ROI로 잘리기 전의
     // 원본 세그멘테이션 결과. 라벨 ROI(하단 40%) 전체에서 모델이 실제로
@@ -1243,6 +1307,9 @@ private:
     Mat lane_mask_for_display = lane_mask.clone();
 
     bitwise_and(lane_mask, trapezoidMask(lane_mask.size()), lane_mask);
+    if (diagnostics) {
+      diagnostics->roi_mask_pixels = static_cast<std::size_t>(cv::countNonZero(lane_mask));
+    }
 
     // 세그멘테이션 경계의 자잘한 구멍/점을 정리한다. 색상 파이프라인의
     // 모폴로지와 목적은 같지만, 마스크가 이미 꽉 차 있어 커널이 더 작다.
@@ -1250,6 +1317,10 @@ private:
     Mat open_kernel = getStructuringElement(MORPH_ELLIPSE, Size(3, 3));
     morphologyEx(lane_mask, lane_mask, MORPH_CLOSE, close_kernel);
     morphologyEx(lane_mask, lane_mask, MORPH_OPEN, open_kernel);
+    if (diagnostics) {
+      diagnostics->roi_after_morphology_pixels =
+        static_cast<std::size_t>(cv::countNonZero(lane_mask));
+    }
 
     // 디버그 오버레이(publishAndDebug의 "Lane View + Offset" 등)는 BGR 캔버스를
     // 요구한다. 원본 카메라 영상은 더 이상 구독하지 않으므로 마스크를 3채널로
@@ -1272,6 +1343,9 @@ private:
     warpPerspective(
       lane_mask, bev_yellow, H_, bev_size_,
       INTER_NEAREST, BORDER_CONSTANT, Scalar(0));
+    if (diagnostics) {
+      diagnostics->bev_pixels = static_cast<std::size_t>(cv::countNonZero(bev_yellow));
+    }
     if (debug_view_ && debug_lane_view_) {imshow("BEV-PIDNet-Center-Lane", bev_yellow);}
 
     // (3) 노이즈 억제 준비: corridor 범위 및 디버그 캔버스 준비
@@ -1296,6 +1370,11 @@ private:
       &bev_color
     );
     if (suppressed) {bev_yellow = bev_clean;}
+    if (diagnostics) {
+      diagnostics->horizontal_suppressed = suppressed;
+      diagnostics->after_horizontal_pixels =
+        static_cast<std::size_t>(cv::countNonZero(bev_yellow));
+    }
 
     // (3-b) 수직 열 밴드 노이즈 억제
     // vertical_noise_peak_use_corridor: true면 corridor만, false면 전체 폭 검사
@@ -1313,6 +1392,11 @@ private:
       &bev_color
     );
     if (suppressed2) {bev_yellow = bev_clean2;}
+    if (diagnostics) {
+      diagnostics->column_suppressed = suppressed2;
+      diagnostics->after_column_pixels =
+        static_cast<std::size_t>(cv::countNonZero(bev_yellow));
+    }
 
     if (debug_view_ && debug_lane_view_) {
       cv::imshow("BEV-Mask (suppressed rows/columns in red)", bev_color);
@@ -1323,7 +1407,7 @@ private:
     bool show_dbg = debug_view_ && (frame_count_ % debug_stride_ == 0);
 
     bool valid = false;
-    LineFit center_fit = fitLaneFromBEV(bev_yellow, valid);
+    LineFit center_fit = fitLaneFromBEV(bev_yellow, valid, diagnostics);
 
     std_msgs::msg::Bool validity_msg;
     validity_msg.data = valid;
@@ -1344,6 +1428,16 @@ private:
     // (6) 토픽 발행 + 디버그 출력
     const auto publication_policy = publishAndDebug(
       frame, offset, center_fit, valid, show_dbg, lane_mask_for_display);
+
+    if (diagnostics) {
+      diagnostics->fit_valid = valid;
+      diagnostics->frame_mapping_ok = publication_policy.publish_fit;
+      diagnostics->processing_time_us = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - diagnostics_started).count());
+      diagnostics_pub_->publish(
+        lane_detection::makeLanePipelineDiagnostic(msg->header, *diagnostics));
+    }
 
     // A failed fit may retain prior geometry for internal tracking/debug,
     // but invalid evidence must reset lane-change completion progress.

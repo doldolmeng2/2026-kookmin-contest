@@ -317,6 +317,8 @@ def generate_launch_description():
         name='lane_node',
         output='screen',
         parameters=[{
+            # J4012 production opt-in; lane_node code default remains false.
+            'enable_reacquire_full_bev_fallback': True,
             'debug_view': ParameterValue(
                 LaunchConfiguration('lane_debug'), value_type=bool
             ),
