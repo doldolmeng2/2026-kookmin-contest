@@ -41,6 +41,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
+from typing import List
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
@@ -51,6 +52,7 @@ from launch.launch_description_sources import (
     PythonLaunchDescriptionSource,
 )
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from ament_index_python.packages import get_package_share_directory
 
 
@@ -93,6 +95,22 @@ def generate_launch_description():
         description='PIDNet-S checkpoint path'
     )
     pidnet_model = LaunchConfiguration('pidnet_model')
+    pidnet_lane_classes_arg = DeclareLaunchArgument(
+        'pidnet_lane_classes',
+        default_value='[1]',
+        description=(
+            '/lane_segmentation_mask 로 내보낼 PIDNet 클래스 '
+            '(1=center_lane, 2=left_solid, 3=right_solid, 4=road, 5=shortcut). '
+            'lane_node는 선을 하나만 피팅하고 1/2차선 모드는 기준 x만 옮기므로 '
+            '기본값은 중앙선 단독인 [1] 이다. 경계선을 섞으면 트래커가 '
+            '중앙선 대신 경계선에 붙어 오프셋이 한 차선 폭만큼 어긋날 수 있다. '
+            '(/pidnet_class_map 은 이 값과 무관하게 전체 라벨을 내보내므로 '
+            'road_surface 노드는 영향받지 않는다.)'
+        )
+    )
+    pidnet_lane_classes = ParameterValue(
+        LaunchConfiguration('pidnet_lane_classes'), value_type=List[int]
+    )
     rubbercone_offset_filter_alpha_arg = DeclareLaunchArgument(
         'rubbercone_offset_filter_alpha',
         default_value='0.80',
@@ -277,7 +295,7 @@ def generate_launch_description():
             'input_topic': '/resized_image',
             'mask_topic': '/lane_segmentation_mask',
             'class_topic': '/pidnet_class_map',
-            'lane_classes': [1, 2, 3],
+            'lane_classes': pidnet_lane_classes,
             'device': 'auto',
         }],
     )
@@ -368,6 +386,7 @@ def generate_launch_description():
         lane_target_arg,
         show_debug_arg,
         pidnet_model_arg,
+        pidnet_lane_classes_arg,
         rubbercone_offset_filter_alpha_arg,
         rubbercone_end_missing_frames_arg,
         rubbercone_scan_max_range_arg,
