@@ -2,7 +2,8 @@
 """ONNX Runtime YOLO frontend for the C++ LiDAR/lane fusion node.
 
 한 번의 추론으로 두 가지를 낸다:
-  /object_yolo    차량(고정장애물·방해차량) 박스 1개 -> object_node(C++)
+  /object_yolo    차량 고정/이동 박스 각 1개(10+10 슬롯) -> object_node(C++)
+  /traffic_detection  같은 프레임 분류 신호 코드(Int32)
   /traffic_boxes  신호등처럼 생긴 위치 후보 전부       -> object_node(C++)
 
 신호등은 2단계(ROI 크롭 + 분류) 방식이다. 검출기는 '신호등이 여기 있다'는
@@ -30,26 +31,33 @@ class_id/confidence 자리에는 이제 **분류기** 인덱스(0=green 1=left_g
 from __future__ import annotations
 
 import os
+import time
 
 import numpy as np
 import onnxruntime as ort
 import rclpy
 from ament_index_python.packages import get_package_share_directory
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Int32
 
 from object_detection.image_conversion import imgmsg_to_bgr
 from object_detection.yolo_runtime import (
-    closest_detection,
+    LatestFrameRateLimiter,
+    closest_detection_for_classes,
     crop_with_margin,
     decode_detections,
+    detection_slot,
     letterbox_blob,
     light_blob,
     light_geometry_ok,
+    normalize_class_ids,
 )
 from object_detection.traffic_classifier import (
+    classify_current_frame_candidate,
     parse_class_names,
     validate_classifier_classes,
     validate_detector_classes,
@@ -64,6 +72,13 @@ MOVING = 1
 UNCLASSIFIED = -1
 
 
+def diagnostic_value(key: str, value: object) -> KeyValue:
+    item = KeyValue()
+    item.key = key
+    item.value = str(value)
+    return item
+
+
 class ObjectYoloNode(Node):
     def __init__(self) -> None:
         super().__init__("object_yolo_node")
@@ -72,10 +87,17 @@ class ObjectYoloNode(Node):
         self.declare_parameter("traffic_classifier_model_path", "")
         self.declare_parameter("camera_topic", "/resized_image")
         self.declare_parameter("output_topic", "/object_yolo")
+        self.declare_parameter("traffic_output_topic", "/traffic_detection")
+        self.declare_parameter("traffic_boxes_topic", "/traffic_boxes")
         self.declare_parameter("confidence_threshold", 0.50)
         self.declare_parameter("classifier_confidence_threshold", 0.60)
         self.declare_parameter("nms_threshold", 0.40)
         self.declare_parameter("input_size", 640)
+        self.declare_parameter("max_inference_hz", 0.0)
+        self.declare_parameter("publish_inference_diagnostics", False)
+        self.declare_parameter(
+            "inference_diagnostics_topic", "/object_yolo/inference_diagnostics"
+        )
         # Model class IDs are deliberately parameters rather than hardcoded,
         # so a retrained model with a different ID mapping can be dropped in
         # without code changes. Current model (train-2, 7-class merged
@@ -86,7 +108,6 @@ class ObjectYoloNode(Node):
         # 여기서는 "신호등처럼 생긴 위치" 후보를 고르는 용도로만 쓴다 —
         # 순서는 의미가 없다.
         self.declare_parameter("traffic_class_ids", [1, 2, 3, 5, 6])
-        self.declare_parameter("traffic_output_topic", "/traffic_boxes")
         # ── 신호등 크롭 분류기 ──────────────────────────────────────────
         # 빈 문자열이면 share 디렉터리(model/light_cls.onnx)를 탐색한다.
         # 전처리 상수는 object_detection.cpp 의 폴백 경로와 같은 기본값을
@@ -123,25 +144,30 @@ class ObjectYoloNode(Node):
                 "model",
                 "light1_classifier_best.onnx",
             )
-        if not os.path.isfile(detector_model_path):
-            raise FileNotFoundError(
-                f"train-10 detector model missing: {detector_model_path}"
-            )
+        for label, path in (
+            ("train-10 detector", detector_model_path),
+            ("light1 traffic classifier", classifier_model_path),
+        ):
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"{label} model missing: {path}")
 
         self.confidence = float(
             self.get_parameter("confidence_threshold").value
         )
         self.nms = float(self.get_parameter("nms_threshold").value)
         self.input_size = int(self.get_parameter("input_size").value)
-        self.fixed_ids = {
-            int(value) for value in self.get_parameter("fixed_class_ids").value
-        }
-        self.moving_ids = {
-            int(value) for value in self.get_parameter("moving_class_ids").value
-        }
-        self.traffic_ids = {
-            int(value) for value in self.get_parameter("traffic_class_ids").value
-        }
+        self.classifier_confidence = float(
+            self.get_parameter("classifier_confidence_threshold").value
+        )
+        self.fixed_ids = normalize_class_ids(
+            self.get_parameter("fixed_class_ids").value
+        )
+        self.moving_ids = normalize_class_ids(
+            self.get_parameter("moving_class_ids").value
+        )
+        self.traffic_ids = normalize_class_ids(
+            self.get_parameter("traffic_class_ids").value
+        )
         overlap = self.fixed_ids & self.moving_ids
         if overlap:
             raise ValueError(f"fixed/moving class IDs overlap: {sorted(overlap)}")
@@ -165,10 +191,43 @@ class ObjectYoloNode(Node):
         self.input_name = self.session.get_inputs()[0].name
         output_shape = self.session.get_outputs()[0].shape
 
+        self.classifier_session = ort.InferenceSession(
+            classifier_model_path,
+            providers=["CPUExecutionProvider"],
+        )
+        classifier_names = parse_class_names(
+            self.classifier_session.get_modelmeta().custom_metadata_map.get(
+                "names"
+            )
+        )
+        validate_classifier_classes(classifier_names)
+        classifier_input = self.classifier_session.get_inputs()[0]
+        classifier_shape = classifier_input.shape
+        if (
+            len(classifier_shape) != 4
+            or classifier_shape[0] != 1
+            or classifier_shape[1] != 3
+            or not isinstance(classifier_shape[2], int)
+            or not isinstance(classifier_shape[3], int)
+        ):
+            raise ValueError(
+                f"unsupported traffic classifier input shape: {classifier_shape}"
+            )
+        self.classifier_input_name = classifier_input.name
+        self.classifier_height = classifier_shape[2]
+        self.classifier_width = classifier_shape[3]
+
         self.light_margin = float(self.get_parameter("light_crop_margin").value)
         self.light_input_size = int(self.get_parameter("light_input_size").value)
         self.light_max_aspect = float(self.get_parameter("light_max_aspect").value)
         self.light_edge_min_h = int(self.get_parameter("light_edge_min_h").value)
+        self.max_inference_hz = float(
+            self.get_parameter("max_inference_hz").value
+        )
+        self.rate_limiter = LatestFrameRateLimiter(self.max_inference_hz)
+        self.publish_inference_diagnostics = bool(
+            self.get_parameter("publish_inference_diagnostics").value
+        )
 
         # 분류기를 못 띄워도 차량 경로는 그대로 돌아야 한다. 이 경우
         # /traffic_boxes 의 class_id 는 UNCLASSIFIED 로 나가고, object_node 가
@@ -238,14 +297,31 @@ class ObjectYoloNode(Node):
         )
         output_topic = str(self.get_parameter("output_topic").value)
         traffic_output_topic = str(self.get_parameter("traffic_output_topic").value)
+        traffic_boxes_topic = str(self.get_parameter("traffic_boxes_topic").value)
         camera_topic = str(self.get_parameter("camera_topic").value)
         self.publisher = self.create_publisher(
             Float32MultiArray, output_topic, qos
         )
         self.traffic_publisher = self.create_publisher(
-            Float32MultiArray, traffic_output_topic, qos
+            Int32, traffic_output_topic, qos
         )
+        self.traffic_boxes_publisher = self.create_publisher(
+            Float32MultiArray, traffic_boxes_topic, qos
+        )
+        self.inference_diagnostics_publisher = None
+        if self.publish_inference_diagnostics:
+            diagnostics_topic = str(
+                self.get_parameter("inference_diagnostics_topic").value
+            )
+            self.inference_diagnostics_publisher = self.create_publisher(
+                DiagnosticArray, diagnostics_topic, qos
+            )
         self.create_subscription(Image, camera_topic, self.on_image, qos)
+        self.inference_timer = None
+        if self.rate_limiter.enabled:
+            self.inference_timer = self.create_timer(
+                self.rate_limiter.period_s, self._on_inference_timer
+            )
 
     def _warn_fallback_active(self) -> None:
         self.get_logger().warn(
@@ -290,6 +366,24 @@ class ObjectYoloNode(Node):
         return index, float(probabilities[index])
 
     def on_image(self, message: Image) -> None:
+        if not self.rate_limiter.enabled:
+            received_ns = (
+                time.monotonic_ns() if self.publish_inference_diagnostics else 0
+            )
+            self._infer_and_publish(message, received_ns)
+            return
+        pending = (message, time.monotonic_ns())
+        selected = self.rate_limiter.offer(pending, time.monotonic())
+        if selected is not None:
+            self._infer_and_publish(*selected)
+
+    def _on_inference_timer(self) -> None:
+        selected = self.rate_limiter.pop_due(time.monotonic())
+        if selected is not None:
+            self._infer_and_publish(*selected)
+
+    def _infer_and_publish(self, message: Image, received_ns: int) -> None:
+        started_ns = time.monotonic_ns()
         try:
             image = imgmsg_to_bgr(message)
             prepared = letterbox_blob(image, self.input_size)
@@ -309,10 +403,11 @@ class ObjectYoloNode(Node):
             detections = decode_detections(
                 allowed_class_ids=self.allowed_ids, **decode_kwargs
             )
-            detection = closest_detection(
-                det
-                for det in detections
-                if det.class_id in self.fixed_ids or det.class_id in self.moving_ids
+            fixed_detection = closest_detection_for_classes(
+                detections, self.fixed_ids
+            )
+            moving_detection = closest_detection_for_classes(
+                detections, self.moving_ids
             )
             # 신호등은 위치가 아니라 "보이는가"만 필요하다. 원거리 신호등이
             # 차량용 min_size_px(기본 12px) 필터에 걸려 누락되지 않도록
@@ -320,31 +415,39 @@ class ObjectYoloNode(Node):
             traffic_detections = decode_detections(
                 allowed_class_ids=self.traffic_ids, min_size_px=1, **decode_kwargs
             )
+            traffic_candidate = closest_detection_for_classes(
+                traffic_detections, self.traffic_ids
+            )
         except Exception as exc:
             self.get_logger().error(f"object YOLO inference failed: {exc}")
             return
 
         output_message = Float32MultiArray()
-        if detection is None:
-            output_message.data = [0.0, float(UNKNOWN)] + [0.0] * 8
-        else:
-            semantic_type = (
-                FIXED if detection.class_id in self.fixed_ids else MOVING
-            )
-            center_x, center_y = detection.center
-            output_message.data = [
-                1.0,
-                float(semantic_type),
-                float(detection.confidence),
-                float(detection.area),
-                float(center_x),
-                float(center_y),
-                float(detection.x),
-                float(detection.y),
-                float(detection.width),
-                float(detection.height),
-            ]
+        output_message.data = (
+            detection_slot(fixed_detection, FIXED)
+            + detection_slot(moving_detection, MOVING)
+        )
         self.publisher.publish(output_message)
+
+        traffic_signal = 0
+        if traffic_candidate is not None:
+            try:
+                traffic_signal = classify_current_frame_candidate(
+                    image,
+                    traffic_candidate,
+                    self.classifier_session,
+                    self.classifier_input_name,
+                    self.classifier_height,
+                    self.classifier_width,
+                    self.classifier_confidence,
+                )
+            except Exception as exc:
+                self.get_logger().error(
+                    f"same-frame traffic classification failed: {exc}"
+                )
+        signal_message = Int32()
+        signal_message.data = traffic_signal
+        self.traffic_publisher.publish(signal_message)
 
         # 박스마다 같은 프레임에서 잘라 분류한 뒤, 검출기 class_id/confidence
         # 자리에 분류기 결과를 실어 보낸다. 우선순위(좌회전>직진>정지) 판정과
@@ -371,7 +474,39 @@ class ObjectYoloNode(Node):
                 float(det.x), float(det.y), float(det.width), float(det.height),
             ])
         traffic_message.data = flat
-        self.traffic_publisher.publish(traffic_message)
+        self.traffic_boxes_publisher.publish(traffic_message)
+
+        if self.inference_diagnostics_publisher is not None:
+            completed_ns = time.monotonic_ns()
+            diagnostics = DiagnosticArray()
+            diagnostics.header = message.header
+            status = DiagnosticStatus()
+            status.level = DiagnosticStatus.OK
+            status.name = "object_yolo/inference"
+            status.message = "OK"
+            status.hardware_id = "onnxruntime"
+            status.values = [
+                diagnostic_value("max_inference_hz", self.max_inference_hz),
+                diagnostic_value(
+                    "receive_to_start_us", (started_ns - received_ns) // 1000
+                ),
+                diagnostic_value(
+                    "inference_work_us", (completed_ns - started_ns) // 1000
+                ),
+                diagnostic_value(
+                    "callback_total_us", (completed_ns - received_ns) // 1000
+                ),
+                diagnostic_value(
+                    "fixed_detected", int(fixed_detection is not None)
+                ),
+                diagnostic_value(
+                    "moving_detected", int(moving_detection is not None)
+                ),
+                diagnostic_value("traffic_signal", traffic_signal),
+                diagnostic_value("traffic_box_count", len(flat) // 6),
+            ]
+            diagnostics.status = [status]
+            self.inference_diagnostics_publisher.publish(diagnostics)
 
 
 def main(args=None) -> None:
@@ -379,7 +514,7 @@ def main(args=None) -> None:
     node = ObjectYoloNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()

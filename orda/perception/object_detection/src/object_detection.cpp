@@ -6,7 +6,7 @@
 // 구독:
 //   /scan              (sensor_msgs/LaserScan)           - LiDAR 거리 데이터 (디버그 표시용)
 //   /resized_image     (sensor_msgs/Image, BGR8)          - 디버그 영상 + 크롭 분류 폴백 원본
-//   /object_yolo       (std_msgs/Float32MultiArray)       - ONNX Runtime 차량 검출(가장 가까운 1개)
+//   /object_yolo       (std_msgs/Float32MultiArray)       - ONNX Runtime 차량 검출(고정/이동 10+10 슬롯)
 //   /traffic_boxes     (std_msgs/Float32MultiArray)       - 신호등 박스 + 크롭 분류 결과(전부)
 //   /lane_fit          (std_msgs/Float32MultiArray [m,b]) - 차선 회귀 결과
 //
@@ -91,6 +91,7 @@
 #include <sstream>
 
 #include "object_detection/side_clearance.hpp"
+#include "object_detection/lane_stabilizer.hpp"
 
 using std::placeholders::_1;
 
@@ -385,32 +386,33 @@ private:
         fit_stamp_ = now();
     }
 
-    // /object_yolo 계약:
-    // [detected, object_type, confidence, box_area, cx, cy, x, y, w, h]
+    // /object_yolo 계약: fixed/moving 두 슬롯을 같은 프레임에서 전달한다.
+    // [fixed_detected, 0, confidence, area, cx, cy, x, y, w, h,
+    //  moving_detected, 1, confidence, area, cx, cy, x, y, w, h]
+    // 기록된 구형 bag을 위해 단일 10필드 슬롯도 계속 수용한다.
     void onYoloDetection(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
         if (!use_external_yolo_) return;
-        if (msg->data.size() < 10) {
+        if (msg->data.size() != 10 && msg->data.size() != 20) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                 "/object_yolo 필드가 10개보다 적습니다.");
+                                 "/object_yolo는 정확히 10개 또는 20개 필드가 필요합니다.");
             return;
         }
 
-        const bool detected = msg->data[0] >= 0.5f;
-        const int object_type = static_cast<int>(std::lround(msg->data[1]));
-        const float confidence = msg->data[2];
-        const float box_area = msg->data[3];
-        const float box_cx = msg->data[4];
-        const float box_cy = msg->data[5];
-        if (!std::isfinite(confidence) || !std::isfinite(box_area) ||
-            !std::isfinite(box_cx) || !std::isfinite(box_cy) ||
-            (detected && object_type != 0 && object_type != 1)) {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                 "유효하지 않은 /object_yolo 메시지를 무시합니다.");
-            return;
-        }
+        struct ParsedDetection {
+            bool detected = false;
+            int type = -1;
+            float confidence = 0.0f;
+            float area = 0.0f;
+            float cx = 0.0f;
+            float cy = 0.0f;
+            float x = 0.0f;
+            float y = 0.0f;
+            float width = 0.0f;
+            float height = 0.0f;
+            float dx = 0.0f;
+            int lane = 0;
+        };
 
-        float box_dx = 0.0f;
-        int lane_label = 0;
         float m = 0.0f, b = 0.0f;
         bool lane_ok = false;
         rclcpp::Time fit_stamp{0, 0, RCL_ROS_TIME};
@@ -425,45 +427,105 @@ private:
             const double age_s = (now() - fit_stamp).seconds();
             lane_ok = age_s >= 0.0 && age_s <= lane_fit_max_age_s_;
         }
-        if (detected && lane_ok && lane_fit_is_frame_) {
-            const float x_line = m * box_cy + b;
-            box_dx = box_cx - x_line;
-            if (box_dx <= -static_cast<float>(lane_split_margin_px_)) lane_label = 1;
-            else if (box_dx >= static_cast<float>(lane_split_margin_px_)) lane_label = 2;
+
+        const auto parse_slot = [&](std::size_t offset, int expected_type,
+                                    ParsedDetection& out) -> bool {
+            const float detected_value = msg->data[offset];
+            const float type_value = msg->data[offset + 1];
+            if (!std::isfinite(detected_value) || !std::isfinite(type_value)) {
+                return false;
+            }
+            out.detected = detected_value >= 0.5f;
+            out.type = static_cast<int>(std::lround(type_value));
+            out.confidence = msg->data[offset + 2];
+            out.area = msg->data[offset + 3];
+            out.cx = msg->data[offset + 4];
+            out.cy = msg->data[offset + 5];
+            out.x = msg->data[offset + 6];
+            out.y = msg->data[offset + 7];
+            out.width = msg->data[offset + 8];
+            out.height = msg->data[offset + 9];
+            const bool valid_type = expected_type >= 0
+                ? out.type == expected_type
+                : (out.type == 0 || out.type == 1 ||
+                   (!out.detected && out.type == -1));
+            if (!std::isfinite(out.confidence) || !std::isfinite(out.area) ||
+                !std::isfinite(out.cx) || !std::isfinite(out.cy) ||
+                !std::isfinite(out.x) || !std::isfinite(out.y) ||
+                !std::isfinite(out.width) || !std::isfinite(out.height) ||
+                out.confidence < 0.0f || out.confidence > 1.0f ||
+                out.area < 0.0f || out.width < 0.0f || out.height < 0.0f ||
+                !valid_type) {
+                return false;
+            }
+            if (!out.detected) {
+                out.confidence = 0.0f;
+                out.area = 0.0f;
+                out.cx = 0.0f;
+                out.cy = 0.0f;
+                out.x = 0.0f;
+                out.y = 0.0f;
+                out.width = 0.0f;
+                out.height = 0.0f;
+                return true;
+            }
+            if (lane_ok && lane_fit_is_frame_) {
+                const float x_line = m * out.cy + b;
+                out.dx = out.cx - x_line;
+                if (out.dx <= -static_cast<float>(lane_split_margin_px_)) out.lane = 1;
+                else if (out.dx >= static_cast<float>(lane_split_margin_px_)) out.lane = 2;
+            }
+            return true;
+        };
+
+        ParsedDetection fixed;
+        ParsedDetection moving;
+        if (msg->data.size() == 20) {
+            if (!parse_slot(0, 0, fixed) || !parse_slot(10, 1, moving)) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "유효하지 않은 2슬롯 /object_yolo를 무시합니다.");
+                return;
+            }
+        } else {
+            ParsedDetection legacy;
+            if (!parse_slot(0, -1, legacy)) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "유효하지 않은 구형 /object_yolo를 무시합니다.");
+                return;
+            }
+            if (legacy.type == 0) fixed = legacy;
+            else if (legacy.type == 1) moving = legacy;
         }
 
-        // 차선 판정 디바운스: margin(10px)이 좁아진 만큼 /lane_fit 흔들림으로
-        // raw lane_label 이 한두 프레임 튈 수 있다. 같은 값이
-        // lane_debounce_n_ 프레임 연속돼야 lane_stable_ 에 반영한다.
-        if (lane_label == lane_cand_) lane_cnt_++;
-        else { lane_cand_ = lane_label; lane_cnt_ = 1; }
-        if (lane_cnt_ >= lane_debounce_n_) lane_stable_ = lane_cand_;
+        const rclcpp::Time sample_stamp = now();
+        const double sample_time = sample_stamp.seconds();
+        const int fixed_stable_lane = fixed_lane_stabilizer_.update(
+            fixed.detected, fixed.lane, sample_time);
+        const int moving_stable_lane = moving_lane_stabilizer_.update(
+            moving.detected, moving.lane, sample_time);
 
-        // 화면에는 여기서 직접 그리지 않는다. onYoloDetection/onTrafficBoxes
-        // 콜백은 카메라 프레임과 비동기로, 서로 다른 빈도로 들어와서 last_img_에
-        // 바로 그리면 지우는 시점이 없어 이전 박스가 남아 "박스 2개"로 겹쳐
-        // 보이는 문제가 있었다. 대신 최신 상태만 저장해두고, onTimer()가
-        // 매 렌더 틱마다 원본 프레임에서 다시 그린다 (누적 없음).
-        const float box_x = detected ? msg->data[6] : 0.0f;
-        const float box_y = detected ? msg->data[7] : 0.0f;
-        const float box_w = detected ? msg->data[8] : 0.0f;
-        const float box_h = detected ? msg->data[9] : 0.0f;
-        const bool  geom_ok = std::isfinite(box_x) && std::isfinite(box_y) &&
-                              std::isfinite(box_w) && std::isfinite(box_h);
+        const ParsedDetection* closest = nullptr;
+        if (fixed.detected) closest = &fixed;
+        if (moving.detected && (closest == nullptr || moving.area > closest->area)) {
+            closest = &moving;
+        }
 
         std::lock_guard<std::mutex> lk(mtx_box_);
-        last_box_area_pix_ = detected ? box_area : 0.0f;
-        last_box_cx_ = detected ? box_cx : 0.0f;
-        last_box_cy_ = detected ? box_cy : 0.0f;
-        last_box_dx_ = detected ? box_dx : 0.0f;
-        last_box_x_  = (detected && geom_ok) ? box_x : 0.0f;
-        last_box_y_  = (detected && geom_ok) ? box_y : 0.0f;
-        last_box_w_  = (detected && geom_ok) ? box_w : 0.0f;
-        last_box_h_  = (detected && geom_ok) ? box_h : 0.0f;
-        last_lane_label_ = lane_stable_;
-        last_object_type_ = detected ? object_type : -1;
-        last_object_confidence_ = detected ? confidence : 0.0f;
-        last_box_stamp_ = now();
+        last_fixed_lane_label_ = fixed.detected ? fixed_stable_lane : 0;
+        last_moving_lane_label_ = moving.detected ? moving_stable_lane : 0;
+        last_box_area_pix_ = closest != nullptr ? closest->area : 0.0f;
+        last_box_cx_ = closest != nullptr ? closest->cx : 0.0f;
+        last_box_cy_ = closest != nullptr ? closest->cy : 0.0f;
+        last_box_dx_ = closest != nullptr ? closest->dx : 0.0f;
+        last_box_x_ = closest != nullptr ? closest->x : 0.0f;
+        last_box_y_ = closest != nullptr ? closest->y : 0.0f;
+        last_box_w_ = closest != nullptr ? closest->width : 0.0f;
+        last_box_h_ = closest != nullptr ? closest->height : 0.0f;
+        last_lane_label_ = closest == &fixed ? fixed_stable_lane :
+            closest == &moving ? moving_stable_lane : 0;
+        last_object_type_ = closest != nullptr ? closest->type : -1;
+        last_object_confidence_ = closest != nullptr ? closest->confidence : 0.0f;
+        last_box_stamp_ = sample_stamp;
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -817,7 +879,7 @@ private:
         }
 
         float box_area, box_cx, box_cy, box_dx, confidence;
-        int   raw_lane_label, raw_object_type;
+        int   raw_lane_label, raw_fixed_lane, raw_moving_lane, raw_object_type;
         rclcpp::Time box_stamp{0, 0, RCL_ROS_TIME};
         {
             std::lock_guard<std::mutex> lk(mtx_box_);
@@ -826,6 +888,8 @@ private:
             box_cy          = last_box_cy_;
             box_dx          = last_box_dx_;
             raw_lane_label  = last_lane_label_;
+            raw_fixed_lane  = last_fixed_lane_label_;
+            raw_moving_lane = last_moving_lane_label_;
             raw_object_type = last_object_type_;
             confidence      = last_object_confidence_;
             box_stamp       = last_box_stamp_;
@@ -836,9 +900,13 @@ private:
                 : std::numeric_limits<double>::infinity();
         const bool box_fresh = box_age_s >= 0.0 && box_age_s <= box_max_age_s_;
         int lane_label  = raw_lane_label;
+        int fixed_lane  = raw_fixed_lane;
+        int moving_lane = raw_moving_lane;
         int object_type = raw_object_type;
         if (!box_fresh || box_area <= 0.0f) {
             lane_label  = 0;
+            fixed_lane  = 0;
+            moving_lane = 0;
             object_type = -1;
         }
         // /object_info_raw 에도 같은 스테일 리셋을 적용한다 — box_* 계열
@@ -865,12 +933,6 @@ private:
         if (traffic_staled) {
             traffic_state = 0;
         }
-
-        // lane_label 이 0(중앙/미확정)이면 "그 차선을 못 정했다"는 뜻이라
-        // object_type 이 맞아도 인식x(0)로 내보낸다 — 애매한 값을 1/2차선
-        // 어느 한쪽으로 억지로 밀어넣지 않는다.
-        const int32_t fixed_lane  = (object_type == 0 && lane_label != 0) ? lane_label : 0;
-        const int32_t moving_lane = (object_type == 1 && lane_label != 0) ? lane_label : 0;
 
         // /object_info: [신호등 정보, 고정차량 위치, 방해차량 위치]
         std_msgs::msg::Int32MultiArray out;
@@ -1354,9 +1416,13 @@ private:
     float last_box_dx_       = 0.f;
     float last_box_x_ = 0.f, last_box_y_ = 0.f, last_box_w_ = 0.f, last_box_h_ = 0.f;
     int   last_lane_label_   = 0;
+    int   last_fixed_lane_label_ = 0;
+    int   last_moving_lane_label_ = 0;
     int   last_object_type_  = -1;
     float last_object_confidence_ = 0.0f;
     rclcpp::Time last_box_stamp_{0, 0, RCL_ROS_TIME};  // 마지막 YOLO 갱신 시각
+    object_detection::LaneStabilizer fixed_lane_stabilizer_;
+    object_detection::LaneStabilizer moving_lane_stabilizer_;
 
     // ── 신호등 박스 공유 변수 (뮤텍스: mtx_traffic_boxes_, 표시 전용) ──
     std::mutex                       mtx_traffic_boxes_;

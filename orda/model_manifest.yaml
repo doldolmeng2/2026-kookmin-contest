@@ -30,23 +30,24 @@ models:
     device: cpu_or_cuda
   train10_detector:
     deploy_path: orda/perception/object_detection/model/train10_detector_best.onnx
-    sha256: dee9eb2ff5a53d752676862c376c9eb5da0aaac891069c553e1da7fde7fbe24a
-    size_bytes: 12269274
+    sha256: 0733b3d1f18058a0d03b918aefd288f3972cb5ea1240cf943ecad191a3deb0b6
+    size_bytes: 12270076
     input:
       name: images
       shape: [1, 3, 640, 640]
       type: tensor(float)
     output:
       name: output0
-      shape: [1, 10, 8400]
+      shape: [1, 11, 8400]
       type: tensor(float)
     classes:
-      0: red_car
-      1: green_car
-      2: green_light
-      3: left_green_light
-      4: orange_light
+      0: green_car
+      1: green_light
+      2: left_green_light
+      3: orange_light
+      4: red_car
       5: red_light
+      6: traffic
     runtime: onnxruntime
     provider: CPUExecutionProvider
   light1_classifier:
