@@ -53,8 +53,8 @@ TEST(SideClearance, IgnoresBodyReflectionsBeyondOneHundredDegrees)
   const auto result = calculate(scanWithPoints({{130.0, 0.12F}, {-130.0, 0.11F}}));
 
   ASSERT_TRUE(result.publishable);
-  EXPECT_TRUE(std::isinf(result.left_m));
-  EXPECT_TRUE(std::isinf(result.right_m));
+  EXPECT_FLOAT_EQ(result.left_m, object_detection::kSideClearanceNoReturnM);
+  EXPECT_FLOAT_EQ(result.right_m, object_detection::kSideClearanceNoReturnM);
 }
 
 TEST(SideClearance, IgnoresReflectionsBeyondOnePointFiveMeters)
@@ -63,7 +63,7 @@ TEST(SideClearance, IgnoresReflectionsBeyondOnePointFiveMeters)
 
   ASSERT_TRUE(result.publishable);
   EXPECT_FLOAT_EQ(result.left_m, 1.50F);
-  EXPECT_TRUE(std::isinf(result.right_m));
+  EXPECT_FLOAT_EQ(result.right_m, object_detection::kSideClearanceNoReturnM);
 }
 
 TEST(SideClearance, IgnoresNonFiniteNegativeAndScanRangeViolations)
@@ -76,17 +76,28 @@ TEST(SideClearance, IgnoresNonFiniteNegativeAndScanRangeViolations)
     }));
 
   ASSERT_TRUE(result.publishable);
-  EXPECT_TRUE(std::isinf(result.left_m));
-  EXPECT_TRUE(std::isinf(result.right_m));
+  EXPECT_FLOAT_EQ(result.left_m, object_detection::kSideClearanceNoReturnM);
+  EXPECT_FLOAT_EQ(result.right_m, object_detection::kSideClearanceNoReturnM);
 }
 
-TEST(SideClearance, EmptySideSectorsProducePositiveInfinity)
+TEST(SideClearance, EmptySideSectorsProduceFiniteClearSentinel)
 {
   const auto result = calculate(scanWithPoints({{0.0, 0.5F}}));
 
   ASSERT_TRUE(result.publishable);
-  EXPECT_TRUE(std::isinf(result.left_m));
-  EXPECT_TRUE(std::isinf(result.right_m));
+  EXPECT_FLOAT_EQ(result.left_m, object_detection::kSideClearanceNoReturnM);
+  EXPECT_FLOAT_EQ(result.right_m, object_detection::kSideClearanceNoReturnM);
+}
+
+TEST(SideClearance, ValidScanAlwaysProducesFiniteNonnegativeDistances)
+{
+  const auto result = calculate(scanWithPoints({{90.0, 0.32F}}));
+
+  ASSERT_TRUE(result.publishable);
+  EXPECT_TRUE(std::isfinite(result.left_m));
+  EXPECT_TRUE(std::isfinite(result.right_m));
+  EXPECT_GE(result.left_m, 0.0F);
+  EXPECT_GE(result.right_m, 0.0F);
 }
 
 TEST(SideClearance, MalformedScanIsNotPublishable)

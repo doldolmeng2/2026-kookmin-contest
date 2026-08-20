@@ -346,6 +346,23 @@ def test_main_scan_callback_only_records_receipt_without_raw_lidar_interpretatio
     assert "msg.ranges" not in source
 
 
+def test_object_node_owns_side_clearance_scan_calculation_and_publication():
+    orda_root = Path(__file__).resolve().parents[2]
+    source = (
+        orda_root
+        / "perception"
+        / "object_detection"
+        / "src"
+        / "object_detection.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert '#include "object_detection/side_clearance.hpp"' in source
+    assert '"/side_clearance", qos_sensor_output' in source
+    assert "rclcpp::KeepLast(1)" in source
+    assert "object_detection::calculateSideClearance(" in source
+    assert "pub_side_clearance_->publish(side_msg);" in source
+
+
 def test_invalid_lane_fit_does_not_republish_previous_offset_as_fresh_measurement():
     orda_root = Path(__file__).resolve().parents[2]
     source_path = (

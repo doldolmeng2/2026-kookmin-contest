@@ -55,6 +55,10 @@
 //   값이다(/object_info 의 fixed_lane/moving_lane 은 리셋된다). 디버깅·로깅
 //   용이고 FSM 계약과는 무관하다.
 //
+//   /side_clearance (std_msgs/Float32MultiArray [left_m, right_m])
+//   매 유효 /scan에서 좌우 60~100도 sector의 1.5m 이내 최소 거리를 낸다.
+//   sector에 반사가 없으면 finite clear sentinel 1.5m를 사용한다.
+//
 // 디버그 창 (enable_gui=true 시):
 //   "OBJECT DEBUG" : exists / distance / cluster_size (LiDAR 클러스터링, 표시 전용)
 //   "CAMERA VIEW"  : 입력 영상 + 차량/신호등 박스 오버레이
@@ -79,6 +83,8 @@
 #include <vector>
 #include <iomanip>
 #include <sstream>
+
+#include "object_detection/side_clearance.hpp"
 
 using std::placeholders::_1;
 
@@ -181,6 +187,8 @@ public:
         // QoS 프로파일
         // - qos_fast: 수치 토픽용 Best Effort + Volatile
         auto qos_fast = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
+        auto qos_sensor_output =
+            rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
 
         // LiDAR 스캔 구독
         sub_scan_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
@@ -213,6 +221,8 @@ public:
         // (스테일 리셋 미적용). 디버깅/로깅용, FSM 은 이 토픽을 구독하지 않는다.
         pub_obj_raw_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
             "/object_info_raw", qos_fast);
+        pub_side_clearance_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
+            "/side_clearance", qos_sensor_output);
 
         // ── YOLO 모델 초기화 ────────────────────────────────────────────
         // 모델 경로는 개발 PC / 실차 두 곳을 순서대로 확인한다 (resolveModelPath).
@@ -636,6 +646,19 @@ private:
     // 연속 인덱스 기반으로 클러스터링하여 가장 가까운 클러스터를 저장한다.
     // ─────────────────────────────────────────────────────────────────────
     void onScan(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+        const auto side_clearance = object_detection::calculateSideClearance(
+            msg->ranges,
+            msg->angle_min,
+            msg->angle_max,
+            msg->angle_increment,
+            msg->range_min,
+            msg->range_max);
+        if (side_clearance.publishable) {
+            std_msgs::msg::Float32MultiArray side_msg;
+            side_msg.data = {side_clearance.left_m, side_clearance.right_m};
+            pub_side_clearance_->publish(side_msg);
+        }
+
         const int N = static_cast<int>(msg->ranges.size());
         if (N == 0 || msg->angle_increment <= 0.0) {
             publishEmpty();
@@ -1281,6 +1304,7 @@ private:
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr  sub_traffic_boxes_;
     rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr       pub_obj_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr     pub_obj_raw_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr     pub_side_clearance_;
     rclcpp::TimerBase::SharedPtr timer_;      // 디버그 창 갱신 타이머
     rclcpp::TimerBase::SharedPtr pub_timer_;  // 발행 타이머
 

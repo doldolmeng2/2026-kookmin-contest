@@ -9,6 +9,8 @@
 namespace object_detection
 {
 
+constexpr float kSideClearanceNoReturnM = 1.5F;
+
 struct SideClearanceResult
 {
   bool publishable{false};
@@ -38,9 +40,11 @@ inline SideClearanceResult calculateSideClearance(
   constexpr double kRadiansToDegrees = 180.0 / kPi;
   constexpr double kSideFovMinDegrees = 60.0;
   constexpr double kSideFovMaxDegrees = 100.0;
-  constexpr float kSideMaxRangeM = 1.5F;
+  constexpr float kSideMaxRangeM = kSideClearanceNoReturnM;
 
   result.publishable = true;
+  result.left_m = kSideClearanceNoReturnM;
+  result.right_m = kSideClearanceNoReturnM;
   for (std::size_t index = 0; index < ranges.size(); ++index) {
     const float distance = ranges[index];
     if (!std::isfinite(distance) || distance < range_min || distance > range_max ||
