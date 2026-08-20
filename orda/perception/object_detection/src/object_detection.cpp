@@ -68,7 +68,13 @@
 #include <std_msgs/msg/int32.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
-#include <cv_bridge/cv_bridge.hpp>
+#if __has_include(<cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge.hpp>  // Jazzy
+#elif __has_include(<cv_bridge/cv_bridge.h>)
+#include <cv_bridge/cv_bridge.h>    // Humble
+#else
+#error "cv_bridge header not found"
+#endif
 #include <ament_index_cpp/get_package_prefix.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <fstream>
