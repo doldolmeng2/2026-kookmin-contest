@@ -1,14 +1,19 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // lane_detection.cpp
 //
-// 역할: BEV 기반 노란 차선 검출 노드
-//   1) 카메라 영상에서 노란색 픽셀을 추출하고 Canny 엣지를 계산한다.
+// 역할: PIDNet 세그멘테이션 마스크 기반 BEV 중앙선 추적 노드
+//   1) PIDNet-S가 발행한 중앙선 세그멘테이션 마스크를 입력받는다.
 //   2) 사다리꼴 ROI를 BEV(Bird's Eye View)로 투시변환한다.
 //   3) 수평/수직 노이즈를 억제한 뒤 슬라이딩 윈도우로 중앙선을 추적한다.
 //   4) 최소자승 직선 피팅 결과를 오프셋(/lane_offset)과 피팅 파라미터
 //      (/lane_fit)로 발행한다.
 //
-// 구독: /resized_image (sensor_msgs/Image, BGR8)
+// 입력이 색상 임계값에서 CNN 마스크로 바뀌었을 뿐, (2)~(4)의 BEV·노이즈
+// 억제·앵커 추적·강건 피팅은 그대로다. 그래서 JSON의 yellow_* / canny_* /
+// gaussian_blur_kernel_size 항목은 더 이상 주행에 영향을 주지 않는다
+// (스키마 호환을 위해 남겨두었을 뿐이며, hls_hsv_tuner 전용이다).
+//
+// 구독: /lane_segmentation_mask (sensor_msgs/Image, MONO8)
 //       /mode_info     (std_msgs/Int32MultiArray, [mode, lane])
 // 발행: /lane_offset       (std_msgs/Int16, 픽셀 단위 오프셋)
 //       /lane_fit           (std_msgs/Float32MultiArray, [m, b])
@@ -86,11 +91,24 @@ public:
     auto qos_sensor = rclcpp::SensorDataQoS().best_effort();
     auto qos_fast = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
 
-    // 카메라 영상 구독: /resized_image (BGR8)
+    // PIDNet-S 중앙선 마스크 구독: /lane_segmentation_mask (MONO8, 0 또는 255)
+    const std::string mask_topic = this->declare_parameter<std::string>(
+      "mask_topic", "/lane_segmentation_mask");
     image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-      "/resized_image", qos_sensor,
+      mask_topic, qos_sensor,
       std::bind(&LaneDetector::imageCallback, this, std::placeholders::_1)
     );
+    RCLCPP_INFO(get_logger(), "PIDNet 세그멘테이션 마스크 사용: %s", mask_topic.c_str());
+
+    // 디버그 창은 JSON 값을 기본으로 하되 ROS 파라미터로 덮어쓸 수 있다.
+    // JSON을 고치면 실차 주행에도 그대로 남아 성능을 깎으므로, 볼 때만
+    // 런치에서 켜고 끄는 쪽이 안전하다.
+    debug_view_ = this->declare_parameter<bool>("debug_view", config_.debug_view);
+    debug_lane_view_ =
+      this->declare_parameter<bool>("debug_lane_view", config_.debug_lane_view);
+    RCLCPP_INFO(
+      get_logger(), "디버그 창: debug_view=%s debug_lane_view=%s",
+      debug_view_ ? "true" : "false", debug_lane_view_ ? "true" : "false");
 
     // 모드/차선 정보 구독: /mode_info [mode, lane]
     //   mode: 3=차선주행, 5=차선변경
@@ -142,87 +160,6 @@ public:
       ref_start_time_ = this->now();
       ref_transition_active_ = false;
     }
-  }
-
-  // ─────────────────────────────────────────────────────────────────────
-  // (1) 노란 차선 전처리
-  //
-  // 입력 프레임에서 노란색 픽셀을 HLS ∩ HSV ∩ YCrCb 조건으로 추출하고,
-  // 모폴로지 연산(닫힘 → 열림)으로 정리한 꽉 찬 마스크를 그대로 반환한다.
-  // ROI 사다리꼴 마스크를 먼저 적용해 관심 영역 외부를 제외한다.
-  //
-  // 예전엔 여기서 Canny로 마스크의 윤곽선만 뽑아서 넘겼는데, 그러면
-  // 슬라이딩 윈도우가 보는 점이 폭 1~2px짜리 성긴 엣지뿐이라 그래디언트
-  // 기반 Canny 임계값이 조명/압축 노이즈에 반응할 때마다 프레임마다 살아
-  // 남는 점 집합이 달라져 피팅이 흔들렸다(지터링). 이미 안정적인 꽉 찬
-  // 마스크를 그대로 쓰면 윈도우당 점이 훨씬 조밀해지고, 노이즈 한 프레임에
-  // 안 흔들린다.
-  // ─────────────────────────────────────────────────────────────────────
-  Mat preprocessYellow(const Mat & frame)
-  {
-    // ROI 마스크 적용
-    Mat roi_mask = trapezoidMask(frame.size());
-    Mat roi_frame;
-    frame.copyTo(roi_frame, roi_mask);
-
-    // 색공간 변환: HLS, HSV, YCrCb
-    Mat hls, hsv, ycrcb;
-    cvtColor(roi_frame, hls, COLOR_BGR2HLS);
-    cvtColor(roi_frame, hsv, COLOR_BGR2HSV);
-    cvtColor(roi_frame, ycrcb, COLOR_BGR2YCrCb);      // 채널 순서: [Y, Cr, Cb]
-
-    // 각 색공간에서 노란색 범위 마스크 생성
-    Mat y_hls, y_hsv, y_ycc, y_mask;
-    inRange(
-      hls,
-      Scalar(config_.yellow_hls_min_h, config_.yellow_hls_min_l, config_.yellow_hls_min_s),
-      Scalar(config_.yellow_hls_max_h, config_.yellow_hls_max_l, config_.yellow_hls_max_s),
-      y_hls);
-
-    inRange(
-      hsv,
-      Scalar(config_.yellow_hsv_min_h, config_.yellow_hsv_min_s, config_.yellow_hsv_min_v),
-      Scalar(config_.yellow_hsv_max_h, config_.yellow_hsv_max_s, config_.yellow_hsv_max_v),
-      y_hsv);
-
-    // YCrCb: OpenCV 채널 순서가 [Y, Cr, Cb]임에 주의
-    inRange(
-      ycrcb,
-      Scalar(config_.yellow_ycrcb_min_y, config_.yellow_ycrcb_min_cr, config_.yellow_ycrcb_min_cb),
-      Scalar(config_.yellow_ycrcb_max_y, config_.yellow_ycrcb_max_cr, config_.yellow_ycrcb_max_cb),
-      y_ycc);
-
-    // YCrCb 채널 합산 디버그 시각화 (debug_lane_view 설정 시)
-    if (config_.debug_view && config_.debug_lane_view) {
-      std::vector<cv::Mat> ch;
-      split(ycrcb, ch);
-      imshow("YCrCb channels", (ch[0] + ch[1] + ch[2]) / 3);
-    }
-
-    // 세 색공간 마스크의 교집합 계산
-    bitwise_and(y_hls, y_hsv, y_mask);
-    bitwise_and(y_mask, y_ycc, y_mask);
-
-    // 매우 어두운 픽셀(Y ≤ 5) 억제: 검정 영역이 재유입되는 현상 방지
-    {
-      std::vector<cv::Mat> ch;
-      split(ycrcb, ch);
-      cv::Mat y_gate = ch[0] > 5;
-      y_gate.convertTo(y_gate, CV_8U, 255);
-      bitwise_and(y_mask, y_gate, y_mask);
-    }
-
-    // 모폴로지: 닫힘(구멍 메우기) → 열림(잔여 노이즈 제거)
-    Mat k_close = getStructuringElement(
-      MORPH_RECT,
-      Size(config_.kernel_yellow_closing_size, config_.kernel_yellow_closing_size));
-    Mat k_open = getStructuringElement(
-      MORPH_RECT,
-      Size(config_.kernel_yellow_opening_size, config_.kernel_yellow_opening_size));
-    morphologyEx(y_mask, y_mask, MORPH_CLOSE, k_close);
-    morphologyEx(y_mask, y_mask, MORPH_OPEN, k_open);
-
-    return y_mask;
   }
 
 
@@ -1158,16 +1095,37 @@ private:
   {
     if (smooth_enabled_) {updateRefRatio();}
 
-    // (0) ROS 이미지 → OpenCV BGR Mat
+    // (0) PIDNet-S mono8 마스크 → 이진 OpenCV 마스크
     cv_bridge::CvImagePtr cv_ptr;
     try {
-      cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+      cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::MONO8);
     } catch (cv_bridge::Exception & e) {
-      RCLCPP_ERROR(get_logger(), "cv_bridge 오류: %s", e.what());
+      RCLCPP_ERROR(get_logger(), "cv_bridge 마스크 오류: %s", e.what());
       return;
     }
-    Mat frame = cv_ptr->image;
-    if (frame.empty()) {return;}
+    Mat lane_mask = cv_ptr->image;
+    if (lane_mask.empty()) {return;}
+
+    // 모델 출력 해상도가 JSON의 frame_width/height와 다르면 맞춘다.
+    // 이진 마스크이므로 보간은 반드시 최근접(INTER_NEAREST)이어야 한다.
+    if (lane_mask.size() != Size(frame_width_, frame_height_)) {
+      resize(lane_mask, lane_mask, Size(frame_width_, frame_height_), 0, 0, INTER_NEAREST);
+    }
+    threshold(lane_mask, lane_mask, 0, 255, THRESH_BINARY);
+    bitwise_and(lane_mask, trapezoidMask(lane_mask.size()), lane_mask);
+
+    // 세그멘테이션 경계의 자잘한 구멍/점을 정리한다. 색상 파이프라인의
+    // 모폴로지와 목적은 같지만, 마스크가 이미 꽉 차 있어 커널이 더 작다.
+    Mat close_kernel = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
+    Mat open_kernel = getStructuringElement(MORPH_ELLIPSE, Size(3, 3));
+    morphologyEx(lane_mask, lane_mask, MORPH_CLOSE, close_kernel);
+    morphologyEx(lane_mask, lane_mask, MORPH_OPEN, open_kernel);
+
+    // 디버그 오버레이(publishAndDebug의 "Lane View + Offset" 등)는 BGR 캔버스를
+    // 요구한다. 원본 카메라 영상은 더 이상 구독하지 않으므로 마스크를 3채널로
+    // 올려 캔버스로 쓴다.
+    Mat frame;
+    cvtColor(lane_mask, frame, COLOR_GRAY2BGR);
 
     // ROI 사다리꼴 디버그 시각화 (debug_lane_view 설정 시)
     if (debug_view_ && debug_lane_view_) {
@@ -1176,16 +1134,15 @@ private:
       imshow("ROI Polygon", frame_roi_vis);
     }
 
-    // (1) 노란 차선 전처리: ROI 내 노란 엣지 픽셀 추출
-    Mat yellow_edges = preprocessYellow(frame);
-    if (debug_view_) {imshow("Mask-Yellow", yellow_edges);}
+    // (1) 전처리 완료된 중앙선 마스크
+    if (debug_view_) {imshow("Mask-PIDNet-Center-Lane", lane_mask);}
 
     // (2) BEV 투시변환: 사다리꼴 → 직사각형
     Mat bev_yellow;
     warpPerspective(
-      yellow_edges, bev_yellow, H_, bev_size_,
-      INTER_LINEAR, BORDER_CONSTANT, Scalar(0));
-    if (debug_view_ && debug_lane_view_) {imshow("BEV-Yellow", bev_yellow);}
+      lane_mask, bev_yellow, H_, bev_size_,
+      INTER_NEAREST, BORDER_CONSTANT, Scalar(0));
+    if (debug_view_ && debug_lane_view_) {imshow("BEV-PIDNet-Center-Lane", bev_yellow);}
 
     // (3) 노이즈 억제 준비: corridor 범위 및 디버그 캔버스 준비
     const int y_start_chk = (int)std::round(bev_size_.height * 0.0f);

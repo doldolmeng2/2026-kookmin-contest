@@ -9,7 +9,9 @@
 #     따라서 입력이 잠깐 끊겨도 터미널 STOP으로 래치되지 않는다.
 #   - 신호등, 라바콘, 장애물, 차선변경을 전혀 보지 않는다.
 #
-# 제어식은 main 패키지 control.py의 LANE_DRIVE 프로필과 동일하다.
+# 제어식은 PD 그대로다. main 패키지 control.py의 LANE_DRIVE는 Pure Pursuit로
+# 바뀌었으므로 더 이상 같지 않다 — PD와 Pure Pursuit를 비교할 때 이 도구를
+# 기준선으로 쓸 수 있다.
 #   조향: angle = kp * offset + kd * (offset - prev_offset)
 #   속도: speed = max_speed - |angle| * scale_factor, 하한 min_speed
 #   발행: 위 speed에 speed_scale(기본 0.5)을 곱한 값

@@ -22,7 +22,13 @@ find_package(sensor_msgs REQUIRED)
 # find_package(cv_bridge) 보다 반드시 먼저 와야 한다 — cv_bridge 의 cmake config
 # 가 내부적으로 find_package(OpenCV) 를 호출하는데, 그게 먼저 실행되면 버전
 # 제약 없이 기본 탐색 경로(4.11 우선)로 이미 캐시돼서 아래 지정이 무시된다.
-find_package(OpenCV REQUIRED PATHS /usr/lib/x86_64-linux-gnu/cmake/opencv4 NO_DEFAULT_PATH)
+# 경로에 아키텍처를 박으면 실차(J4012, aarch64)에서 깨진다. 그 머신에는
+# /usr/lib/x86_64-linux-gnu 가 없고 OpenCV config 가 /usr/lib/cmake/opencv4 에
+# 있다. NO_DEFAULT_PATH 는 그대로 두어 /usr/local 4.11 은 계속 배제한다.
+find_package(OpenCV REQUIRED PATHS
+  /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/cmake/opencv4
+  /usr/lib/cmake/opencv4
+  NO_DEFAULT_PATH)
 find_package(cv_bridge REQUIRED)
 
 # 실행 파일 빌드
