@@ -1,0 +1,35 @@
+# ── 외부 라이브러리 (별도 clone) ────────────────────────────
+# https://github.com/mgonzs13/yolo_ros  (GPL-3.0, v4.1.1)
+yolo_ros/
+
+# ── colcon / ament 빌드 산출물 ──────────────────────────────
+# 워크스페이스 루트가 아닌 곳에서 colcon build를 돌리면 여기 생깁니다
+build/
+install/
+log/
+
+# ── Python ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ── 모델 가중치 (용량이 커서 제외) ──────────────────────────
+*.pt
+*.pth
+*.engine
+
+# ── 편집기 임시 파일 ────────────────────────────────────────
+.*.sw[op]
+*~
+.vscode/
+
+# ── 백업 ───────────────────────────────────────────────────
+*.bak
+*.bak_*
+*.onnx.bak_*
+orda/perception/object_detection/best_back.onnx
+orda/perception/object_detection/best_simplified.onnx
+orda/perception/traffic_light.zip
+
+# ── WSL/Windows 잔여 메타데이터 ─────────────────────────────
+*:Zone.Identifier
