@@ -19,7 +19,6 @@
 # 포함되는 런치 파일:
 #   xycar_cam.launch.py       - 카메라 드라이버
 #   xycar_lidar.launch.py     - LiDAR 드라이버
-#   xycar_ultrasonic.launch.py- 초음파 드라이버
 #
 # 런치 인수:
 #   mode (기본값: 0) - main_node 초기 주행 모드
@@ -242,11 +241,6 @@ def generate_launch_description():
         description='Main motor output; production default is the fixed contract',
     )
     motor_output_topic = LaunchConfiguration('motor_output_topic')
-    enable_ultrasonic_arg = DeclareLaunchArgument(
-        'enable_ultrasonic', default_value='false', choices=('false', 'true'),
-        description='Start the unused ultrasonic producer only when explicitly requested',
-    )
-    enable_ultrasonic = LaunchConfiguration('enable_ultrasonic')
     lidar_port_arg = DeclareLaunchArgument(
         'lidar_port',
         default_value='/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0',
@@ -396,17 +390,6 @@ def generate_launch_description():
         ),
         launch_arguments={'port': lidar_port}.items(),
     )
-    # 초음파
-    ultrasonic_launch = IncludeLaunchDescription(
-        AnyLaunchDescriptionSource(
-            os.path.join(
-                get_package_share_directory('xycar_ultrasonic'),
-                'launch/xycar_ultrasonic.launch.py'
-            )
-        ),
-        condition=IfCondition(enable_ultrasonic),
-    )
-
     return LaunchDescription([
         mode_arg,
         lane_target_arg,
@@ -432,7 +415,6 @@ def generate_launch_description():
         traffic_classifier_model_path_arg,
         perception_camera_topic_arg,
         motor_output_topic_arg,
-        enable_ultrasonic_arg,
         lidar_port_arg,
         udp_motor_bridge_arg,
         main_node,
@@ -447,5 +429,4 @@ def generate_launch_description():
         preflight_node,
         cam_launch,
         lidar_launch,
-        ultrasonic_launch,
     ])

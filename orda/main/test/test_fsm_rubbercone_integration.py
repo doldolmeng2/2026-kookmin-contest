@@ -280,9 +280,7 @@ def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
     assert "image_resize" not in packages
     assert "executable='resize_node'" not in source
     assert "'input_topic': '/resized_image'" in source
-    assert not {
-        "xycar_cam", "xycar_lidar", "xycar_ultrasonic"
-    }.intersection(packages)
+    assert not {"xycar_cam", "xycar_lidar"}.intersection(packages)
     assert "default_value='false'" in source
     assert "'udp_motor_bridge', default_value='false'" in source
     assert "' == 'true' and '" in source

@@ -6,7 +6,7 @@
 # module_drive.py와의 차이점:
 #   - 하드웨어 드라이버 (카메라, LiDAR) 런치 파일 미포함
 #     → bag 파일이 /image_raw, /scan 등 토픽을 직접 재생하기 때문
-#   - joy_node, xycar_ultrasonic 미포함 (하드웨어 없음)
+#   - joy_node 미포함 (하드웨어 없음)
 #   - main_node의 모터 명령을 /kmu_main_offline/xycar_motor로 격리
 #
 # 시작되는 노드:
