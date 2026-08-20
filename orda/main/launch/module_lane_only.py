@@ -53,6 +53,24 @@ def generate_launch_description():
             description="PIDNet-S checkpoint path",
         ),
         DeclareLaunchArgument(
+            "lane_debug",
+            default_value="false",
+            choices=("false", "true"),
+            description=(
+                "차선 인식 OpenCV 창 표시 (SlidingWindows / Mask-PIDNet-Center-Lane / "
+                "Vehicle Dynamics). 영상 표시가 CPU를 쓰므로 기록 주행에서는 끌 것."
+            ),
+        ),
+        DeclareLaunchArgument(
+            "lane_debug_detail",
+            default_value="false",
+            choices=("false", "true"),
+            description=(
+                "보조 차선 창까지 표시 (ROI Polygon / BEV-PIDNet-Center-Lane / "
+                "Lane View + Offset). lane_debug:=true 일 때만 의미가 있다."
+            ),
+        ),
+        DeclareLaunchArgument(
             "pidnet_lane_classes",
             default_value="[1]",
             description=(
@@ -115,6 +133,14 @@ def generate_launch_description():
         executable="lane_node",
         name="lane_node",
         output="screen",
+        parameters=[{
+            "debug_view": ParameterValue(
+                LaunchConfiguration("lane_debug"), value_type=bool
+            ),
+            "debug_lane_view": ParameterValue(
+                LaunchConfiguration("lane_debug_detail"), value_type=bool
+            ),
+        }],
         remappings=[("/mode_info", "/internal/lane_command")],
     )
     preflight = Node(

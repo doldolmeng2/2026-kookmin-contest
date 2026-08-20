@@ -86,6 +86,24 @@ def generate_launch_description():
         description='상태 OpenCV 창 표시 여부 (실차 제어 시 false 권장)'
     )
     show_debug = LaunchConfiguration('show_debug')
+    lane_debug_arg = DeclareLaunchArgument(
+        'lane_debug',
+        default_value='false',
+        choices=('false', 'true'),
+        description=(
+            '차선 인식 OpenCV 창 표시 (SlidingWindows / Mask-PIDNet-Center-Lane / '
+            'Vehicle Dynamics). 영상 표시가 CPU를 쓰므로 기록 주행에서는 끌 것.'
+        )
+    )
+    lane_debug_detail_arg = DeclareLaunchArgument(
+        'lane_debug_detail',
+        default_value='false',
+        choices=('false', 'true'),
+        description=(
+            '보조 차선 창까지 표시 (ROI Polygon / BEV-PIDNet-Center-Lane / '
+            'Lane View + Offset). lane_debug:=true 일 때만 의미가 있다.'
+        )
+    )
     pidnet_model_arg = DeclareLaunchArgument(
         'pidnet_model',
         default_value=os.path.join(
@@ -304,6 +322,14 @@ def generate_launch_description():
         executable='lane_node',
         name='lane_node',
         output='screen',
+        parameters=[{
+            'debug_view': ParameterValue(
+                LaunchConfiguration('lane_debug'), value_type=bool
+            ),
+            'debug_lane_view': ParameterValue(
+                LaunchConfiguration('lane_debug_detail'), value_type=bool
+            ),
+        }],
         remappings=[('/mode_info', '/internal/lane_command')],
     )
     object_yolo_node = Node(
@@ -385,6 +411,8 @@ def generate_launch_description():
         mode_arg,
         lane_target_arg,
         show_debug_arg,
+        lane_debug_arg,
+        lane_debug_detail_arg,
         pidnet_model_arg,
         pidnet_lane_classes_arg,
         rubbercone_offset_filter_alpha_arg,

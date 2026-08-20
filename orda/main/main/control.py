@@ -41,9 +41,9 @@ PD_PARAMS = {
 # /lane_offset을 차량 중심에서 목표 경로까지의 횡방향 거리 x로 사용하고,
 # 차량 전방 lookahead_px 위치에 목표점 (x, lookahead_px)이 있다고 본다.
 PURE_PURSUIT_PARAMS = {
-    'lookahead_px':       120.0,
-    'wheelbase_px':        30.0,
-    'steering_gain':        1.0,
+    'lookahead_px':       120.0,  #늘리면 조향이 완만해지고, 줄이면 조향이 날카로워진다.
+    'wheelbase_px':        30.0,  #코너에서 조향이 모자라면 늘리면 됨.
+    'steering_gain':        1.0,  #전체적인 조향이 약할 때 늘리면 됨.
     'max_steering_angle': 40.0,
 }
 
@@ -52,11 +52,11 @@ PURE_PURSUIT_PARAMS = {
 #   min_speed    : 최소 속도 (조향각이 커도 이 속도 아래로 떨어지지 않음)
 #   scale_factor : |조향각| × scale_factor 만큼 최대 속도에서 감속
 SPEED_PARAMS = {
-    Mode.LANE_DRIVE: (43.0, 16.0, 0.5),
+    Mode.LANE_DRIVE: (43.0, 25.0, 0.5),
     # 회피 중에는 낮은 속도로 안정적으로 옮겨간다. 빠르면 차선 변경이 끝나기
     # 전에 장애물에 도달한다.
     # ★ 실차 튜닝 지점: 회피가 늦으면 max_speed를 낮추고, 굼뜨면 올린다.
-    Mode.FIXED_AVOID: (30.0, 14.0, 0.6),
+    Mode.FIXED_AVOID: (25.0, 14.0, 0.6),
 }
 
 # 라바콘 속도 제어 파라미터.

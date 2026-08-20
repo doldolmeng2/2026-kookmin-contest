@@ -1,7 +1,7 @@
 # J4012 ROS 2 to Noetic motor bridge
 
 Run these scripts directly from the repository; they are operational scripts
-and are not installed into `install_jazzy`.
+and are not installed into `install`.
 
 ```bash
 bash ~/xycar_ws/src/orda/main/tools/start_noetic_motor.sh
@@ -13,7 +13,7 @@ Run a live mission only with required real producers connected. The profiles are
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-source ~/xycar_ws/install_jazzy/setup.bash
+source ~/xycar_ws/install/setup.bash
 ros2 launch main module_drive_mission_test.py test_profile:=2 live_drive:=true
 ```
 

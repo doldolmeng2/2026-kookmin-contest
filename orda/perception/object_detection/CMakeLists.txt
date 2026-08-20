@@ -17,7 +17,13 @@ find_package(sensor_msgs REQUIRED)
 # 4.5.4 에서 문제없이 검증됐다(object_detection.cpp 참고) — 4.11 이 필요했던 건
 # best.onnx YOLO 검출기 쪽인데 그건 use_external_yolo_=true 로 이미 꺼져 있다.
 # 자세한 이유는 image_resize/CMakeLists.txt 참고.
-find_package(OpenCV REQUIRED PATHS /usr/lib/x86_64-linux-gnu/cmake/opencv4 NO_DEFAULT_PATH)
+# 경로에 아키텍처를 박으면 실차(J4012, aarch64)에서 깨진다. 그 머신에는
+# /usr/lib/x86_64-linux-gnu 가 없고 OpenCV config 가 /usr/lib/cmake/opencv4 에
+# 있다. NO_DEFAULT_PATH 는 그대로 두어 /usr/local 4.11 은 계속 배제한다.
+find_package(OpenCV REQUIRED PATHS
+  /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/cmake/opencv4
+  /usr/lib/cmake/opencv4
+  NO_DEFAULT_PATH)
 find_package(cv_bridge REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 

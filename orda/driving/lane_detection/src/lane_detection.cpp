@@ -100,6 +100,16 @@ public:
     );
     RCLCPP_INFO(get_logger(), "PIDNet 세그멘테이션 마스크 사용: %s", mask_topic.c_str());
 
+    // 디버그 창은 JSON 값을 기본으로 하되 ROS 파라미터로 덮어쓸 수 있다.
+    // JSON을 고치면 실차 주행에도 그대로 남아 성능을 깎으므로, 볼 때만
+    // 런치에서 켜고 끄는 쪽이 안전하다.
+    debug_view_ = this->declare_parameter<bool>("debug_view", config_.debug_view);
+    debug_lane_view_ =
+      this->declare_parameter<bool>("debug_lane_view", config_.debug_lane_view);
+    RCLCPP_INFO(
+      get_logger(), "디버그 창: debug_view=%s debug_lane_view=%s",
+      debug_view_ ? "true" : "false", debug_lane_view_ ? "true" : "false");
+
     // 모드/차선 정보 구독: /mode_info [mode, lane]
     //   mode: 3=차선주행, 5=차선변경
     //   lane: 0=1차선,    1=2차선
