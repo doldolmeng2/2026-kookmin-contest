@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from main.control_selector import ControlSource
-from main.mission_types import LaneTarget, RouteTrafficSignal
+from main.mission_types import LaneTarget, ObjectLane, RouteTrafficSignal
 from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
@@ -50,6 +50,10 @@ COMPLETION_PROFILES = [
 ]
 
 
+def object_message(lane):
+    return [1.0, 1.2, 0.1, 0.2, 5.0, 100.0, 20.0, 30.0, 4.0, lane.value]
+
+
 def test_race_profile_is_a_noop_and_preserves_normal_startup_contract():
     fsm = RaceFSM(initial_state=Mode.WAIT_GREEN)
     context = RaceContext()
@@ -81,6 +85,46 @@ def test_each_named_profile_starts_in_exact_existing_mode(profile):
         "lane_two": LaneTarget.LANE_TWO,
     }.get(profile, LaneTarget.CENTER)
     assert runtime.context.lane_target is expected_lane
+
+
+@pytest.mark.parametrize(
+    ("profile", "first_lane", "expected_target", "opposite_lane"),
+    [
+        ("fixed", ObjectLane.LEFT, LaneTarget.LANE_TWO, ObjectLane.RIGHT),
+        ("overtake", ObjectLane.RIGHT, LaneTarget.LANE_ONE, ObjectLane.LEFT),
+    ],
+)
+def test_direct_object_profile_locks_the_first_fresh_known_lane(
+    profile,
+    first_lane,
+    expected_target,
+    opposite_lane,
+):
+    runtime = RaceRuntimeAdapter()
+    runtime.bootstrap_test_profile(profile, started_at=10.0)
+
+    assert runtime.record_object_info(object_message(ObjectLane.UNKNOWN), 10.1).accepted
+    runtime.step(10.1)
+    assert runtime.lane_action.target_locked is False
+    assert runtime.lane_action.target is None
+    assert runtime.context.lane_target is LaneTarget.CENTER
+
+    assert runtime.record_object_info(object_message(first_lane), 10.2).accepted
+    runtime.step(10.2)
+    started_at = runtime.lane_action.started_at
+    assert runtime.lane_action.target_locked is True
+    assert runtime.lane_action.target is expected_target
+    assert runtime.context.lane_target is expected_target
+    assert runtime.lane_action.pending is True
+
+    assert runtime.record_object_info(object_message(opposite_lane), 10.3).accepted
+    runtime.step(10.3)
+    assert runtime.lane_action.target_locked is True
+    assert runtime.lane_action.target is expected_target
+    assert runtime.context.lane_target is expected_target
+    assert runtime.lane_action.pending is True
+    assert runtime.lane_action.completed is False
+    assert runtime.lane_action.started_at == started_at
 
 
 def test_shortcut_profile_bootstraps_self_consistent_lap_context():

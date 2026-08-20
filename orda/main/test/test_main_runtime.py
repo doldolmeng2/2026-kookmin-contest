@@ -317,34 +317,105 @@ def test_fixed_entry_snapshot_starts_one_lane_action_after_fsm_commit():
     assert harness.runtime._pending_object_entry_evidence is None
 
 
-def test_unknown_fixed_entry_waits_for_one_post_zone_stable_lane():
-    harness = ObjectEntryHarness(
-        [1.10, 1.30],
-        mode=Mode.LANE_DRIVE,
-        state_entered_at=1.0,
+@pytest.mark.parametrize(
+    ("object_type", "object_lane", "expected_state", "expected_target"),
+    [
+        (ObjectType.FIXED, ObjectLane.LEFT, Mode.FIXED_AVOID, LaneTarget.LANE_TWO),
+        (ObjectType.FIXED, ObjectLane.RIGHT, Mode.FIXED_AVOID, LaneTarget.LANE_ONE),
+        (ObjectType.MOVING, ObjectLane.LEFT, Mode.OVERTAKE, LaneTarget.LANE_TWO),
+        (ObjectType.MOVING, ObjectLane.RIGHT, Mode.OVERTAKE, LaneTarget.LANE_ONE),
+    ],
+)
+def test_object_entry_locks_fixed_and_moving_lane_mapping(
+    object_type,
+    object_lane,
+    expected_state,
+    expected_target,
+):
+    runtime = RaceRuntimeAdapter(
+        fsm=RaceFSM(initial_state=Mode.LANE_DRIVE),
+        context=RaceContext(state_entered_at=1.0),
     )
+    assert runtime.record_object_info(
+        _object_entry_message(object_type, object_lane).data,
+        1.10,
+    ).accepted
+    snapshot = runtime.latest_object_snapshot
+    assert snapshot is not None
+    assert runtime.record_object_mission_entry(
+        expected_state,
+        snapshot,
+        1.20,
+    ).accepted
 
-    entered = _record_object_entry(
-        harness,
-        ObjectType.FIXED,
-        ObjectLane.UNKNOWN,
-        now=1.20,
+    cycle = runtime.step(1.20)
+
+    assert cycle.transition.target is expected_state
+    assert runtime.context.lane_target is expected_target
+    assert runtime.lane_action.target is expected_target
+    assert runtime.lane_action.target_locked is True
+    assert runtime.lane_action.pending is True
+
+
+def test_committed_entry_evidence_locks_after_object_freshness_expires():
+    runtime = RaceRuntimeAdapter(
+        fsm=RaceFSM(initial_state=Mode.LANE_DRIVE),
+        context=RaceContext(state_entered_at=1.0),
+        object_max_age_s=0.1,
     )
-    assert entered.transition.target is Mode.FIXED_AVOID
-    assert harness.runtime.context.lane_target is LaneTarget.CENTER
-    assert harness.runtime.lane_action.pending is False
-    assert harness.runtime._pending_object_entry_evidence is None
+    assert runtime.record_object_info(
+        _object_entry_message(ObjectType.FIXED, ObjectLane.LEFT).data,
+        1.10,
+    ).accepted
+    snapshot = runtime.latest_object_snapshot
+    assert snapshot is not None
+    assert runtime.record_object_mission_entry(
+        Mode.FIXED_AVOID,
+        snapshot,
+        1.20,
+    ).accepted
 
-    MainNode.object_info_raw_callback(
-        harness,
-        _object_entry_message(ObjectType.FIXED, ObjectLane.LEFT),
+    cycle = runtime.step(1.50)
+
+    assert cycle.transition.target is Mode.FIXED_AVOID
+    assert runtime.context.lane_target is LaneTarget.LANE_TWO
+    assert runtime.lane_action.target is LaneTarget.LANE_TWO
+    assert runtime.lane_action.target_locked is True
+
+
+@pytest.mark.parametrize(
+    ("object_type", "expected_state"),
+    [
+        (ObjectType.FIXED, Mode.FIXED_AVOID),
+        (ObjectType.MOVING, Mode.OVERTAKE),
+    ],
+)
+def test_production_unknown_lane_entry_is_rejected_without_an_edge(
+    object_type,
+    expected_state,
+):
+    runtime = RaceRuntimeAdapter(
+        fsm=RaceFSM(initial_state=Mode.LANE_DRIVE),
+        context=RaceContext(state_entered_at=1.0),
     )
-    harness.runtime.step(1.31)
+    assert runtime.record_object_info(
+        _object_entry_message(object_type, ObjectLane.UNKNOWN).data,
+        1.10,
+    ).accepted
+    snapshot = runtime.latest_object_snapshot
+    assert snapshot is not None
 
-    assert harness.runtime.context.lane_target is LaneTarget.LANE_TWO
-    assert harness.runtime.lane_action.target is LaneTarget.LANE_TWO
-    assert harness.runtime.lane_action.pending is True
-    assert harness.runtime.lane_action.started_at == pytest.approx(1.31)
+    result = runtime.record_object_mission_entry(expected_state, snapshot, 1.20)
+    cycle = runtime.step(1.20)
+
+    assert result.accepted is False
+    assert "LEFT or RIGHT" in result.warning
+    assert cycle.observation.fixed_zone_entered is False
+    assert cycle.observation.overtake_entered is False
+    assert cycle.transition.changed is False
+    assert runtime.fsm.state is Mode.LANE_DRIVE
+    assert runtime.context.lane_target is LaneTarget.CENTER
+    assert runtime._pending_object_entry_evidence is None
 
 
 @pytest.mark.parametrize(
@@ -404,6 +475,52 @@ def test_entry_evidence_is_discarded_when_safety_commits_another_state():
     runtime.step(1.40)
     assert runtime.context.lane_target is LaneTarget.CENTER
     assert runtime.lane_action.pending is False
+    assert runtime.lane_action.target_locked is False
+
+
+def test_lane_action_lock_resets_for_a_new_object_mission():
+    runtime = RaceRuntimeAdapter(
+        fsm=RaceFSM(initial_state=Mode.LANE_DRIVE),
+        context=RaceContext(state_entered_at=1.0),
+    )
+    assert runtime.record_object_info(
+        _object_entry_message(ObjectType.FIXED, ObjectLane.RIGHT).data,
+        1.10,
+    ).accepted
+    first_snapshot = runtime.latest_object_snapshot
+    assert first_snapshot is not None
+    assert runtime.record_object_mission_entry(
+        Mode.FIXED_AVOID,
+        first_snapshot,
+        1.20,
+    ).accepted
+    runtime.step(1.20)
+    assert runtime.context.lane_target is LaneTarget.LANE_ONE
+    assert runtime.lane_action.target_locked is True
+
+    assert runtime.record_fixed_zone_exit(1.30).accepted
+    exited = runtime.step(1.30)
+    assert exited.transition.target is Mode.LANE_DRIVE
+    assert runtime.context.lane_target is LaneTarget.LANE_ONE
+    assert runtime.lane_action.target_locked is False
+
+    assert runtime.record_object_info(
+        _object_entry_message(ObjectType.MOVING, ObjectLane.LEFT).data,
+        1.40,
+    ).accepted
+    second_snapshot = runtime.latest_object_snapshot
+    assert second_snapshot is not None
+    assert runtime.record_object_mission_entry(
+        Mode.OVERTAKE,
+        second_snapshot,
+        1.50,
+    ).accepted
+    entered = runtime.step(1.50)
+
+    assert entered.transition.target is Mode.OVERTAKE
+    assert runtime.context.lane_target is LaneTarget.LANE_TWO
+    assert runtime.lane_action.target is LaneTarget.LANE_TWO
+    assert runtime.lane_action.target_locked is True
 
 
 @pytest.mark.parametrize(

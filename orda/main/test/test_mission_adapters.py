@@ -538,37 +538,51 @@ def test_main_trusts_one_perception_stabilized_lane_message():
     assert runtime.context.lane_target is LaneTarget.LANE_TWO
 
 
-def test_wrong_direction_is_corrected_after_the_change_completed():
-    """구간 안에서 방향을 고칠 수 있어야 한다.
+def test_pending_action_ignores_opposite_lane_evidence():
+    runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.CENTER)
 
-    예전에는 재타겟 조건에 ``not action.completed`` 가 걸려 있어서, 변경이 한
-    번 끝나면 반대 증거가 아무리 쌓여도 목표를 되돌릴 수 없었다.
+    feed_direction(runtime, ObjectLane.RIGHT.value, DIRECTION_TIMES)
+    started_at = runtime.lane_action.started_at
+    feed_direction(runtime, ObjectLane.LEFT.value, (1.5, 1.65, 1.8))
+
+    assert runtime.context.lane_target is LaneTarget.LANE_ONE
+    assert runtime.lane_action.target is LaneTarget.LANE_ONE
+    assert runtime.lane_action.target_locked is True
+    assert runtime.lane_action.pending is True
+    assert runtime.lane_action.completed is False
+    assert runtime.lane_action.started_at == started_at
+
+
+def test_completed_action_ignores_opposite_lane_evidence():
+    """구간 진입 때 정한 방향은 차선 변경 완료 후에도 유지한다.
+
+    새 object snapshot은 action 완료 상태와 목표를 다시 초기화하지 않는다.
     """
 
     runtime = adapter(Mode.FIXED_AVOID, lane_target=LaneTarget.CENTER)
 
-    # 잘못된 방향으로 1차선 변경이 시작되고 완료된다.
     feed_direction(runtime, ObjectLane.RIGHT.value, DIRECTION_TIMES)
     assert runtime.context.lane_target is LaneTarget.LANE_ONE
     assert runtime.record_lane_position(LaneTarget.LANE_ONE.value, 1.45)
     runtime.record_object_info(object_message(lane=ObjectLane.RIGHT.value), 1.5)
     runtime.step(1.5, lane=candidate(1.5))
     assert runtime.lane_action.completed is True
+    completed_at = runtime.lane_action.completed_at
 
-    # 이후 카메라가 "장애물은 왼쪽"이라고 계속 말한다.
     feed_direction(runtime, ObjectLane.LEFT.value, (1.9, 2.05, 2.2))
 
-    assert runtime.context.lane_target is LaneTarget.LANE_TWO
-    assert runtime.lane_action.target is LaneTarget.LANE_TWO
-    assert runtime.lane_action.pending is True
-    assert runtime.lane_action.completed is False
-    # 명령도 다시 차선 변경(5)으로 나가야 lane_detection 이 기준선을 옮긴다.
+    assert runtime.context.lane_target is LaneTarget.LANE_ONE
+    assert runtime.lane_action.target is LaneTarget.LANE_ONE
+    assert runtime.lane_action.target_locked is True
+    assert runtime.lane_action.pending is False
+    assert runtime.lane_action.completed is True
+    assert runtime.lane_action.completed_at == completed_at
     assert lane_command_data(
         runtime.fsm.state,
         runtime.context.lane_target.value,
         mission_lane_control_enabled=runtime.lane_action.safe_to_drive,
         lane_change_active=runtime.lane_action.pending,
-    ) == [5, 2]
+    ) == [3, 1]
 
 
 def test_center_is_the_default_before_any_avoidance():

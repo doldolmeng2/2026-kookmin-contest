@@ -188,6 +188,7 @@ class LaneActionStatus:
     pending: bool = False
     completed: bool = False
     target: Optional[LaneTarget] = None
+    target_locked: bool = False
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
 
@@ -760,6 +761,11 @@ class RaceRuntimeAdapter:
         )
         if snapshot.object_type is not expected_type:
             return InputRecordResult(False, "object entry type/state mismatch")
+        if opposite_lane_target(snapshot.lane) is None:
+            return InputRecordResult(
+                False,
+                "object entry lane must be LEFT or RIGHT",
+            )
 
         event_name = (
             "fixed_zone_entry"
@@ -770,13 +776,12 @@ class RaceRuntimeAdapter:
         if not result.accepted:
             return result
 
-        if opposite_lane_target(snapshot.lane) is not None:
-            self._pending_object_entry_evidence = ObjectEntryEvidence(
-                expected_state=expected_state,
-                lane=snapshot.lane,
-                object_received_at=snapshot.received_at,
-                mission_edge_received_at=received_at,
-            )
+        self._pending_object_entry_evidence = ObjectEntryEvidence(
+            expected_state=expected_state,
+            lane=snapshot.lane,
+            object_received_at=snapshot.received_at,
+            mission_edge_received_at=received_at,
+        )
         return result
 
     def record_overtake_complete(self, received_at: float) -> InputRecordResult:
@@ -1165,7 +1170,7 @@ class RaceRuntimeAdapter:
             if entry_evidence is not None
             else observation.object_received_at
         )
-        target_fresh = self._event_is_fresh(
+        target_fresh = entry_evidence is not None or self._event_is_fresh(
             target_received_at,
             observation.now,
             self.object_max_age_s,
@@ -1176,26 +1181,20 @@ class RaceRuntimeAdapter:
             and observation.object_received_at > self.context.state_entered_at
         )
         if (
-            target_fresh
-            and (entry_evidence is not None or observation.object_box_px > 0.0)
+            not action.target_locked
+            and target_fresh
             and target is not None
-            and target != self.context.lane_target
             and target_is_authorized
         ):
-            # 이미 시작했거나(pending) 끝난(completed) 변경이어도 방향을 고친다.
-            # 예전에는 not pending and not completed 를 요구해서, 잘못된
-            # 방향으로 한 번 들어가면 반대 증거가 아무리 쌓여도 되돌릴 수
-            # 없었다. 실측 bag에서 car_lane=1 이 20프레임 넘게 연속으로
-            # 나왔는데도 목표가 1차선(장애물이 있는 쪽)에 고정된 채 충돌했다.
-            #
-            # 중앙(CENTER) 복귀는 여기서도 일어나지 않는다.
-            # opposite_lane_target() 이 좌/우만 돌려주기 때문이다.
+            target_changed = target != self.context.lane_target
             self.context.lane_target = target
             action.target = target
-            action.pending = True
-            action.completed = False
-            action.completed_at = None
-            action.started_at = observation.now
+            action.target_locked = True
+            if target_changed:
+                action.pending = True
+                action.completed = False
+                action.completed_at = None
+                action.started_at = observation.now
 
         # 차선 변경 완료 판정 ①: 실측 차선(/lane_position)이 목표와 일치.
         #
