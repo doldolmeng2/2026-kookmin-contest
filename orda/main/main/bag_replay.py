@@ -60,7 +60,6 @@ _ALLOWED_TRANSITIONS = frozenset(
         (Mode.LANE_DRIVE, Mode.FIXED_AVOID),
         (Mode.FIXED_AVOID, Mode.LANE_DRIVE),
         (Mode.LANE_DRIVE, Mode.OVERTAKE),
-        (Mode.FIXED_AVOID, Mode.OVERTAKE),
         (Mode.OVERTAKE, Mode.LANE_DRIVE),
         (Mode.LANE_DRIVE, Mode.SHORTCUT),
         (Mode.SHORTCUT, Mode.LANE_DRIVE),

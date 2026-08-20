@@ -50,10 +50,6 @@ class MissionObservation:
     fixed_zone_entry_received_at: Optional[float] = None
     fixed_zone_exited: bool = False
     fixed_zone_exit_received_at: Optional[float] = None
-    # Deprecated pre-merge seam. Production uses fixed_zone_exited; retained
-    # only so old bags/tests fail closed instead of failing deserialization.
-    fixed_avoid_complete: bool = False
-    fixed_avoid_completed_at: Optional[float] = None
     overtake_entered: bool = False
     overtake_entry_received_at: Optional[float] = None
     route_traffic_signal: RouteTrafficSignal = RouteTrafficSignal.UNKNOWN

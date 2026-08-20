@@ -260,21 +260,6 @@ class RaceFSM:
                     context,
                     observation.now,
                 )
-            if (
-                observation.fixed_avoid_complete is True
-                and self._accept_mission_edge(
-                    "fixed_avoid_complete",
-                    observation.fixed_avoid_completed_at,
-                    observation,
-                    context,
-                )
-            ):
-                return self._change(
-                    Mode.OVERTAKE,
-                    "legacy fixed completion chain",
-                    context,
-                    observation.now,
-                )
             return self._stay("waiting for fresh fixed-zone exit")
 
         if self.state is Mode.OVERTAKE:

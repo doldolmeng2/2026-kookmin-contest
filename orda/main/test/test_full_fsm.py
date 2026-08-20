@@ -38,10 +38,6 @@ def edge_observation(now, name, received_at=_UNSET):
             "fixed_zone_exited": True,
             "fixed_zone_exit_received_at": timestamp,
         },
-        "fixed_avoid_complete": {
-            "fixed_avoid_complete": True,
-            "fixed_avoid_completed_at": timestamp,
-        },
         "overtake_complete": {
             "overtake_complete": True,
             "overtake_complete_received_at": timestamp,
@@ -270,7 +266,7 @@ def test_fixed_zone_edges_return_straight_to_lane_drive():
 @pytest.mark.parametrize(
     ("state", "edge_name"),
     [
-        (Mode.FIXED_AVOID, "fixed_avoid_complete"),
+        (Mode.FIXED_AVOID, "fixed_exit"),
         (Mode.OVERTAKE, "overtake_complete"),
         (Mode.SHORTCUT, "shortcut_complete"),
     ],
@@ -307,7 +303,7 @@ def test_pre_entry_stale_and_duplicate_mission_edges_are_ignored(
 @pytest.mark.parametrize(
     ("state", "edge_name", "target"),
     [
-        (Mode.FIXED_AVOID, "fixed_avoid_complete", Mode.OVERTAKE),
+        (Mode.FIXED_AVOID, "fixed_exit", Mode.LANE_DRIVE),
         (Mode.OVERTAKE, "overtake_complete", Mode.LANE_DRIVE),
         (Mode.SHORTCUT, "shortcut_complete", Mode.LANE_DRIVE),
     ],
@@ -340,7 +336,7 @@ def test_fresh_completion_is_consumed_once_per_state_session(
 @pytest.mark.parametrize(
     ("state", "edge_name"),
     [
-        (Mode.FIXED_AVOID, "fixed_avoid_complete"),
+        (Mode.FIXED_AVOID, "fixed_exit"),
         (Mode.OVERTAKE, "overtake_complete"),
         (Mode.SHORTCUT, "shortcut_complete"),
     ],
@@ -412,7 +408,7 @@ def test_safety_stop_precedes_all_simultaneous_mission_edges():
     context = RaceContext(state_entered_at=1.0)
 
     transition = fsm.step(
-        edge_observation(1.1, "fixed_avoid_complete"),
+        edge_observation(1.1, "fixed_exit"),
         context,
         SafetyDecision(must_stop=True, reason="synthetic fault"),
     )

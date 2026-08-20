@@ -108,10 +108,6 @@ class SyntheticRace:
     def completion(self, name):
         timestamp = self._next_time()
         fields = {
-            "fixed_avoid_complete": {
-                "fixed_avoid_complete": True,
-                "fixed_avoid_completed_at": timestamp,
-            },
             "overtake_complete": {
                 "overtake_complete": True,
                 "overtake_complete_received_at": timestamp,

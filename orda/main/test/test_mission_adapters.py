@@ -423,7 +423,7 @@ def test_internal_zone_and_complete_seams_drive_only_the_declared_chain():
 @pytest.mark.parametrize(
     ("record_method", "mission_state"),
     [
-        ("record_fixed_avoid_complete", Mode.FIXED_AVOID),
+        ("record_fixed_zone_exit", Mode.FIXED_AVOID),
         ("record_overtake_complete", Mode.OVERTAKE),
         ("record_shortcut_complete", Mode.SHORTCUT),
     ],

@@ -319,7 +319,6 @@ class RaceRuntimeAdapter:
         self._mission_events: dict[str, Deque[MissionEdgeEvent]] = {
             "fixed_zone_entry": deque(),
             "fixed_zone_exit": deque(),
-            "fixed_avoid_complete": deque(),
             "overtake_entry": deque(),
             "overtake_complete": deque(),
             "shortcut_complete": deque(),
@@ -731,11 +730,6 @@ class RaceRuntimeAdapter:
     def record_fixed_zone_exit(self, received_at: float) -> InputRecordResult:
         return self._record_mission_edge("fixed_zone_exit", received_at)
 
-    def record_fixed_avoid_complete(self, received_at: float) -> InputRecordResult:
-        """Deprecated compatibility seam; new code must record fixed_zone_exit."""
-
-        return self._record_mission_edge("fixed_avoid_complete", received_at)
-
     def record_overtake_entry(self, received_at: float) -> InputRecordResult:
         return self._record_mission_edge("overtake_entry", received_at)
 
@@ -1026,14 +1020,6 @@ class RaceRuntimeAdapter:
             fixed_zone_exit_received_at=(
                 mission_events["fixed_zone_exit"].received_at
                 if mission_events["fixed_zone_exit"] is not None
-                else None
-            ),
-            fixed_avoid_complete=(
-                mission_events["fixed_avoid_complete"] is not None
-            ),
-            fixed_avoid_completed_at=(
-                mission_events["fixed_avoid_complete"].received_at
-                if mission_events["fixed_avoid_complete"] is not None
                 else None
             ),
             overtake_entered=mission_events["overtake_entry"] is not None,
