@@ -27,6 +27,7 @@ from main.control_selector import (
 )
 from main.mission_types import (
     LaneTarget,
+    ObjectLane,
     ObjectType,
     RouteTrafficSignal,
     opposite_lane_target,
@@ -37,6 +38,11 @@ from main.mode_info import (
     lane_info_value,
 )
 from main.overtake import OvertakeGuard
+from main.relative_x_fallback import (
+    RelativeXObstacleLaneFallback,
+    effective_object_lane,
+    object_mission_entry_allowed,
+)
 from main.same_lane_brake import SameLaneBrake, SameLaneBrakeDecision
 from main.shortcut_exit import ShortcutExitGuard
 from main.race_fsm import Mode, RaceFSM
@@ -91,6 +97,9 @@ BAG_LOOP_BACKJUMP_S = 2.0
 
 # 이 면적을 넘는 박스를 object_type에 따라 FIXED_AVOID 또는 OVERTAKE로 보낸다.
 FIXED_ENTRY_BOX_PX = 1900.0
+# 반복 regression에서 entry 전 동일 물체 independent YOLO 최대 gap은 1.800초였다.
+# perception freshness(0.6초)와 encounter grouping을 분리하고 0.10초 margin만 둔다.
+RELATIVE_X_ENCOUNTER_TIMEOUT_S = 1.90
 
 # 추월 완료 판정 임계값은 main.overtake.OvertakeConfig가 갖는다.
 
@@ -219,6 +228,9 @@ class MainNode(Node):
         self.overtake = OvertakeGuard()
         # 같은 차선 고정장애물 감속. 순수 로직은 main.same_lane_brake 가 갖는다.
         self.same_lane_brake = SameLaneBrake()
+        self.relative_x_fallback = RelativeXObstacleLaneFallback(
+            encounter_timeout_s=RELATIVE_X_ENCOUNTER_TIMEOUT_S,
+        )
         self.last_same_lane_brake = SameLaneBrakeDecision(
             speed_limit=float("inf"), same_lane=False, reason="not evaluated yet"
         )
@@ -568,6 +580,19 @@ class MainNode(Node):
         self.object_confidence = (
             snapshot.confidence if snapshot is not None else 0.0
         )
+        # Object mission을 이미 commit한 뒤에는 entry lane을 다시 분류하지
+        # 않는다. CONE_DRIVE 중에는 edge를 만들지 않지만, 같은 카메라
+        # encounter의 초기 YOLO 상태는 보존해야 LANE_DRIVE 복귀 직후 판단할
+        # 수 있다.
+        if self.runtime.fsm.state in (Mode.LANE_DRIVE, Mode.CONE_DRIVE):
+            self.relative_x_fallback.observe(
+                object_type=self.object_type,
+                box_size=self.box_size,
+                box_cx=self.box_cx,
+                box_cy=self.box_cy,
+                confidence=self.object_confidence,
+                received_at=received_at,
+            )
 
     def lane_change_state_callback(self, msg: Int32MultiArray) -> None:
         received_at = self._now_seconds()
@@ -819,6 +844,7 @@ class MainNode(Node):
 
         self.overtake.reset()
         self.same_lane_brake.reset()
+        self.relative_x_fallback.reset()
         self.last_same_lane_brake = SameLaneBrakeDecision(
             speed_limit=float("inf"), same_lane=False, reason="reset"
         )
@@ -859,12 +885,19 @@ class MainNode(Node):
         """
 
         state = self.runtime.fsm.state
+        previous_state = self._zone_state
         entered = state is not self._zone_state
         self._zone_state = state
 
         if state is Mode.LANE_DRIVE:
             if entered:
                 self._fixed_entry_sent = False
+                # 초기 세션, bag loop, object mission 복귀는 새 encounter다.
+                # CONE_DRIVE는 object edge를 만들지 않는 일시적 mission이므로
+                # 그 동안 수집한 fresh fallback latch를 같은 encounter로 잇는다.
+                if previous_state is not Mode.CONE_DRIVE:
+                    self.relative_x_fallback.reset()
+            self.relative_x_fallback.expire(now)
             entered_at = self.runtime.context.state_entered_at
             snapshot = self.runtime.latest_object_snapshot
             # 엣지는 state_entered_at 보다 "뒤"여야 수락되고 한 번만 소비된다.
@@ -881,6 +914,30 @@ class MainNode(Node):
                 and snapshot.box_px > FIXED_ENTRY_BOX_PX
                 and snapshot.object_type in (ObjectType.FIXED, ObjectType.MOVING)
             ):
+                if (
+                    snapshot.lane is ObjectLane.UNKNOWN
+                    and not self.relative_x_fallback.decided
+                    and self.relative_x_fallback.latch_for_entry(
+                        self.runtime.context.lane_target
+                    )
+                ):
+                    median_x = self.relative_x_fallback.median_relative_x
+                    lane = self.relative_x_fallback.latched_lane
+                    samples = self.relative_x_fallback.evidence_samples
+                    self.get_logger().info(
+                        "relative-X obstacle lane latched at entry: "
+                        f"type={snapshot.object_type.name} lane={lane.value} "
+                        f"median={median_x:.2f}px samples={samples}"
+                    )
+                effective_lane = effective_object_lane(
+                    snapshot.lane,
+                    self.relative_x_fallback.latched_lane,
+                )
+                if not object_mission_entry_allowed(
+                    self.runtime.context.lane_target,
+                    effective_lane,
+                ):
+                    return
                 if snapshot.object_type is ObjectType.MOVING:
                     expected_state = Mode.OVERTAKE
                     label = "방해차량"
@@ -891,6 +948,7 @@ class MainNode(Node):
                     expected_state,
                     snapshot,
                     now,
+                    effective_lane,
                 )
                 if not result.accepted:
                     return

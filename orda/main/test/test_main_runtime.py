@@ -29,11 +29,13 @@ from main.main import (
     RUBBERCONE_OFFSET_TOPIC,
     RUBBERCONE_SESSION_ACTIVE_TOPIC,
     SIDE_CLEARANCE_TOPIC,
+    RELATIVE_X_ENCOUNTER_TIMEOUT_S,
     parse_initial_mode,
     rubbercone_session_qos,
     sensor_event_qos,
 )
 from main.overtake import OvertakeGuard
+from main.relative_x_fallback import RelativeXObstacleLaneFallback
 from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import RaceRuntimeAdapter
@@ -58,6 +60,9 @@ class CallbackHarness:
         self.moving_vehicle_lane = 0
         self.traffic_signal = 0
         self.overtake = OvertakeGuard()
+        self.relative_x_fallback = RelativeXObstacleLaneFallback(
+            encounter_timeout_s=RELATIVE_X_ENCOUNTER_TIMEOUT_S,
+        )
         self.side_left = float("inf")
         self.side_right = float("inf")
 
@@ -109,6 +114,25 @@ def _object_entry_message(object_type, lane):
             float(lane.value),
             float(object_type.value),
             0.9,
+        ],
+    )
+
+
+def _relative_object_entry_message(object_type, relative_x, index):
+    return SimpleNamespace(
+        data=[
+            0.0,
+            float("inf"),
+            0.0,
+            0.0,
+            0.0,
+            (1000.0, 1400.0, 2200.0)[index],
+            320.0 + relative_x,
+            200.0 + index,
+            0.0,
+            float(ObjectLane.UNKNOWN.value),
+            float(object_type.value),
+            0.80 + index * 0.01,
         ],
     )
 
@@ -315,6 +339,149 @@ def test_fixed_entry_snapshot_starts_one_lane_action_after_fsm_commit():
     assert harness.runtime.lane_action.pending is True
     assert harness.runtime.lane_action.started_at == pytest.approx(1.20)
     assert harness.runtime._pending_object_entry_evidence is None
+
+
+@pytest.mark.parametrize(
+    ("ego_lane", "samples"),
+    [
+        (LaneTarget.LANE_TWO, [-66.0, -63.5, -63.5]),
+        (LaneTarget.LANE_ONE, [80.0, 110.0, 139.5]),
+    ],
+)
+@pytest.mark.parametrize("object_type", [ObjectType.FIXED, ObjectType.MOVING])
+def test_relative_x_adjacent_obstacle_does_not_create_mission_edge(
+    ego_lane,
+    samples,
+    object_type,
+):
+    harness = ObjectEntryHarness(
+        [1.10, 1.20, 1.30],
+        mode=Mode.LANE_DRIVE,
+        state_entered_at=1.0,
+    )
+    harness.runtime.context.lane_target = ego_lane
+
+    for index, relative_x in enumerate(samples):
+        MainNode.object_info_raw_callback(
+            harness,
+            _relative_object_entry_message(object_type, relative_x, index),
+        )
+        MainNode._drive_mission_zones(harness, 1.10 + index * 0.10)
+
+    assert len(harness.runtime._mission_events["fixed_zone_entry"]) == 0
+    assert len(harness.runtime._mission_events["overtake_entry"]) == 0
+    assert harness._fixed_entry_sent is False
+    assert harness.runtime.fsm.state is Mode.LANE_DRIVE
+    assert harness.runtime.context.lane_target is ego_lane
+
+
+def test_c_far_boxes_wait_for_entry_then_use_rolling_last_three():
+    samples = [5.5, 35.0, 80.5, 96.0, 117.0, 131.0]
+    areas = [627.0, 756.0, 943.0, 1144.0, 1624.0, 4920.0]
+    times = [1.10 + index * 0.10 for index in range(len(samples))]
+    harness = ObjectEntryHarness(
+        times,
+        mode=Mode.LANE_DRIVE,
+        state_entered_at=1.0,
+    )
+    harness.runtime.context.lane_target = LaneTarget.LANE_ONE
+
+    for index, (relative_x, area, now) in enumerate(zip(samples, areas, times)):
+        message = _relative_object_entry_message(
+            ObjectType.FIXED,
+            relative_x,
+            min(index, 2),
+        )
+        message.data[5] = area
+        message.data[7] = 200.0 + index
+        message.data[11] = 0.80 + index * 0.01
+        MainNode.object_info_raw_callback(harness, message)
+        MainNode._drive_mission_zones(harness, now)
+        if area <= 1900.0:
+            assert harness.relative_x_fallback.decided is False
+
+    assert harness.relative_x_fallback.evidence_samples == (96.0, 117.0, 131.0)
+    assert harness.relative_x_fallback.median_relative_x == 117.0
+    assert harness.relative_x_fallback.latched_lane is ObjectLane.RIGHT
+    assert len(harness.runtime._mission_events["fixed_zone_entry"]) == 0
+    assert harness._fixed_entry_sent is False
+    assert harness.runtime.context.lane_target is LaneTarget.LANE_ONE
+
+
+@pytest.mark.parametrize(
+    ("ego_lane", "samples", "expected_target"),
+    [
+        (LaneTarget.LANE_ONE, [43.0, 43.0, 45.0], LaneTarget.LANE_TWO),
+        (LaneTarget.LANE_TWO, [31.0, 30.0, 33.0], LaneTarget.LANE_ONE),
+    ],
+)
+@pytest.mark.parametrize(
+    ("object_type", "expected_state", "event_name"),
+    [
+        (ObjectType.FIXED, Mode.FIXED_AVOID, "fixed_zone_entry"),
+        (ObjectType.MOVING, Mode.OVERTAKE, "overtake_entry"),
+    ],
+)
+def test_relative_x_same_lane_creates_one_edge_and_locks_target(
+    ego_lane,
+    samples,
+    expected_target,
+    object_type,
+    expected_state,
+    event_name,
+):
+    harness = ObjectEntryHarness(
+        [1.10, 1.20, 1.30],
+        mode=Mode.LANE_DRIVE,
+        state_entered_at=1.0,
+    )
+    harness.runtime.context.lane_target = ego_lane
+
+    for index, relative_x in enumerate(samples):
+        MainNode.object_info_raw_callback(
+            harness,
+            _relative_object_entry_message(object_type, relative_x, index),
+        )
+        MainNode._drive_mission_zones(harness, 1.10 + index * 0.10)
+
+    MainNode._drive_mission_zones(harness, 1.31)
+    assert len(harness.runtime._mission_events[event_name]) == 1
+    assert harness._fixed_entry_sent is True
+
+    assert harness.runtime.record_lane_offset(0, 1.31)
+    assert harness.runtime.record_scan(1.31)
+    cycle = harness.runtime.step(1.31)
+
+    assert cycle.transition.target is expected_state
+    assert harness.runtime.context.lane_target is expected_target
+    assert harness.runtime.lane_action.target_locked is True
+
+
+def test_fresh_relative_x_latch_survives_cone_return_for_same_encounter():
+    harness = ObjectEntryHarness(
+        [1.10, 1.20, 1.30, 1.40],
+        mode=Mode.CONE_DRIVE,
+        state_entered_at=0.5,
+    )
+    harness.runtime.context.lane_target = LaneTarget.LANE_TWO
+
+    for index, relative_x in enumerate([31.0, 30.0, 33.0]):
+        MainNode.object_info_raw_callback(
+            harness,
+            _relative_object_entry_message(ObjectType.FIXED, relative_x, index),
+        )
+    assert harness.relative_x_fallback.decided is False
+
+    harness.runtime.fsm.state = Mode.LANE_DRIVE
+    harness.runtime.context.state_entered_at = 1.35
+    MainNode.object_info_raw_callback(
+        harness,
+        _relative_object_entry_message(ObjectType.FIXED, 32.0, 2),
+    )
+    MainNode._drive_mission_zones(harness, 1.41)
+
+    assert len(harness.runtime._mission_events["fixed_zone_entry"]) == 1
+    assert harness.relative_x_fallback.latched_lane is ObjectLane.RIGHT
 
 
 @pytest.mark.parametrize(

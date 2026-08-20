@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "rubbercone/entry_readiness.hpp"
+#include "rubbercone/entry_geometry.hpp"
 #include "rubbercone/session_lifecycle.hpp"
 
 using std::placeholders::_1;
@@ -91,6 +92,7 @@ struct BoundaryModel {
 struct PathEstimate {
     bool valid{false};
     bool bilateral{false};
+    bool entry_geometry_valid{false};
     cv::Point2f target{};
     float confidence{0.0f};
 };
@@ -580,6 +582,8 @@ private:
                 const float quality = 0.5f * (boundaryQuality(left) + boundaryQuality(right));
                 path.valid = true;
                 path.bilateral = true;
+                path.entry_geometry_valid = rubbercone::entryGeometryValid(
+                    left.count, right.count);
                 path.target = cv::Point2f{target_x, 0.5f * (left_y + right_y)};
                 path.confidence = clampValue(0.65f + 0.35f * quality, 0.0f, 1.0f);
                 return path;
@@ -635,8 +639,10 @@ private:
     void updateDetectionState(const PathEstimate& path)
     {
         const int confidence = static_cast<int>(std::round(path.confidence * 100.0f));
+        const bool lifecycle_path_valid = rubbercone::lifecyclePathValid(
+            session_lifecycle_.active(), path.valid, path.entry_geometry_valid);
         const auto session = session_lifecycle_.update(
-            path.valid, path.confidence, now().seconds());
+            lifecycle_path_valid, path.confidence, now().seconds());
         rubber_entry_ready_value_ = session.entry_ready ? 1 : 0;
         rubber_end_value_ = session.end_latched ? 1 : 0;
         if (session.armed_this_sample) {

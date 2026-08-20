@@ -174,6 +174,16 @@ def generate_launch_description():
         description='라바콘 LiDAR 인식 디버그 창 표시 여부'
     )
     rubbercone_enable_gui = LaunchConfiguration('rubbercone_enable_gui')
+    rubbercone_enabled_arg = DeclareLaunchArgument(
+        'rubbercone_enabled',
+        default_value='true',
+        choices=('false', 'true'),
+        description=(
+            'Obstacle-only shadow regression에서 perception interference를 '
+            '분리하기 위한 test switch'
+        ),
+    )
+    rubbercone_enabled = LaunchConfiguration('rubbercone_enabled')
     object_enable_gui_arg = DeclareLaunchArgument(
         'object_enable_gui',
         default_value='false',
@@ -250,6 +260,7 @@ def generate_launch_description():
             'offset_limit': rubbercone_offset_limit,
             'enable_gui': rubbercone_enable_gui,
         }],
+        condition=IfCondition(rubbercone_enabled),
     )
     pidnet_node = Node(
         package='segmentation_tools',
@@ -328,6 +339,7 @@ def generate_launch_description():
         rubbercone_offset_gain_arg,
         rubbercone_offset_limit_arg,
         rubbercone_enable_gui_arg,
+        rubbercone_enabled_arg,
         object_enable_gui_arg,
         detector_model_path_arg,
         traffic_classifier_model_path_arg,

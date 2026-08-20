@@ -242,6 +242,29 @@ def test_bag_launch_requires_explicit_live_bridge_opt_in_and_string_profile():
         assert profile.value_type is str
 
 
+def test_bag_launch_rubbercone_test_switch_defaults_true():
+    module = load_launch_module(BAG_TEST_LAUNCH, '_bag_rubbercone_switch')
+    description = module.generate_launch_description()
+    argument = launch_argument(description, 'rubbercone_enabled')
+    nodes = [
+        action
+        for action in description.entities
+        if isinstance(action, Node)
+        and action.node_package == 'rubbercone'
+        and action.node_executable == 'rubbercone_node'
+    ]
+
+    assert substitution_text(argument.default_value) == 'true'
+    assert tuple(argument.choices) == ('false', 'true')
+    assert len(nodes) == 1
+    assert type(nodes[0].condition) is IfCondition
+
+    for value, expected in (('false', False), ('true', True)):
+        context = LaunchContext()
+        context.launch_configurations['rubbercone_enabled'] = value
+        assert nodes[0].condition.evaluate(context) is expected
+
+
 @pytest.mark.parametrize(
     ('path', 'module_name'),
     [

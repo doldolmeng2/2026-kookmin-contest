@@ -42,16 +42,33 @@ def parse_class_names(value: object) -> dict[int, str]:
     return parsed
 
 
-def validate_detector_classes(names: Mapping[int, str]) -> None:
+def validate_detector_classes(
+    names: Mapping[int, str],
+    fixed_class_ids=(0,),
+    moving_class_ids=(1,),
+    traffic_class_ids=range(2, 6),
+) -> None:
     """Reject a detector that cannot satisfy the train-10 class contract."""
 
     fixed_names = {"fixed", "red_car"}
     moving_names = {"moving", "green_car"}
-    if names.get(0) not in fixed_names:
-        raise ValueError("detector class 0 must be fixed/red_car")
-    if names.get(1) not in moving_names:
-        raise ValueError("detector class 1 must be moving/green_car")
-    missing = sorted(set(range(2, 6)) - set(names))
+    invalid_fixed = sorted(
+        class_id for class_id in fixed_class_ids if names.get(class_id) not in fixed_names
+    )
+    if invalid_fixed:
+        raise ValueError(
+            f"detector class {invalid_fixed[0]} must be fixed/red_car"
+        )
+    invalid_moving = sorted(
+        class_id
+        for class_id in moving_class_ids
+        if names.get(class_id) not in moving_names
+    )
+    if invalid_moving:
+        raise ValueError(
+            f"detector class {invalid_moving[0]} must be moving/green_car"
+        )
+    missing = sorted(set(traffic_class_ids) - set(names))
     if missing:
         raise ValueError(f"detector traffic candidate classes missing: {missing}")
 

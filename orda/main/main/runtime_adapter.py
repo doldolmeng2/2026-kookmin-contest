@@ -739,6 +739,7 @@ class RaceRuntimeAdapter:
         expected_state: Mode,
         snapshot: ObjectSnapshot,
         received_at: float,
+        effective_lane: Optional[ObjectLane] = None,
     ) -> InputRecordResult:
         """Queue one validated object entry and preserve its lane once.
 
@@ -761,7 +762,13 @@ class RaceRuntimeAdapter:
         )
         if snapshot.object_type is not expected_type:
             return InputRecordResult(False, "object entry type/state mismatch")
-        if opposite_lane_target(snapshot.lane) is None:
+        entry_lane = snapshot.lane
+        if (
+            entry_lane not in (ObjectLane.LEFT, ObjectLane.RIGHT)
+            and effective_lane in (ObjectLane.LEFT, ObjectLane.RIGHT)
+        ):
+            entry_lane = effective_lane
+        if opposite_lane_target(entry_lane) is None:
             return InputRecordResult(
                 False,
                 "object entry lane must be LEFT or RIGHT",
@@ -778,7 +785,7 @@ class RaceRuntimeAdapter:
 
         self._pending_object_entry_evidence = ObjectEntryEvidence(
             expected_state=expected_state,
-            lane=snapshot.lane,
+            lane=entry_lane,
             object_received_at=snapshot.received_at,
             mission_edge_received_at=received_at,
         )

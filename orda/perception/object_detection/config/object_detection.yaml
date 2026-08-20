@@ -3,8 +3,9 @@ object_yolo_node:
     # Empty paths resolve to the canonical package-share deploy weights.
     detector_model_path: ""
     traffic_classifier_model_path: ""
-    fixed_class_ids: [0]
-    moving_class_ids: [1]
+    fixed_class_ids: [4]
+    moving_class_ids: [0]
+    traffic_class_ids: [1, 2, 3, 5, 6]
     classifier_confidence_threshold: 0.60
 
 object_detector_node:

@@ -38,7 +38,7 @@ from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
-from std_msgs.msg import Float32MultiArray, Int32
+from std_msgs.msg import Float32MultiArray
 
 from object_detection.image_conversion import imgmsg_to_bgr
 from object_detection.yolo_runtime import (
@@ -50,7 +50,6 @@ from object_detection.yolo_runtime import (
     light_geometry_ok,
 )
 from object_detection.traffic_classifier import (
-    classify_current_frame_candidate,
     parse_class_names,
     validate_classifier_classes,
     validate_detector_classes,
@@ -73,21 +72,20 @@ class ObjectYoloNode(Node):
         self.declare_parameter("traffic_classifier_model_path", "")
         self.declare_parameter("camera_topic", "/resized_image")
         self.declare_parameter("output_topic", "/object_yolo")
-        self.declare_parameter("traffic_output_topic", "/traffic_detection")
         self.declare_parameter("confidence_threshold", 0.50)
         self.declare_parameter("classifier_confidence_threshold", 0.60)
         self.declare_parameter("nms_threshold", 0.40)
         self.declare_parameter("input_size", 640)
         # Model class IDs are deliberately parameters rather than hardcoded,
         # so a retrained model with a different ID mapping can be dropped in
-        # without code changes. Current model (train-5, 6-class merged
-        # car+traffic model): 0=red_car(fixed) 1=green_car(moving).
-        self.declare_parameter("fixed_class_ids", [0])
-        self.declare_parameter("moving_class_ids", [1])
+        # without code changes. Current model (train-2, 7-class merged
+        # car+traffic model): 4=red_car(fixed) 0=green_car(moving).
+        self.declare_parameter("fixed_class_ids", [4])
+        self.declare_parameter("moving_class_ids", [0])
         # 신호등 후보 클래스. 실제 색 판정은 아래 크롭 분류기가 하므로,
         # 여기서는 "신호등처럼 생긴 위치" 후보를 고르는 용도로만 쓴다 —
         # 순서는 의미가 없다.
-        self.declare_parameter("traffic_class_ids", [2, 3, 4, 5])
+        self.declare_parameter("traffic_class_ids", [1, 2, 3, 5, 6])
         self.declare_parameter("traffic_output_topic", "/traffic_boxes")
         # ── 신호등 크롭 분류기 ──────────────────────────────────────────
         # 빈 문자열이면 share 디렉터리(model/light_cls.onnx)를 탐색한다.
@@ -125,39 +123,31 @@ class ObjectYoloNode(Node):
                 "model",
                 "light1_classifier_best.onnx",
             )
-        for label, path in (
-            ("train-10 detector", detector_model_path),
-            ("light1 traffic classifier", classifier_model_path),
-        ):
-            if not os.path.isfile(path):
-                raise FileNotFoundError(f"{label} model missing: {path}")
+        if not os.path.isfile(detector_model_path):
+            raise FileNotFoundError(
+                f"train-10 detector model missing: {detector_model_path}"
+            )
 
         self.confidence = float(
             self.get_parameter("confidence_threshold").value
         )
         self.nms = float(self.get_parameter("nms_threshold").value)
-        self.classifier_confidence = float(
-            self.get_parameter("classifier_confidence_threshold").value
-        )
         self.input_size = int(self.get_parameter("input_size").value)
-        self.fixed_ids = normalize_class_ids(
-            self.get_parameter("fixed_class_ids").value
-        )
-        try:
-            moving_class_ids = self.get_parameter("moving_class_ids").value
-        except ParameterUninitializedException:
-            moving_class_ids = []
-        self.moving_ids = normalize_class_ids(moving_class_ids)
-        self.traffic_ids = {2, 3, 4, 5}
+        self.fixed_ids = {
+            int(value) for value in self.get_parameter("fixed_class_ids").value
+        }
+        self.moving_ids = {
+            int(value) for value in self.get_parameter("moving_class_ids").value
+        }
+        self.traffic_ids = {
+            int(value) for value in self.get_parameter("traffic_class_ids").value
+        }
         overlap = self.fixed_ids & self.moving_ids
         if overlap:
             raise ValueError(f"fixed/moving class IDs overlap: {sorted(overlap)}")
         self.allowed_ids = self.fixed_ids | self.moving_ids | self.traffic_ids
         if not self.allowed_ids:
             raise ValueError("at least one obstacle class ID is required")
-        self.traffic_ids = {
-            int(value) for value in self.get_parameter("traffic_class_ids").value
-        }
 
         self.session = ort.InferenceSession(
             detector_model_path,
@@ -166,40 +156,14 @@ class ObjectYoloNode(Node):
         detector_names = parse_class_names(
             self.session.get_modelmeta().custom_metadata_map.get("names")
         )
-        validate_detector_classes(detector_names)
+        validate_detector_classes(
+            detector_names,
+            self.fixed_ids,
+            self.moving_ids,
+            self.traffic_ids,
+        )
         self.input_name = self.session.get_inputs()[0].name
         output_shape = self.session.get_outputs()[0].shape
-
-        self.classifier_session = ort.InferenceSession(
-            classifier_model_path,
-            providers=["CPUExecutionProvider"],
-        )
-        classifier_names = parse_class_names(
-            self.classifier_session.get_modelmeta().custom_metadata_map.get(
-                "names"
-            )
-        )
-        validate_classifier_classes(classifier_names)
-        classifier_input = self.classifier_session.get_inputs()[0]
-        classifier_shape = classifier_input.shape
-        if (
-            len(classifier_shape) != 4
-            or classifier_shape[0] != 1
-            or classifier_shape[1] != 3
-            or not isinstance(classifier_shape[2], int)
-            or not isinstance(classifier_shape[3], int)
-        ):
-            raise ValueError(
-                f"unsupported traffic classifier input shape: {classifier_shape}"
-            )
-        self.classifier_input_name = classifier_input.name
-        self.classifier_height = classifier_shape[2]
-        self.classifier_width = classifier_shape[3]
-        self.get_logger().info(
-            f"ONNX Runtime ready: detector={detector_model_path}, "
-            f"output={output_shape}, classifier={classifier_model_path}, "
-            f"fixed={sorted(self.fixed_ids)}, moving={sorted(self.moving_ids)}"
-        )
 
         self.light_margin = float(self.get_parameter("light_crop_margin").value)
         self.light_input_size = int(self.get_parameter("light_input_size").value)
@@ -211,20 +175,29 @@ class ObjectYoloNode(Node):
         # 예전처럼 직접 크롭 분류하는 폴백 경로를 탄다.
         light_path = str(self.get_parameter("light_classifier_path").value)
         if not light_path:
-            light_path = os.path.join(
-                get_package_share_directory("object_detection"),
-                "model",
-                "light_cls.onnx",
-            )
+            light_path = classifier_model_path
         self.light_session = None
         self.light_input_name = ""
         if os.path.isfile(light_path):
             try:
-                self.light_session = ort.InferenceSession(
+                light_session = ort.InferenceSession(
                     light_path,
                     providers=["CPUExecutionProvider"],
                 )
-                self.light_input_name = self.light_session.get_inputs()[0].name
+                classifier_names = parse_class_names(
+                    light_session.get_modelmeta().custom_metadata_map.get("names")
+                )
+                validate_classifier_classes(classifier_names)
+                classifier_input = light_session.get_inputs()[0]
+                classifier_shape = classifier_input.shape
+                expected_shape = [1, 3, self.light_input_size, self.light_input_size]
+                if classifier_shape != expected_shape:
+                    raise ValueError(
+                        "unsupported traffic classifier input shape: "
+                        f"{classifier_shape}, expected {expected_shape}"
+                    )
+                self.light_session = light_session
+                self.light_input_name = classifier_input.name
                 self.get_logger().info(
                     f"신호등 크롭 분류기 로드 완료: {light_path} "
                     f"(margin={self.light_margin}, size={self.light_input_size}, "
@@ -240,6 +213,12 @@ class ObjectYoloNode(Node):
             self.get_logger().warn(
                 f"신호등 분류기 모델이 없어 object_node 폴백으로 넘깁니다: {light_path}"
             )
+        self.get_logger().info(
+            f"ONNX Runtime ready: detector={detector_model_path}, "
+            f"output={output_shape}, classifier={light_path}, "
+            f"fixed={sorted(self.fixed_ids)}, moving={sorted(self.moving_ids)}, "
+            f"traffic={sorted(self.traffic_ids)}"
+        )
 
         # ── 폴백 상태 알림 ────────────────────────────────────────────
         # 시작 시점 로그(위 warn/error) 는 한 번만 찍히고 스크롤로 사라진다.
@@ -264,9 +243,7 @@ class ObjectYoloNode(Node):
             Float32MultiArray, output_topic, qos
         )
         self.traffic_publisher = self.create_publisher(
-            Int32,
-            str(self.get_parameter("traffic_output_topic").value),
-            qos,
+            Float32MultiArray, traffic_output_topic, qos
         )
         self.create_subscription(Image, camera_topic, self.on_image, qos)
 
@@ -332,38 +309,20 @@ class ObjectYoloNode(Node):
             detections = decode_detections(
                 allowed_class_ids=self.allowed_ids, **decode_kwargs
             )
-            detection = closest_detection(detections)
+            detection = closest_detection(
+                det
+                for det in detections
+                if det.class_id in self.fixed_ids or det.class_id in self.moving_ids
+            )
             # 신호등은 위치가 아니라 "보이는가"만 필요하다. 원거리 신호등이
             # 차량용 min_size_px(기본 12px) 필터에 걸려 누락되지 않도록
             # 최소 크기 제한 없이 별도로 디코드한다 (traffic_node 원래 동작과 동일).
             traffic_detections = decode_detections(
                 allowed_class_ids=self.traffic_ids, min_size_px=1, **decode_kwargs
             )
-            traffic_candidate = closest_detection_for_classes(
-                detections,
-                self.traffic_ids,
-            )
         except Exception as exc:
             self.get_logger().error(f"object YOLO inference failed: {exc}")
             return
-
-        traffic_signal = 0
-        if traffic_candidate is not None:
-            try:
-                traffic_signal = classify_current_frame_candidate(
-                    image,
-                    traffic_candidate,
-                    self.classifier_session,
-                    self.classifier_input_name,
-                    self.classifier_height,
-                    self.classifier_width,
-                    self.classifier_confidence,
-                )
-            except Exception as exc:
-                self.get_logger().error(
-                    f"same-frame traffic classification failed: {exc}"
-                )
-                traffic_signal = 0
 
         output_message = Float32MultiArray()
         if detection is None:
@@ -386,9 +345,6 @@ class ObjectYoloNode(Node):
                 float(detection.height),
             ]
         self.publisher.publish(output_message)
-        traffic_message = Int32()
-        traffic_message.data = traffic_signal
-        self.traffic_publisher.publish(traffic_message)
 
         # 박스마다 같은 프레임에서 잘라 분류한 뒤, 검출기 class_id/confidence
         # 자리에 분류기 결과를 실어 보낸다. 우선순위(좌회전>직진>정지) 판정과

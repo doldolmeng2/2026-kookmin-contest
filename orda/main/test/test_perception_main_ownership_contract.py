@@ -14,6 +14,7 @@ import pytest
 from sensor_msgs.msg import LaserScan
 
 from main.main import MainNode
+from main.main import RELATIVE_X_ENCOUNTER_TIMEOUT_S
 from main.mission_types import (
     LaneTarget,
     ObjectLane,
@@ -21,6 +22,7 @@ from main.mission_types import (
     RouteTrafficSignal,
 )
 from main.overtake import OvertakeGuard
+from main.relative_x_fallback import RelativeXObstacleLaneFallback
 from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import OBJECT_MAX_AGE_S, RaceRuntimeAdapter
@@ -80,6 +82,9 @@ class _MainMethodHarness:
         self._fixed_entry_sent = False
         self._zone_exit_sent = False
         self.overtake = OvertakeGuard()
+        self.relative_x_fallback = RelativeXObstacleLaneFallback(
+            encounter_timeout_s=RELATIVE_X_ENCOUNTER_TIMEOUT_S,
+        )
         self.side_left = math.inf
         self.side_right = math.inf
         self.detected_lane = -1

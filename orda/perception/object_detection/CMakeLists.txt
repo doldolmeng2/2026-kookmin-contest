@@ -54,6 +54,9 @@ install(FILES
   light_cls.onnx
   DESTINATION share/${PROJECT_NAME}/model)
 
+install(DIRECTORY config
+  DESTINATION share/${PROJECT_NAME})
+
 install(DIRECTORY include/ DESTINATION include)
 
 if(BUILD_TESTING)
