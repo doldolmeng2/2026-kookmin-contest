@@ -19,6 +19,7 @@ setup(
                 'launch/module_drive_bag_test.py',
                 'launch/module_drive_mission_test.py',
                 'launch/module_lane_only.py',
+                'launch/module_lane_debug_bag_preview.py',
                 'launch/module_pidnet_bag_preview.py',
                 'launch/object_detection_test.py',
             ],
