@@ -8,7 +8,12 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from sensor_msgs.msg import Image
 from .pidnet import PIDNet
 from .core import label_roi_top
@@ -22,6 +27,23 @@ CLASS_COLORS = np.array([
     (90, 90, 90),    # road: gray
     (255, 0, 255),   # shortcut: magenta
 ], dtype=np.uint8)
+
+
+def latest_frame_qos():
+    """Keep only the newest image while preserving production QoS semantics."""
+    return QoSProfile(
+        depth=1,
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        durability=DurabilityPolicy.VOLATILE,
+        history=HistoryPolicy.KEEP_LAST,
+    )
+
+
+def resize_for_model(bgr, width, height):
+    """Skip only the redundant exact-size resize."""
+    if bgr.shape[1] == width and bgr.shape[0] == height:
+        return bgr
+    return cv2.resize(bgr, (width, height), interpolation=cv2.INTER_LINEAR)
 
 
 def warmup_runner(runner, enabled=True):
@@ -72,7 +94,7 @@ class PIDNetRunner:
         self.checkpoint=path; self.best_epoch=checkpoint.get('epoch'); self.classes=classes
 
     def predict(self,bgr):
-        original_size=(bgr.shape[1],bgr.shape[0]); resized=cv2.resize(bgr,(self.width,self.height),interpolation=cv2.INTER_LINEAR)
+        original_size=(bgr.shape[1],bgr.shape[0]); resized=resize_for_model(bgr,self.width,self.height)
         rgb=cv2.cvtColor(resized,cv2.COLOR_BGR2RGB).astype(np.float32)/255.; rgb=(rgb-self.mean)/self.std
         tensor=torch.from_numpy(rgb.transpose(2,0,1).copy()).unsqueeze(0).to(self.device)
         with torch.inference_mode(),torch.autocast(device_type=self.device.type,enabled=self.device.type=='cuda'):
@@ -120,11 +142,12 @@ class PIDNetInferenceNode(Node):
             )
         self.bridge=CvBridge(); self.frames=0; self.total_time=0.
         self.roi_top=label_roi_top(int(height))
-        self.mask_pub=self.create_publisher(Image,mask_topic,qos_profile_sensor_data)
-        self.class_pub=self.create_publisher(Image,class_topic,qos_profile_sensor_data)
-        self.color_pub=self.create_publisher(Image,color_topic,qos_profile_sensor_data)
-        self.overlay_pub=self.create_publisher(Image,overlay_topic,qos_profile_sensor_data)
-        self.sub=self.create_subscription(Image,input_topic,self.image_callback,qos_profile_sensor_data)
+        image_qos=latest_frame_qos()
+        self.mask_pub=self.create_publisher(Image,mask_topic,image_qos)
+        self.class_pub=self.create_publisher(Image,class_topic,image_qos)
+        self.color_pub=self.create_publisher(Image,color_topic,image_qos)
+        self.overlay_pub=self.create_publisher(Image,overlay_topic,image_qos)
+        self.sub=self.create_subscription(Image,input_topic,self.image_callback,image_qos)
         self.window_name='PIDNet-S Class Visualization'
         if self.show_visualization:
             title=f'{self.window_name} (label ROI y>={self.roi_top})' if self.roi_crop_visualization else f'{self.window_name} (full frame)'
