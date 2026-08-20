@@ -26,7 +26,13 @@
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/int32_multi_array.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
-#include <cv_bridge/cv_bridge.hpp>
+#if __has_include(<cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge.hpp>  // Jazzy
+#elif __has_include(<cv_bridge/cv_bridge.h>)
+#include <cv_bridge/cv_bridge.h>    // Humble
+#else
+#error "cv_bridge header not found"
+#endif
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
 #include <opencv2/opencv.hpp>
@@ -57,6 +63,9 @@ using namespace cv;
 //   안정적으로 피팅된다.
 // ─────────────────────────────────────────────────────────────────────────────
 struct LineFit { float m; float b; };
+
+// 통합 디버그 모니터 창 이름.
+static constexpr const char * MONITOR_WINDOW = "Lane Drive Monitor";
 
 
 class LaneDetector : public rclcpp::Node
@@ -109,6 +118,20 @@ public:
     RCLCPP_INFO(
       get_logger(), "디버그 창: debug_view=%s debug_lane_view=%s",
       debug_view_ ? "true" : "false", debug_lane_view_ ? "true" : "false");
+
+    // 원본 카메라 영상 구독(모니터 창의 CAMERA 패널 전용).
+    // 주행 판단에는 쓰지 않는다. 디버그를 끈 상태에서 프레임을 복사하는
+    // 비용을 물지 않도록 debug_view_ 일 때만 구독을 만든다.
+    const std::string camera_topic = this->declare_parameter<std::string>(
+      "camera_topic", "/resized_image");
+    if (debug_view_) {
+      camera_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+        camera_topic, qos_sensor,
+        std::bind(&LaneDetector::cameraCallback, this, std::placeholders::_1)
+      );
+      RCLCPP_INFO(
+        get_logger(), "모니터 창 CAMERA 패널 입력: %s", camera_topic.c_str());
+    }
 
     // 모드/차선 정보 구독: /mode_info [mode, lane]
     //   mode: 3=차선주행, 5=차선변경
@@ -761,7 +784,7 @@ public:
     const LineFit & fit_bev,
     bool fit_valid,
     bool show_dbg,
-    const cv::Mat * dbg_from_fit = nullptr)
+    const cv::Mat & lane_mask_for_display)
   {
     cv::Mat frame = frame_in.clone();
 
@@ -797,15 +820,16 @@ public:
       fit_pub_->publish(fit_msg);
     }
 
-    // 슬라이딩 윈도우 BEV 디버그 창 표시
-    if (debug_view_ && show_dbg && dbg_from_fit && !dbg_from_fit->empty()) {
-      cv::imshow("SlidingWindows", *dbg_from_fit);
+    // 통합 모니터 창: CAMERA / VEHICLE 2개 패널을 한 창에 그린다.
+    // 조향·속도는 /xycar_motor 콜백이 캐시해 둔 최신 값을 쓰므로, 여기서
+    // 프레임당 한 번만 그려도 값이 최신이다.
+    if (debug_view_ && show_dbg) {
+      cv::imshow(MONITOR_WINDOW, buildMonitorView(lane_mask_for_display));
     }
 
     // 오프셋 슬라이더 창 표시 (debug_lane_view 설정 시)
     // waitKey는 debug_lane_view와 무관하게 호출해야 한다. HighGUI 이벤트 펌프
-    // 역할을 하므로, 이걸 건너뛰면 남아있는 창(SlidingWindows/Mask-Yellow)이
-    // 갱신되지 않는다.
+    // 역할을 하므로, 이걸 건너뛰면 남아있는 창이 갱신되지 않는다.
     if (debug_view_ && show_dbg && debug_lane_view_) {
       cv::Mat vis = drawOffsetSlider(frame, offset, lane_mode_);
       cv::imshow("Lane View + Offset", vis);
@@ -860,6 +884,94 @@ public:
     rr.points(pts);
     std::vector<cv::Point> poly = {pts[0], pts[1], pts[2], pts[3]};
     cv::fillConvexPoly(canvas, poly, color, cv::LINE_AA);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 모니터 창 패널 공통: 위쪽에 제목 띠를 붙인다.
+  // ─────────────────────────────────────────────────────────────────────
+  static cv::Mat withPanelTitle(const cv::Mat & panel, const std::string & title)
+  {
+    const int bar_h = 26;
+    cv::Mat out(panel.rows + bar_h, panel.cols, CV_8UC3, cv::Scalar(24, 24, 24));
+    panel.copyTo(out(cv::Rect(0, bar_h, panel.cols, panel.rows)));
+    cv::putText(
+      out, title, cv::Point(10, 18), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+      cv::Scalar(235, 235, 235), 1, cv::LINE_AA);
+    return out;
+  }
+
+  // 패널이 없을 때(카메라 미수신 등) 자리를 채우는 회색 판.
+  static cv::Mat placeholderPanel(int width, int height, const std::string & text)
+  {
+    cv::Mat panel(height, width, CV_8UC3, cv::Scalar(45, 45, 45));
+    cv::putText(
+      panel, text, cv::Point(14, height / 2), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+      cv::Scalar(160, 160, 160), 1, cv::LINE_AA);
+    return panel;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 통합 모니터 창: 2개 패널을 한 창에 합친다.
+  //
+  //   [ CAMERA (라벨 ROI 오버레이) ] [ VEHICLE (조향/속도) ]
+  //
+  // CAMERA 패널: 라벨 ROI(하단 40%, y>=label_roi_top_) 위쪽은 어둡게 죽이고
+  // 그 아래에는 중앙선 세그멘테이션 마스크를 반투명 초록으로 겹쳐 그린다.
+  // 세그멘테이션이 실제 화면 위에서 잘 맞는지 한눈에 확인하기 위함이다.
+  //
+  // 창을 여러 개 띄우면 각각 imshow+waitKey 비용이 붙고 배치도 흐트러진다.
+  // 하나로 합치면 imshow 가 프레임당 한 번만 돈다.
+  // ─────────────────────────────────────────────────────────────────────
+  cv::Mat buildMonitorView(const cv::Mat & lane_mask_for_display) const
+  {
+    const int panel_h = 360;
+
+    cv::Mat camera_panel;
+    if (latest_camera_.empty()) {
+      camera_panel = placeholderPanel(640, panel_h, "no camera frame");
+    } else {
+      cv::Mat vis = latest_camera_.clone();
+      const int roi_top = std::clamp(label_roi_top_, 0, vis.rows);
+
+      // 라벨 ROI 밖(위쪽): 어둡게 죽여서 판단 대상이 아님을 표시한다.
+      if (roi_top > 0) {
+        cv::Mat above = vis(cv::Rect(0, 0, vis.cols, roi_top));
+        above *= CAMERA_ABOVE_ROI_DIM_FACTOR;
+      }
+
+      // 라벨 ROI 안(아래쪽): 세그멘테이션 마스크를 반투명 초록으로 겹친다.
+      if (roi_top < vis.rows && !lane_mask_for_display.empty() &&
+        lane_mask_for_display.size() == vis.size())
+      {
+        cv::Rect below_rect(0, roi_top, vis.cols, vis.rows - roi_top);
+        cv::Mat below = vis(below_rect);
+        cv::Mat mask_below = lane_mask_for_display(below_rect);
+
+        cv::Mat tint(below.size(), below.type(), cv::Scalar(0, 255, 0));
+        cv::Mat blended;
+        cv::addWeighted(
+          below, 1.0 - CENTER_LANE_OVERLAY_ALPHA,
+          tint, CENTER_LANE_OVERLAY_ALPHA, 0.0, blended);
+        blended.copyTo(below, mask_below);
+      }
+
+      cv::line(vis, {0, roi_top}, {vis.cols - 1, roi_top}, {0, 0, 255}, 1, cv::LINE_AA);
+
+      cv::resize(
+        vis, camera_panel,
+        cv::Size(std::max(1, vis.cols * panel_h / std::max(1, vis.rows)), panel_h));
+    }
+
+    // 조향/속도 패널. 정사각 캔버스를 패널 높이에 맞춘다.
+    cv::Mat vehicle_panel;
+    cv::resize(drawVehicleDynamicsView(), vehicle_panel, cv::Size(panel_h, panel_h));
+
+    cv::Mat monitor;
+    cv::hconcat(
+      withPanelTitle(camera_panel, "CAMERA  (dim = above label ROI, green = center-lane mask)"),
+      withPanelTitle(vehicle_panel, "VEHICLE  steer / speed"),
+      monitor);
+    return monitor;
   }
 
   // ─────────────────────────────────────────────────────────────────────
@@ -1014,6 +1126,8 @@ public:
 private:
   // ── ROS 통신 객체 ───────────────────────────────────────────────────
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
+  // 모니터 창 CAMERA 패널 전용. debug_view_ 일 때만 생성된다.
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr camera_sub_;
   rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr mode_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr motor_sub_;
   rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr offset_pub_;
@@ -1059,11 +1173,21 @@ private:
   int frame_count_ = 0;
   int debug_stride_ = 1;      // 디버그 출력 주기 (1이면 매 프레임)
   bool debug_view_ = config_.debug_view;
-  // false면 보조 차선 디버그 창을 숨기고 SlidingWindows / Mask-Yellow 만 남긴다.
+  // true면 통합 모니터 창에 더해 보조 차선 창들을 추가로 띄운다.
   // debug_view_ 가 false면 이 값과 무관하게 모든 창이 꺼진다.
   bool debug_lane_view_ = config_.debug_lane_view;
-  // "Vehicle Dynamics" 창 마지막 표시 시각 (10 Hz 제한용)
-  rclcpp::Time last_dynamics_draw_{0, 0, RCL_ROS_TIME};
+  // 통합 모니터 창의 CAMERA 패널에 쓸 최신 원본 프레임.
+  // 단일 스레드 spin 이라 콜백 간 경쟁이 없어 별도 락이 필요 없다.
+  cv::Mat latest_camera_;
+  // 라벨링 ROI 상단 y (하단 40%). segmentation_tools/core.py의
+  // label_roi_top()과 같은 공식이다: height - round(height*0.4)
+  // (640x360 기준 216). 모니터 CAMERA 패널에서 이 위는 어둡게, 이 아래는
+  // 세그멘테이션 마스크를 겹쳐 그린다.
+  int label_roi_top_ = frame_height_ - static_cast<int>(std::lround(frame_height_ * 0.4));
+  // CAMERA 패널에서 라벨 ROI 밖(위쪽)을 죽이는 밝기 배율(0~1).
+  static constexpr double CAMERA_ABOVE_ROI_DIM_FACTOR = 0.55;
+  // CAMERA 패널에서 중앙선 세그멘테이션 마스크를 겹쳐 그릴 때의 초록색 알파.
+  static constexpr double CENTER_LANE_OVERLAY_ALPHA = 0.45;
 
   // ── 모드/차선 상태 ──────────────────────────────────────────────────
   int current_mode_ = 0;
@@ -1112,6 +1236,12 @@ private:
       resize(lane_mask, lane_mask, Size(frame_width_, frame_height_), 0, 0, INTER_NEAREST);
     }
     threshold(lane_mask, lane_mask, 0, 255, THRESH_BINARY);
+
+    // 모니터 CAMERA 패널 오버레이용: 주행 트라페조이드 ROI로 잘리기 전의
+    // 원본 세그멘테이션 결과. 라벨 ROI(하단 40%) 전체에서 모델이 실제로
+    // 무엇을 예측했는지 그대로 보여주기 위해 트라페조이드 AND 이전에 떠둔다.
+    Mat lane_mask_for_display = lane_mask.clone();
+
     bitwise_and(lane_mask, trapezoidMask(lane_mask.size()), lane_mask);
 
     // 세그멘테이션 경계의 자잘한 구멍/점을 정리한다. 색상 파이프라인의
@@ -1134,8 +1264,8 @@ private:
       imshow("ROI Polygon", frame_roi_vis);
     }
 
-    // (1) 전처리 완료된 중앙선 마스크
-    if (debug_view_) {imshow("Mask-PIDNet-Center-Lane", lane_mask);}
+    // (1) 전처리 완료된 중앙선 마스크 (보조 창)
+    if (debug_view_ && debug_lane_view_) {imshow("Mask-PIDNet-Center-Lane", lane_mask);}
 
     // (2) BEV 투시변환: 사다리꼴 → 직사각형
     Mat bev_yellow;
@@ -1185,7 +1315,7 @@ private:
     if (suppressed2) {bev_yellow = bev_clean2;}
 
     if (debug_view_ && debug_lane_view_) {
-      cv::imshow("BEV-Yellow (suppressed rows/columns in red)", bev_color);
+      cv::imshow("BEV-Mask (suppressed rows/columns in red)", bev_color);
     }
 
     // (4) 슬라이딩 윈도우 직선 피팅
@@ -1193,8 +1323,7 @@ private:
     bool show_dbg = debug_view_ && (frame_count_ % debug_stride_ == 0);
 
     bool valid = false;
-    cv::Mat dbg;
-    LineFit center_fit = fitLaneFromBEV(bev_yellow, valid, show_dbg ? &dbg : nullptr);
+    LineFit center_fit = fitLaneFromBEV(bev_yellow, valid);
 
     std_msgs::msg::Bool validity_msg;
     validity_msg.data = valid;
@@ -1214,8 +1343,7 @@ private:
 
     // (6) 토픽 발행 + 디버그 출력
     const auto publication_policy = publishAndDebug(
-      frame, offset, center_fit, valid, show_dbg,
-      dbg.empty() ? nullptr : &dbg);
+      frame, offset, center_fit, valid, show_dbg, lane_mask_for_display);
 
     // A failed fit may retain prior geometry for internal tracking/debug,
     // but invalid evidence must reset lane-change completion progress.
@@ -1329,9 +1457,25 @@ private:
   }
 
   // ─────────────────────────────────────────────────────────────────────
+  // 원본 카메라 콜백: 모니터 창 CAMERA 패널에만 쓴다.
+  //
+  // 차선 판단은 /lane_segmentation_mask 로만 한다. 이 프레임은 어떤 인지
+  // 경로에도 들어가지 않는다.
+  // ─────────────────────────────────────────────────────────────────────
+  void cameraCallback(const sensor_msgs::msg::Image::SharedPtr msg)
+  {
+    try {
+      latest_camera_ =
+        cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8)->image;
+    } catch (cv_bridge::Exception & e) {
+      RCLCPP_WARN(get_logger(), "cv_bridge 카메라 패널 오류: %s", e.what());
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
   // 모터 명령 콜백: /xycar_motor [조향각, 속도] 수신
   //
-  // "Vehicle Dynamics" 디버그 창 시각화에만 사용한다 (제어에 개입하지 않음).
+  // 모니터 창 VEHICLE 패널 시각화에만 사용한다 (제어에 개입하지 않음).
   // ─────────────────────────────────────────────────────────────────────
   void motorCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
   {
@@ -1339,22 +1483,11 @@ private:
     last_steer_cmd_ = msg->data[0];
     if (msg->data.size() >= 2) {last_speed_cmd_ = msg->data[1];}
 
-    // 카메라 프레임 콜백을 기다리지 않고 /xycar_motor 수신마다 갱신하되,
-    // 표시 주기는 10 Hz 로 제한한다. /xycar_motor 는 제어 주기(50 Hz)로
-    // 들어오는데, 그때마다 imshow + waitKey 를 부르면 같은 스레드에서 도는
-    // 차선 인지가 그만큼 밀린다. 실측(bag): 카메라 18.8 Hz 입력에
-    // /lane_offset 은 5.9 Hz 출력. 눈으로 보는 창은 10 Hz 면 충분하다.
-    if (debug_view_) {
-      const rclcpp::Time stamp = this->get_clock()->now();
-      if (last_dynamics_draw_.nanoseconds() == 0 ||
-        (stamp - last_dynamics_draw_).seconds() >= 0.1 ||
-        (stamp - last_dynamics_draw_).seconds() < 0.0)
-      {
-        last_dynamics_draw_ = stamp;
-        cv::imshow("Vehicle Dynamics", drawVehicleDynamicsView());
-        cv::waitKey(1);
-      }
-    }
+    // 값만 캐시하고 그리지는 않는다. /xycar_motor 는 제어 주기(50 Hz)로
+    // 들어오는데 그때마다 imshow + waitKey 를 부르면 같은 스레드에서 도는
+    // 차선 인지가 밀린다(실측 bag: 카메라 18.8 Hz 입력에 /lane_offset 5.9 Hz
+    // 출력). 통합 모니터 창은 카메라 프레임당 한 번만 그리고, 그때 이
+    // 캐시된 최신 값을 읽는다.
   }
 };
 
