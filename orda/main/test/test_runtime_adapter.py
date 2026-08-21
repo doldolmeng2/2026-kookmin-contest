@@ -376,6 +376,49 @@ def test_side_clearance_rejects_invalid_duplicate_or_regressed_receipts():
     assert adapter.perception_received_at["side_clearance"] == 1.0
 
 
+def test_lane_guardrail_rejects_invalid_duplicate_or_regressed_receipts():
+    adapter = runtime(Mode.LANE_DRIVE)
+
+    assert adapter.record_lane_guardrail(120.0, 240.0, 1.0) is True
+    assert adapter.record_lane_guardrail(130.0, 250.0, 1.0) is False
+    assert adapter.record_lane_guardrail(130.0, 250.0, 0.9) is False
+    assert adapter.record_lane_guardrail(float("nan"), 250.0, 1.1) is False
+    assert adapter.record_lane_guardrail(130.0, float("inf"), 1.1) is False
+    assert adapter.record_lane_guardrail(130.0, 250.0, float("nan")) is False
+    assert adapter.latest_lane_guardrail == (120.0, 240.0)
+    assert adapter.lane_guardrail_received_at == 1.0
+    assert adapter.perception_received_at["lane_guardrail"] == 1.0
+
+
+def test_lane_guardrail_accepts_unobserved_rails():
+    """음수는 '레일을 못 봤다'는 정상적인 관측 결과다.
+
+    바깥 실선이 안 보이는 건 흔한 일이고(실측 관측률 84~90%), 그때 메시지를
+    버리면 제어기가 오래된 여유를 계속 붙들게 된다. 값은 받아들이고, 감쇠는
+    제어기가 판단한다.
+    """
+    adapter = runtime(Mode.LANE_DRIVE)
+
+    assert adapter.record_lane_guardrail(-1.0, -1.0, 1.0) is True
+    assert adapter.latest_lane_guardrail == (-1.0, -1.0)
+
+
+def test_lane_change_in_progress_only_while_fresh_and_changing():
+    adapter = runtime(Mode.LANE_DRIVE)
+    max_age = adapter.lane_change_max_age_s
+
+    assert adapter.lane_change_in_progress(1.0) is False
+
+    assert adapter.record_lane_change_state([1, 0], 1.0).accepted is True
+    assert adapter.lane_change_in_progress(1.0) is True
+    assert adapter.lane_change_in_progress(1.0 + max_age) is True
+    # 토픽이 끊기면 차선 변경 중인지 더 이상 알 수 없다.
+    assert adapter.lane_change_in_progress(1.0 + max_age + 0.01) is False
+
+    assert adapter.record_lane_change_state([0, 1], 2.0).accepted is True
+    assert adapter.lane_change_in_progress(2.0) is False
+
+
 def test_runtime_wait_green_absorbs_startup_readiness_gate():
     adapter = RaceRuntimeAdapter(
         fsm=RaceFSM(initial_state=Mode.WAIT_GREEN),

@@ -90,6 +90,12 @@ RUBBERCONE_STEERING_STEP = 3.0
 LANE_ACCEL_STEP = 0.4
 STOP_DECEL_STEP = 0.6
 
+# /lane_offset 과 /lane_guardrail 은 lane_node 의 같은 콜백에서 나가므로 정상이면
+# 수신 시각이 거의 같다. 이보다 벌어졌다면 둘 중 하나가 밀린 것이고, 그때는
+# 가드레일을 쓰지 않는다 — 오래된 여유로 조향을 더하면 이미 지나간 코너를
+# 향해 꺾게 된다. 24 Hz 기준 한 프레임이 42ms 라 두 프레임 남짓으로 잡았다.
+GUARDRAIL_MAX_SKEW_S = 0.10
+
 # 이보다 크게 시각이 역행하면 "bag이 처음부터 다시 재생됨"으로 본다.
 # 실차 wall clock도 NTP 보정으로 아주 드물게 살짝 뒤로 갈 수 있어, 그런 미세
 # 역행까지 리셋으로 잡지 않도록 넉넉한 임계값을 둔다.
@@ -173,11 +179,15 @@ class MainNode(Node):
             ParameterDescriptor(dynamic_typing=True),
         )
         self.declare_parameter("show_debug", False)
+        self.declare_parameter("lane_guardrail", True)
         test_profile = parse_test_profile(
             self.get_parameter("test_profile").value
         )
         self._initial_mode = parse_initial_mode(self.get_parameter("mode").value)
         self.show_debug = bool(self.get_parameter("show_debug").value)
+        self.lane_guardrail_enabled = bool(
+            self.get_parameter("lane_guardrail").value
+        )
 
         # bag --loop 재생 감지용. use_sim_time=True 로 띄우고 bag을 --clock 과
         # 함께 재생하면, 루프가 돌 때 /clock 시각이 뒤로 튄다. 그 역행을 잡아
@@ -301,6 +311,12 @@ class MainNode(Node):
             self.lane_offset_callback,
             qos_fast,
         )
+        self.lane_guardrail_sub = self.create_subscription(
+            Float32MultiArray,
+            "lane_guardrail",
+            self.lane_guardrail_callback,
+            qos_fast,
+        )
         self.object_info_sub = self.create_subscription(
             Int32MultiArray,
             OBJECT_INFO_TOPIC,
@@ -421,6 +437,24 @@ class MainNode(Node):
             self._warn_throttled(
                 "malformed_lane",
                 "invalid lane_offset message ignored",
+                received_at,
+            )
+
+    def lane_guardrail_callback(self, msg: Float32MultiArray) -> None:
+        received_at = self._now_seconds()
+        data = list(msg.data)
+        if len(data) < 2:
+            self._warn_throttled(
+                "malformed_guardrail",
+                "invalid lane_guardrail message ignored",
+                received_at,
+            )
+            return
+        if not self.runtime.record_lane_guardrail(
+                data[0], data[1], received_at):
+            self._warn_throttled(
+                "malformed_guardrail",
+                "invalid lane_guardrail message ignored",
                 received_at,
             )
 
@@ -988,6 +1022,30 @@ class MainNode(Node):
         if entered:
             self._enter_zone(now)
 
+    def _guardrail_for(self, control_mode, lane_received_at: float):
+        """Return the guardrail margins only where the term is allowed to act.
+
+        Returning None disables it in the controller, which then behaves
+        exactly as Pure Pursuit alone.
+        """
+
+        if not self.lane_guardrail_enabled:
+            return None
+        if control_mode is not Mode.LANE_DRIVE:
+            # FIXED_AVOID crosses lines on purpose; CONE_DRIVE has no lines.
+            return None
+        margins = self.runtime.latest_lane_guardrail
+        received_at = self.runtime.lane_guardrail_received_at
+        if margins is None or received_at is None:
+            return None
+        # lane_node publishes both topics in one callback, so anything more
+        # than a frame apart means one of them stalled.
+        if abs(received_at - lane_received_at) > GUARDRAIL_MAX_SKEW_S:
+            return None
+        if self.runtime.lane_change_in_progress(self._now_seconds()):
+            return None
+        return margins
+
     def _command_candidates(self):
         lane_candidate = None
         lane_received_at = self.runtime.latest_lane_received_at
@@ -1004,6 +1062,7 @@ class MainNode(Node):
                 lane_offset,
                 self.object_dist,
                 100,
+                self._guardrail_for(control_mode, lane_received_at),
             )
             speed = float(self.lane_controller.get_speed()) #/2.0 속도 절반
             # 고정장애물이 우리 차선에 있으면 접근할수록 속도를 낮춘다.

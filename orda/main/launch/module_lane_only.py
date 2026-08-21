@@ -92,8 +92,26 @@ def generate_launch_description():
                 "조향 방식만 A/B 로 보고 싶으면 false 로 꺼서 변수를 줄인다."
             ),
         ),
+        DeclareLaunchArgument(
+            "lane_guardrail",
+            default_value="true",
+            choices=("false", "true"),
+            description=(
+                "바깥 실선(left_solid/right_solid)에 가까워질수록 반대쪽으로 "
+                "조향을 더한다. Pure Pursuit 단독은 조향이 38.9 에서 포화하므로 "
+                "코너에서 차선을 벗어나도 더 꺾지 못한다. false 면 반발항이 "
+                "정확히 0 이 되어 Pure Pursuit 단독 거동과 완전히 같다 — "
+                "A/B 비교의 기준선으로 쓴다."
+            ),
+        ),
     ]
-    parameters = [{"mode": 1, "show_debug": show_debug}]
+    parameters = [{
+        "mode": 1,
+        "show_debug": show_debug,
+        "lane_guardrail": ParameterValue(
+            LaunchConfiguration("lane_guardrail"), value_type=bool
+        ),
+    }]
     isolated_main = Node(
         package="main",
         executable="main_node",
@@ -157,6 +175,11 @@ def generate_launch_description():
             # 그래서 실행 후 ros2 param set 으로는 바꿀 수 없고 여기서 넘겨야 한다.
             "enable_reacquire_full_bev_fallback": ParameterValue(
                 LaunchConfiguration("lane_reacquire_fallback"), value_type=bool
+            ),
+            # lane_node 가 /pidnet_class_map 에서 직접 중앙선을 뽑으므로,
+            # pidnet 과 같은 클래스 목록을 받아야 의미가 어긋나지 않는다.
+            "center_classes": ParameterValue(
+                LaunchConfiguration("pidnet_lane_classes"), value_type=List[int]
             ),
         }],
         remappings=[("/mode_info", "/internal/lane_command")],

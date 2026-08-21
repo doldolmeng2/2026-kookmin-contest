@@ -162,8 +162,13 @@ def test_controller_accepts_only_current_fsm_drive_modes_and_keeps_tuning():
     assert controller.get_angle() == 0.0
     assert controller.get_speed() == 0.0
 
+    # 리터럴 43.0 을 기대하던 테스트였는데, LANE_DRIVE max_speed 가 31.0 으로
+    # 낮춰졌을 때 같이 고쳐지지 않아 계속 실패하고 있었다. 프로파일에서 읽어
+    # 재튜닝에도 깨지지 않게 한다. 오프셋 0 이면 감속분이 없으므로 max_speed 다.
     controller.update(Mode.LANE_DRIVE, 0, float("inf"), 100)
-    assert controller.get_speed() == pytest.approx(43.0)
+    assert controller.get_speed() == pytest.approx(
+        controller.speed_params[Mode.LANE_DRIVE].max_speed
+    )
 
 
 def test_detector_reset_clears_detection_debounce_filter_and_debug_state():

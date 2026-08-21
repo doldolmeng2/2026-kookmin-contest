@@ -95,6 +95,9 @@ def generate_launch_description():
             'debug_view': True,
             'debug_lane_view': lane_debug_detail,
             'camera_topic': '/resized_image',
+            # 위 pidnet_node 의 lane_classes 와 같은 값이어야 한다. lane_node 가
+            # /pidnet_class_map 에서 직접 중앙선을 뽑기 때문이다.
+            'center_classes': [1],
         }],
         remappings=[('/mode_info', '/internal/lane_command')],
     )

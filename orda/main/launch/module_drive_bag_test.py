@@ -281,6 +281,10 @@ def generate_launch_description():
         executable='lane_node',
         name='lane_node',
         output='screen',
+        parameters=[{
+            # pidnet 과 같은 클래스 목록을 받아야 의미가 어긋나지 않는다.
+            'center_classes': pidnet_lane_classes,
+        }],
         remappings=[('/mode_info', '/internal/lane_command')],
     )
     object_yolo_node = Node(

@@ -1,23 +1,27 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // lane_detection.cpp
 //
-// 역할: PIDNet 세그멘테이션 마스크 기반 BEV 중앙선 추적 노드
-//   1) PIDNet-S가 발행한 중앙선 세그멘테이션 마스크를 입력받는다.
+// 역할: PIDNet 세그멘테이션 클래스맵 기반 BEV 중앙선 추적 노드
+//   1) PIDNet-S가 발행한 클래스맵에서 중앙선(class 1)을 뽑는다.
 //   2) 사다리꼴 ROI를 BEV(Bird's Eye View)로 투시변환한다.
 //   3) 수평/수직 노이즈를 억제한 뒤 슬라이딩 윈도우로 중앙선을 추적한다.
 //   4) 최소자승 직선 피팅 결과를 오프셋(/lane_offset)과 피팅 파라미터
 //      (/lane_fit)로 발행한다.
+//   5) 같은 클래스맵에서 바깥 실선(left_solid/right_solid)까지의 여유를 재
+//      /lane_guardrail 로 발행한다. 중앙선만 보는 Pure Pursuit 은 조향 상한
+//      (실측 38.9)에 묶여 있어 차선을 벗어나기 직전에 더 꺾을 수단이 없다.
 //
 // 입력이 색상 임계값에서 CNN 마스크로 바뀌었을 뿐, (2)~(4)의 BEV·노이즈
 // 억제·앵커 추적·강건 피팅은 그대로다. 그래서 JSON의 yellow_* / canny_* /
 // gaussian_blur_kernel_size 항목은 더 이상 주행에 영향을 주지 않는다
 // (스키마 호환을 위해 남겨두었을 뿐이며, hls_hsv_tuner 전용이다).
 //
-// 구독: /lane_segmentation_mask (sensor_msgs/Image, MONO8)
+// 구독: /pidnet_class_map (sensor_msgs/Image, MONO8 라벨 0~5)
 //       /mode_info     (std_msgs/Int32MultiArray, [mode, lane])
 // 발행: /lane_offset       (std_msgs/Int16, 픽셀 단위 오프셋)
 //       /lane_fit           (std_msgs/Float32MultiArray, [m, b])
 //       /lane_change_state  (std_msgs/Int32MultiArray, [변경중, 성공여부])
+//       /lane_guardrail     (std_msgs/Float32MultiArray, [좌 여유, 우 여유] BEV px)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <rclcpp/rclcpp.hpp>
@@ -50,6 +54,8 @@
 #include <chrono>
 #include <optional>
 #include "lane_change_state_tracker.hpp"
+#include "lane_detection/class_map.hpp"
+#include "lane_detection/lane_guardrail.hpp"
 #include "lane_detection/lane_measurement_publication_policy.hpp"
 #include "lane_detection/lane_pipeline_diagnostics.hpp"
 #include "lane_detection/reacquire_histogram.hpp"
@@ -106,14 +112,55 @@ public:
     auto qos_sensor = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
     auto qos_fast = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
 
-    // PIDNet-S 중앙선 마스크 구독: /lane_segmentation_mask (MONO8, 0 또는 255)
+    // PIDNet-S 클래스맵 구독: /pidnet_class_map (MONO8, 라벨 0~5)
+    //
+    // 예전에는 pidnet 이 중앙선만 골라 만든 /lane_segmentation_mask 를 받았다.
+    // 가드레일 항이 같은 프레임의 바깥 실선도 필요한데, 마스크와 클래스맵을 따로
+    // 구독하면 pidnet 이 마스크를 먼저 발행하는 탓에 마스크 콜백 시점에 같은
+    // stamp 의 클래스맵이 아직 안 와 있을 수 있다. 클래스맵 하나만 받고 중앙선
+    // 마스크를 여기서 만들면 그 어긋남 자체가 없어진다.
     const std::string mask_topic = this->declare_parameter<std::string>(
-      "mask_topic", "/lane_segmentation_mask");
+      "mask_topic", "/pidnet_class_map");
     image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
       mask_topic, qos_sensor,
       std::bind(&LaneDetector::imageCallback, this, std::placeholders::_1)
     );
-    RCLCPP_INFO(get_logger(), "PIDNet 세그멘테이션 마스크 사용: %s", mask_topic.c_str());
+
+    // 중앙선으로 쓸 클래스. pidnet 의 lane_classes 와 같은 의미이며, 런치에서
+    // 두 곳에 같은 값을 넘겨 의미를 맞춘다 (1=center_lane).
+    const auto center_classes = this->declare_parameter<std::vector<int64_t>>(
+      "center_classes", {1});
+    center_classes_.clear();
+    for (const auto value : center_classes) {
+      center_classes_.push_back(static_cast<int>(value));
+    }
+    // 가드레일용 바깥 실선 클래스 (2=left_solid, 3=right_solid).
+    left_rail_class_ = static_cast<int>(
+      this->declare_parameter<int64_t>("left_rail_class", 2));
+    right_rail_class_ = static_cast<int>(
+      this->declare_parameter<int64_t>("right_rail_class", 3));
+
+    rail_config_.min_row_pixels = static_cast<int>(
+      this->declare_parameter<int64_t>("guardrail_min_row_pixels", 3));
+    rail_config_.min_valid_row_ratio = static_cast<float>(
+      this->declare_parameter<double>("guardrail_min_valid_row_ratio", 0.5));
+    rail_config_.band_top_ratio = static_cast<float>(
+      this->declare_parameter<double>("guardrail_band_top_ratio", 0.60));
+    rail_config_.band_bottom_ratio = static_cast<float>(
+      this->declare_parameter<double>("guardrail_band_bottom_ratio", 0.95));
+
+    // 디버그 게이지 눈금. 제어값이 아니라 표시용이므로 control.py 의
+    // GUARDRAIL_PARAMS 와 같은 값으로 맞춰 두기만 하면 된다.
+    guardrail_display_margin_px_ =
+      this->declare_parameter<double>("guardrail_display_margin_px", 190.0);
+    guardrail_display_min_trust_px_ =
+      this->declare_parameter<double>("guardrail_display_min_trust_px", 15.0);
+
+    RCLCPP_INFO(
+      get_logger(),
+      "PIDNet 클래스맵 사용: %s (중앙선 클래스 %zu개, 레일 %d/%d)",
+      mask_topic.c_str(), center_classes_.size(),
+      left_rail_class_, right_rail_class_);
 
     // 디버그 창은 JSON 값을 기본으로 하되 ROS 파라미터로 덮어쓸 수 있다.
     // JSON을 고치면 실차 주행에도 그대로 남아 성능을 깎으므로, 볼 때만
@@ -164,6 +211,11 @@ public:
 
     // 차선 회귀 파라미터 발행: /lane_fit ([m, b], 프레임 좌표계)
     fit_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/lane_fit", qos_fast);
+
+    // 바깥 실선 여유 발행: /lane_guardrail ([좌 여유, 우 여유], BEV px)
+    // 음수는 미관측이다. /lane_offset 과 같은 콜백에서 나가므로 항상 같은 프레임이다.
+    guardrail_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
+      "/lane_guardrail", qos_fast);
 
     // 차선 변경 상태 발행: /lane_change_state ([변경중여부, 성공여부])
     lane_change_state_pub_ = this->create_publisher<std_msgs::msg::Int32MultiArray>(
@@ -745,6 +797,131 @@ public:
   }
 
   // ─────────────────────────────────────────────────────────────────────
+  // 가드레일: 바깥 실선까지의 여유 측정
+  //
+  // 중앙선과 **같은 사다리꼴 ROI, 같은 호모그래피**로 warp 하므로 결과가
+  // /lane_offset 과 같은 BEV px 단위로 나온다. 차량 중심은 사다리꼴이 cx
+  // 대칭이라 BEV 폭의 절반이다.
+  //
+  // 중앙선용 수평/수직 노이즈 억제는 일부러 적용하지 않는다. 그 억제기들은
+  // "얇은 선 하나"를 전제로 튜닝돼 있어 굵은 실선을 통째로 지워 버린다.
+  // 스페클은 lane_guardrail.hpp 의 행 중앙값이 걸러낸다.
+  // ─────────────────────────────────────────────────────────────────────
+  lane_detection::RailMargins measureRailMargins(const Mat & class_map)
+  {
+    if (debug_view_) {
+      // 시각화용 사본은 사다리꼴로 자르기 전에 떠 둔다. 모델이 ROI 밖에서
+      // 무엇을 봤는지도 보여야 "왜 여유가 저렇게 나왔나"를 판단할 수 있다.
+      left_rail_display_ =
+        lane_detection::extractClassMask(class_map, left_rail_class_);
+      right_rail_display_ =
+        lane_detection::extractClassMask(class_map, right_rail_class_);
+    }
+    if (bev_size_.width <= 1 || bev_size_.height <= 1 || H_.empty()) {
+      last_rail_margins_ = {};
+      return last_rail_margins_;
+    }
+    const Mat trapezoid = trapezoidMask(class_map.size());
+    const int ego_x = bev_size_.width / 2;
+
+    auto measure = [&](int rail_class, Mat * bev_out) {
+        Mat rail = lane_detection::extractClassMask(class_map, rail_class);
+        bitwise_and(rail, trapezoid, rail);
+        Mat bev_rail;
+        warpPerspective(
+          rail, bev_rail, H_, bev_size_,
+          INTER_NEAREST, BORDER_CONSTANT, Scalar(0));
+        if (bev_out) {*bev_out = bev_rail;}
+        return lane_detection::railMargins(bev_rail, ego_x, rail_config_);
+      };
+
+    const bool want_bev = debug_view_ && debug_lane_view_;
+    last_rail_margins_ = lane_detection::mergeRailMargins(
+      measure(left_rail_class_, want_bev ? &left_rail_bev_ : nullptr),
+      measure(right_rail_class_, want_bev ? &right_rail_bev_ : nullptr));
+    return last_rail_margins_;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 세 차선 클래스를 색으로 구분한 원본 해상도 마스크 (사다리꼴 자르기 전).
+  // pidnet 색 규약: center_lane=초록, left_solid=파랑, right_solid=빨강.
+  // ─────────────────────────────────────────────────────────────────────
+  cv::Mat buildClassMaskView(const cv::Mat & center_mask) const
+  {
+    cv::Mat canvas(frame_height_, frame_width_, CV_8UC3, cv::Scalar(0, 0, 0));
+    auto paint = [&](const cv::Mat & mask, const cv::Scalar & color) {
+        if (!mask.empty() && mask.size() == canvas.size()) {
+          canvas.setTo(color, mask);
+        }
+      };
+    paint(left_rail_display_, {255, 80, 0});
+    paint(right_rail_display_, {0, 80, 255});
+    paint(center_mask, {0, 255, 0});
+
+    // 기준선은 CAMERA 패널과 **똑같이** 그린다. 예전에는 이 창에만 사다리꼴을
+    // 칙칙한 빨강으로 하나 그렸는데, CAMERA 쪽 빨간 선은 라벨 ROI(y=216)이고
+    // 이 창의 빨간 선은 사다리꼴 윗변(y=251)이라 35px 어긋난 서로 다른 선이
+    // 같은 색으로 보였다. 그래서 마스크가 같은데도 이 창이 더 좁게 보였다.
+    drawReferenceLines(canvas);
+    return canvas;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 가드레일 BEV 디버그 창: 레일 마스크 위에 실제 측정값을 겹쳐 그린다.
+  //
+  // 숫자만 봐서는 "레일이 저기 있는 게 맞나"를 알 수 없다. 샘플링한 근거리
+  // 행 구간, 차량 중심선, 반발이 시작되는 임계 여유, 그리고 그 프레임에서
+  // 실제로 고른 좌/우 레일 위치를 한 장에 겹쳐 놓는다.
+  // ─────────────────────────────────────────────────────────────────────
+  cv::Mat buildGuardrailBevView() const
+  {
+    if (left_rail_bev_.empty() || right_rail_bev_.empty()) {
+      return placeholderPanel(bev_size_.width, bev_size_.height, "no rail BEV");
+    }
+    cv::Mat canvas(bev_size_, CV_8UC3, cv::Scalar(0, 0, 0));
+    // pidnet 색 규약을 따른다: left_solid=파랑, right_solid=빨강.
+    canvas.setTo(cv::Scalar(255, 80, 0), left_rail_bev_);
+    canvas.setTo(cv::Scalar(0, 80, 255), right_rail_bev_);
+
+    const int ego_x = bev_size_.width / 2;
+    const int y_from = static_cast<int>(bev_size_.height * rail_config_.band_top_ratio);
+    const int y_to = std::min(
+      bev_size_.height - 1,
+      static_cast<int>(bev_size_.height * rail_config_.band_bottom_ratio));
+
+    // 샘플링 밴드 밖은 어둡게 죽인다 — 여기 픽셀은 측정에 안 들어간다.
+    if (y_from > 0) {canvas(cv::Rect(0, 0, canvas.cols, y_from)) *= 0.35;}
+    if (y_to + 1 < canvas.rows) {
+      canvas(cv::Rect(0, y_to + 1, canvas.cols, canvas.rows - y_to - 1)) *= 0.35;
+    }
+
+    // 차량 중심선(흰색)과 반발 시작 임계선(노란 점선 대용: 얇은 실선).
+    cv::line(canvas, {ego_x, 0}, {ego_x, canvas.rows - 1}, {255, 255, 255}, 1);
+    const int threshold = static_cast<int>(std::round(guardrail_display_margin_px_));
+    if (threshold > 0) {
+      for (int y = 0; y < canvas.rows; y += 6) {
+        const int y2 = std::min(canvas.rows - 1, y + 3);
+        cv::line(canvas, {ego_x - threshold, y}, {ego_x - threshold, y2}, {0, 220, 220}, 1);
+        cv::line(canvas, {ego_x + threshold, y}, {ego_x + threshold, y2}, {0, 220, 220}, 1);
+      }
+    }
+
+    // 이번 프레임에 실제로 고른 레일 위치(굵은 세로선).
+    const int mid_y = (y_from + y_to) / 2;
+    if (last_rail_margins_.leftKnown()) {
+      const int x = ego_x - static_cast<int>(std::round(last_rail_margins_.left));
+      cv::line(canvas, {x, y_from}, {x, y_to}, {255, 255, 0}, 2);
+      cv::line(canvas, {x, mid_y}, {ego_x, mid_y}, {255, 255, 0}, 1);
+    }
+    if (last_rail_margins_.rightKnown()) {
+      const int x = ego_x + static_cast<int>(std::round(last_rail_margins_.right));
+      cv::line(canvas, {x, y_from}, {x, y_to}, {0, 255, 255}, 2);
+      cv::line(canvas, {ego_x, mid_y}, {x, mid_y}, {0, 255, 255}, 1);
+    }
+    return canvas;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
   // ROI 사다리꼴 마스크 생성
   // roi_*_ 좌표로 정의된 사다리꼴 내부를 흰색(255)으로 채운 마스크를 반환한다.
   // ─────────────────────────────────────────────────────────────────────
@@ -937,8 +1114,28 @@ public:
     const int bar_h = 26;
     cv::Mat out(panel.rows + bar_h, panel.cols, CV_8UC3, cv::Scalar(24, 24, 24));
     panel.copyTo(out(cv::Rect(0, bar_h, panel.cols, panel.rows)));
+
+    // 제목은 패널 폭 안에서 끝나야 한다. putText 는 잘라주지 않으므로 긴 제목이
+    // 옆 패널 제목 위로 넘어가 겹쳐 읽힌다(실제로 그랬다). 폰트를 줄여 보고,
+    // 그래도 안 들어가면 뒤를 잘라낸다.
+    const int margin = 10;
+    const int usable = std::max(1, panel.cols - 2 * margin);
+    double scale = 0.55;
+    int baseline = 0;
+    std::string text = title;
+    while (scale > 0.34 &&
+      cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, scale, 1, &baseline).width > usable)
+    {
+      scale -= 0.05;
+    }
+    while (text.size() > 4 &&
+      cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, scale, 1, &baseline).width > usable)
+    {
+      text.erase(text.size() - 4, 1);
+      text.replace(text.size() - 3, 3, "...");
+    }
     cv::putText(
-      out, title, cv::Point(10, 18), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+      out, text, cv::Point(margin, 18), cv::FONT_HERSHEY_SIMPLEX, scale,
       cv::Scalar(235, 235, 235), 1, cv::LINE_AA);
     return out;
   }
@@ -982,23 +1179,35 @@ public:
         above *= CAMERA_ABOVE_ROI_DIM_FACTOR;
       }
 
-      // 라벨 ROI 안(아래쪽): 세그멘테이션 마스크를 반투명 초록으로 겹친다.
-      if (roi_top < vis.rows && !lane_mask_for_display.empty() &&
-        lane_mask_for_display.size() == vis.size())
-      {
-        cv::Rect below_rect(0, roi_top, vis.cols, vis.rows - roi_top);
-        cv::Mat below = vis(below_rect);
-        cv::Mat mask_below = lane_mask_for_display(below_rect);
-
-        cv::Mat tint(below.size(), below.type(), cv::Scalar(0, 255, 0));
-        cv::Mat blended;
-        cv::addWeighted(
-          below, 1.0 - CENTER_LANE_OVERLAY_ALPHA,
-          tint, CENTER_LANE_OVERLAY_ALPHA, 0.0, blended);
-        blended.copyTo(below, mask_below);
+      // 라벨 ROI 안(아래쪽): 세그멘테이션 마스크들을 반투명으로 겹친다.
+      // 색은 pidnet 규약(infer_pidnet.py CLASS_COLORS)을 그대로 따른다.
+      //   center_lane = 초록(조향 목표), left_solid = 파랑, right_solid = 빨강
+      // 중앙선과 레일을 구분해서 보여야 "가드레일이 무엇을 보고 밀었나"를
+      // 화면에서 바로 확인할 수 있다.
+      if (roi_top < vis.rows) {
+        const cv::Rect below_rect(0, roi_top, vis.cols, vis.rows - roi_top);
+        auto overlay = [&](const cv::Mat & mask, const cv::Scalar & color,
+          double alpha) {
+            if (mask.empty() || mask.size() != vis.size()) {return;}
+            cv::Mat below = vis(below_rect);
+            cv::Mat tint(below.size(), below.type(), color);
+            cv::Mat blended;
+            cv::addWeighted(below, 1.0 - alpha, tint, alpha, 0.0, blended);
+            blended.copyTo(below, mask(below_rect));
+          };
+        // 레일을 먼저 깔고 중앙선을 위에 올린다. 겹치는 픽셀에서는 조향 목표인
+        // 중앙선이 보이는 편이 낫다.
+        overlay(left_rail_display_, cv::Scalar(255, 80, 0), RAIL_OVERLAY_ALPHA);
+        overlay(right_rail_display_, cv::Scalar(0, 80, 255), RAIL_OVERLAY_ALPHA);
+        overlay(lane_mask_for_display, cv::Scalar(0, 255, 0), CENTER_LANE_OVERLAY_ALPHA);
       }
 
-      cv::line(vis, {0, roi_top}, {vis.cols - 1, roi_top}, {0, 0, 255}, 1, cv::LINE_AA);
+      // 라벨 ROI(빨강)와 BEV 사다리꼴(주황)은 서로 다른 경계다. 빨간 선만
+      // 그려 두면 "저 선 아래를 다 본다"로 읽히는데, 실제로 오프셋과 레일
+      // 여유를 재는 영역은 그보다 더 아래인 사다리꼴 안쪽뿐이다.
+      // Mask-PIDNet-Lanes 창도 같은 함수를 써서 기준선을 맞춘다.
+      drawReferenceLines(vis);
+      drawGuardrailReadout(vis);
 
       cv::resize(
         vis, camera_panel,
@@ -1011,10 +1220,177 @@ public:
 
     cv::Mat monitor;
     cv::hconcat(
-      withPanelTitle(camera_panel, "CAMERA  (dim = above label ROI, green = center-lane mask)"),
+      // 색 범례는 제목이 아니라 패널 안에 그린다(drawGuardrailReadout).
+      // 제목에 넣으면 폭을 넘겨 옆 패널 제목과 겹쳤다.
+      withPanelTitle(camera_panel, "CAMERA  segmentation + guardrail"),
       withPanelTitle(vehicle_panel, "VEHICLE  steer / speed"),
       monitor);
     return monitor;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // BEV 사다리꼴을 카메라 영상 위에 그려, BEV 창이 실제로 어느 범위를 보고
+  // 있는지 원본 화면과 대응시킨다.
+  //
+  // 라벨 ROI 선(빨강, height*0.6)과 사다리꼴 윗변(roi_top_y_, height*0.7)은
+  // 서로 다른 값이다. 빨간 선만 보이면 그 아래 전부를 재는 것처럼 읽히는데,
+  // 오프셋과 레일 여유는 사다리꼴 안쪽에서만 나온다. 아래쪽 변은 화면 밖
+  // (bottom_width 계수 2 → 폭 1280)이라 옆변이 아래로 벌어지는 모양으로 보인다.
+  //
+  // 가드레일이 실제 측정에 쓰는 근거리 밴드(band_top~band_bottom)는 BEV 세로
+  // 비율이므로, 사다리꼴 높이를 그 비율로 나눠 원본 위에 다시 표시한다.
+  // ─────────────────────────────────────────────────────────────────────
+  void drawReferenceLines(cv::Mat & vis) const
+  {
+    if (vis.empty() || frame_width_ <= 0 || frame_height_ <= 0) {return;}
+    const double sy = static_cast<double>(vis.rows) / frame_height_;
+    const int roi_top = std::clamp(
+      static_cast<int>(std::lround(label_roi_top_ * sy)), 0, vis.rows - 1);
+    cv::line(vis, {0, roi_top}, {vis.cols - 1, roi_top}, {0, 0, 255}, 1, cv::LINE_AA);
+    cv::putText(
+      vis, "label ROI", {vis.cols - 84, std::max(10, roi_top - 5)},
+      cv::FONT_HERSHEY_SIMPLEX, 0.36, {0, 0, 255}, 1, cv::LINE_AA);
+    drawBevFootprint(vis);
+  }
+
+  void drawBevFootprint(cv::Mat & vis) const
+  {
+    if (vis.empty() || frame_width_ <= 0 || frame_height_ <= 0) {return;}
+    const double sx = static_cast<double>(vis.cols) / frame_width_;
+    const double sy = static_cast<double>(vis.rows) / frame_height_;
+    const int cx = frame_width_ / 2;
+
+    auto point = [&](int x, int y) {
+        return cv::Point(
+          static_cast<int>(std::lround(x * sx)), static_cast<int>(std::lround(y * sy)));
+      };
+
+    const std::vector<cv::Point> pts = {
+      point(cx - roi_top_width_ / 2, roi_top_y_),
+      point(cx + roi_top_width_ / 2, roi_top_y_),
+      point(cx + roi_bottom_width_ / 2, roi_bottom_y_),
+      point(cx - roi_bottom_width_ / 2, roi_bottom_y_),
+    };
+    cv::polylines(vis, pts, true, {0, 165, 255}, 1, cv::LINE_AA);
+    cv::putText(
+      vis, "BEV", {pts[0].x + 4, pts[0].y - 5},
+      cv::FONT_HERSHEY_SIMPLEX, 0.36, {0, 165, 255}, 1, cv::LINE_AA);
+
+    // 가드레일 샘플 밴드. BEV 세로 비율을 원본 y 로 되돌린다.
+    const int span = roi_bottom_y_ - roi_top_y_;
+    auto band_y = [&](float ratio) {
+        return roi_top_y_ + static_cast<int>(std::lround(span * ratio));
+      };
+    for (const float ratio : {rail_config_.band_top_ratio, rail_config_.band_bottom_ratio}) {
+      const int y = std::clamp(band_y(ratio), 0, frame_height_ - 1);
+      // 그 높이에서의 사다리꼴 폭만큼만 긋는다.
+      const double t = span > 0 ? static_cast<double>(y - roi_top_y_) / span : 0.0;
+      const int half = static_cast<int>(std::lround(
+          (roi_top_width_ + (roi_bottom_width_ - roi_top_width_) * t) / 2.0));
+      cv::line(vis, point(cx - half, y), point(cx + half, y), {0, 255, 255}, 1, cv::LINE_AA);
+    }
+    cv::putText(
+      vis, "guardrail band",
+      {point(cx - roi_top_width_ / 2, band_y(rail_config_.band_top_ratio)).x + 4,
+        point(0, band_y(rail_config_.band_top_ratio)).y - 4},
+      cv::FONT_HERSHEY_SIMPLEX, 0.36, {0, 255, 255}, 1, cv::LINE_AA);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 가드레일 계기: 좌/우 여유와 반발이 얼마나 걸렸는지를 카메라 패널에 겹친다.
+  //
+  // ★ 여기 게이지는 보기용이다. 실제 조향에 더해지는 값은 main 의
+  //   control.py GUARDRAIL_PARAMS 가 계산한다. 이 창의 임계값은 그것과 같게
+  //   맞춰 두려고 guardrail_display_margin_px 파라미터로 받는다 — 값이 어긋나면
+  //   게이지만 틀리고 주행은 영향을 받지 않는다.
+  // ─────────────────────────────────────────────────────────────────────
+  void drawGuardrailReadout(cv::Mat & vis) const
+  {
+    const float threshold = guardrail_display_margin_px_;
+    auto engagement = [&](float margin) {
+        if (threshold <= 0.f || margin < guardrail_display_min_trust_px_) {return 0.f;}
+        if (margin >= threshold) {return 0.f;}
+        return (threshold - margin) / threshold;      // control.py 와 같은 선형 램프
+      };
+
+    struct Row
+    {
+      const char * label;
+      bool known;
+      float margin;
+      cv::Scalar color;
+    };
+    const Row rows[2] = {
+      {"L", last_rail_margins_.leftKnown(), last_rail_margins_.left, {255, 80, 0}},
+      {"R", last_rail_margins_.rightKnown(), last_rail_margins_.right, {0, 80, 255}},
+    };
+
+    const int x0 = 8, bar_w = 150, bar_h = 9;
+
+    // 글자가 밝은 노면 위에 그대로 얹히면 안 읽힌다. 어두운 판을 반투명으로 깐다.
+    const cv::Rect plate(4, 4, std::min(vis.cols - 8, x0 + 74 + bar_w + 8), 78);
+    if (plate.width > 0 && plate.height > 0 &&
+      plate.br().x <= vis.cols && plate.br().y <= vis.rows)
+    {
+      cv::Mat roi = vis(plate);
+      cv::Mat dark(roi.size(), roi.type(), cv::Scalar(0, 0, 0));
+      cv::addWeighted(roi, 0.45, dark, 0.55, 0.0, roi);
+    }
+
+    // 색 범례: 오버레이 색이 무엇을 뜻하는지 패널 안에서 바로 읽히게 한다.
+    int lx = x0;
+    const struct {const char * name; cv::Scalar color;} legend[3] = {
+      {"center", {0, 255, 0}}, {"left", {255, 80, 0}}, {"right", {0, 80, 255}},
+    };
+    for (const auto & item : legend) {
+      cv::rectangle(vis, {lx, 8}, {lx + 9, 15}, item.color, cv::FILLED);
+      cv::putText(
+        vis, item.name, {lx + 13, 15}, cv::FONT_HERSHEY_SIMPLEX, 0.36,
+        {225, 225, 225}, 1, cv::LINE_AA);
+      lx += 13 + 9 +
+        cv::getTextSize(item.name, cv::FONT_HERSHEY_SIMPLEX, 0.36, 1, nullptr).width;
+    }
+
+    int y = 24;
+    for (const Row & row : rows) {
+      char text[64];
+      if (row.known) {
+        std::snprintf(text, sizeof(text), "%s %4.0fpx", row.label, row.margin);
+      } else {
+        std::snprintf(text, sizeof(text), "%s   --", row.label);
+      }
+      cv::putText(
+        vis, text, {x0, y + bar_h}, cv::FONT_HERSHEY_SIMPLEX, 0.42,
+        {235, 235, 235}, 1, cv::LINE_AA);
+
+      const int bx = x0 + 74;
+      cv::rectangle(vis, {bx, y}, {bx + bar_w, y + bar_h}, {90, 90, 90}, 1);
+      const float ratio = row.known ? engagement(row.margin) : 0.f;
+      if (ratio > 0.f) {
+        const int filled = static_cast<int>(std::round(bar_w * ratio));
+        cv::rectangle(
+          vis, {bx + 1, y + 1}, {bx + std::max(1, filled), y + bar_h - 1},
+          row.color, cv::FILLED);
+      }
+      y += bar_h + 8;
+    }
+
+    // 두 레일 중 실제로 반발을 만드는 쪽(=가까운 쪽)과 그 세기.
+    float best = 0.f;
+    const char * side = "none";
+    for (const Row & row : rows) {
+      if (!row.known) {continue;}
+      const float ratio = engagement(row.margin);
+      if (ratio > best) {best = ratio; side = row.label;}
+    }
+    char summary[80];
+    std::snprintf(
+      summary, sizeof(summary), "GUARDRAIL %s %3.0f%%  (thr %.0fpx)",
+      side, best * 100.f, threshold);
+    cv::putText(
+      vis, summary, {x0, y + bar_h}, cv::FONT_HERSHEY_SIMPLEX, 0.42,
+      best > 0.f ? cv::Scalar(0, 235, 235) : cv::Scalar(150, 150, 150),
+      1, cv::LINE_AA);
   }
 
   // ─────────────────────────────────────────────────────────────────────
@@ -1178,7 +1554,25 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr fit_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr lane_change_state_pub_;
   rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr lane_position_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr guardrail_pub_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_pub_;
+
+  // ── 클래스맵 해석 / 가드레일 설정 ───────────────────────────────────
+  std::vector<int> center_classes_{1};
+  int left_rail_class_ = 2;
+  int right_rail_class_ = 3;
+  lane_detection::RailMarginConfig rail_config_{};
+  // 이번 프레임 측정값. 발행과 시각화가 같이 쓴다.
+  lane_detection::RailMargins last_rail_margins_{};
+  // 시각화 전용 사본 (debug_view_ 일 때만 채운다).
+  cv::Mat left_rail_display_;
+  cv::Mat right_rail_display_;
+  cv::Mat left_rail_bev_;
+  cv::Mat right_rail_bev_;
+  // 게이지 눈금용. 제어에는 쓰이지 않는다 — control.py 의 GUARDRAIL_PARAMS 가
+  // 진짜 값이고, 여기 값이 어긋나도 주행은 바뀌지 않는다.
+  double guardrail_display_margin_px_ = 190.0;
+  double guardrail_display_min_trust_px_ = 15.0;
 
   // ── 실측 현재 차선 판정 상태 (인지 기반, 제어 목표와 무관) ──────────
   int detected_lane_ = -1;     // 확정된 실측 차선 (-1=미확정)
@@ -1234,6 +1628,9 @@ private:
   static constexpr double CAMERA_ABOVE_ROI_DIM_FACTOR = 0.55;
   // CAMERA 패널에서 중앙선 세그멘테이션 마스크를 겹쳐 그릴 때의 초록색 알파.
   static constexpr double CENTER_LANE_OVERLAY_ALPHA = 0.45;
+  // 바깥 실선(left_solid/right_solid) 오버레이 알파. 중앙선보다 옅게 깔아
+  // 조향 목표인 중앙선이 화면에서 먼저 읽히게 한다.
+  static constexpr double RAIL_OVERLAY_ALPHA = 0.35;
 
   // ── 모드/차선 상태 ──────────────────────────────────────────────────
   int current_mode_ = 0;
@@ -1271,16 +1668,16 @@ private:
 
     if (smooth_enabled_) {updateRefRatio();}
 
-    // (0) PIDNet-S mono8 마스크 → 이진 OpenCV 마스크
+    // (0) PIDNet-S mono8 클래스맵 → 이진 OpenCV 마스크
     cv_bridge::CvImagePtr cv_ptr;
     try {
       cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::MONO8);
     } catch (cv_bridge::Exception & e) {
-      RCLCPP_ERROR(get_logger(), "cv_bridge 마스크 오류: %s", e.what());
+      RCLCPP_ERROR(get_logger(), "cv_bridge 클래스맵 오류: %s", e.what());
       return;
     }
-    Mat lane_mask = cv_ptr->image;
-    if (lane_mask.empty()) {
+    Mat class_map = cv_ptr->image;
+    if (class_map.empty()) {
       if (diagnostics) {
         diagnostics->processing_time_us = static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1292,14 +1689,21 @@ private:
     }
 
     // 모델 출력 해상도가 JSON의 frame_width/height와 다르면 맞춘다.
-    // 이진 마스크이므로 보간은 반드시 최근접(INTER_NEAREST)이어야 한다.
-    if (lane_mask.size() != Size(frame_width_, frame_height_)) {
-      resize(lane_mask, lane_mask, Size(frame_width_, frame_height_), 0, 0, INTER_NEAREST);
+    // 라벨 영상이므로 보간은 반드시 최근접(INTER_NEAREST)이어야 한다.
+    if (class_map.size() != Size(frame_width_, frame_height_)) {
+      resize(class_map, class_map, Size(frame_width_, frame_height_), 0, 0, INTER_NEAREST);
     }
-    threshold(lane_mask, lane_mask, 0, 255, THRESH_BINARY);
+
+    // 클래스맵에서 중앙선만 뽑는다. 예전처럼 threshold(0, THRESH_BINARY)를 쓰면
+    // road/shortcut 까지 전부 차선이 되어 버린다. extractClassMask 는 pidnet 의
+    // np.isin(labels, lane_classes)*255 와 같은 결과를 낸다.
+    Mat lane_mask = lane_detection::extractClassMask(class_map, center_classes_);
     if (diagnostics) {
       diagnostics->input_mask_pixels = static_cast<std::size_t>(cv::countNonZero(lane_mask));
     }
+
+    // 가드레일용 바깥 실선. 중앙선과 같은 프레임에서 뽑으므로 시간 정렬 문제가 없다.
+    const lane_detection::RailMargins rail_margins = measureRailMargins(class_map);
 
     // 모니터 CAMERA 패널 오버레이용: 주행 트라페조이드 ROI로 잘리기 전의
     // 원본 세그멘테이션 결과. 라벨 ROI(하단 40%) 전체에서 모델이 실제로
@@ -1336,7 +1740,17 @@ private:
     }
 
     // (1) 전처리 완료된 중앙선 마스크 (보조 창)
-    if (debug_view_ && debug_lane_view_) {imshow("Mask-PIDNet-Center-Lane", lane_mask);}
+    if (debug_view_ && debug_lane_view_) {
+      imshow("Mask-PIDNet-Center-Lane", lane_mask);
+      // 세 클래스를 한 장에 색으로 구분해 둔다. 중앙선만 보던 예전 창으로는
+      // 레일이 안 잡히는 건지 잘못 잡히는 건지 구분할 수 없었다.
+      //
+      // 반드시 lane_mask 가 아니라 lane_mask_for_display(사다리꼴 자르기 전)를
+      // 넘긴다. lane_mask 는 이미 잘리고 모폴로지까지 끝난 상태라, 레일(자르기
+      // 전)과 섞으면 중앙선만 짧게 나와 CAMERA 패널과 달라 보인다. 실제로 그
+      // 차이 때문에 "카메라엔 중앙선이 둘인데 마스크 창엔 하나"로 보였다.
+      imshow("Mask-PIDNet-Lanes", buildClassMaskView(lane_mask_for_display));
+    }
 
     // (2) BEV 투시변환: 사다리꼴 → 직사각형
     Mat bev_yellow;
@@ -1346,7 +1760,12 @@ private:
     if (diagnostics) {
       diagnostics->bev_pixels = static_cast<std::size_t>(cv::countNonZero(bev_yellow));
     }
-    if (debug_view_ && debug_lane_view_) {imshow("BEV-PIDNet-Center-Lane", bev_yellow);}
+    if (debug_view_ && debug_lane_view_) {
+      imshow("BEV-PIDNet-Center-Lane", bev_yellow);
+      // 가드레일이 실제로 무엇을 재고 있는지: 레일 마스크 + 샘플 밴드 +
+      // 차량 중심선 + 임계 여유 + 이번 프레임에 고른 좌/우 레일 위치.
+      imshow("BEV-Guardrail-Rails", buildGuardrailBevView());
+    }
 
     // (3) 노이즈 억제 준비: corridor 범위 및 디버그 캔버스 준비
     const int y_start_chk = (int)std::round(bev_size_.height * 0.0f);
@@ -1424,6 +1843,13 @@ private:
       // 피팅 실패: 이전 오프셋 재사용, 데이터 없으면 0
       offset = has_prev_center_fit_ ? prev_offset_ : 0.f;
     }
+
+    // 가드레일 여유 발행. 중앙선 피팅이 실패해도 레일은 별개로 볼 수 있으므로
+    // valid 와 무관하게 매 프레임 낸다 — 실제로 중앙선을 놓치는 순간이야말로
+    // 바깥 실선이 유일하게 남은 근거인 경우가 많다.
+    std_msgs::msg::Float32MultiArray guardrail_msg;
+    guardrail_msg.data = {rail_margins.left, rail_margins.right};
+    guardrail_pub_->publish(guardrail_msg);
 
     // (6) 토픽 발행 + 디버그 출력
     const auto publication_policy = publishAndDebug(
@@ -1553,7 +1979,7 @@ private:
   // ─────────────────────────────────────────────────────────────────────
   // 원본 카메라 콜백: 모니터 창 CAMERA 패널에만 쓴다.
   //
-  // 차선 판단은 /lane_segmentation_mask 로만 한다. 이 프레임은 어떤 인지
+  // 차선 판단은 /pidnet_class_map 으로만 한다. 이 프레임은 어떤 인지
   // 경로에도 들어가지 않는다.
   // ─────────────────────────────────────────────────────────────────────
   void cameraCallback(const sensor_msgs::msg::Image::SharedPtr msg)

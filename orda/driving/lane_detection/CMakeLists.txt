@@ -86,6 +86,18 @@ if(BUILD_TESTING)
   target_include_directories(test_reacquire_histogram PRIVATE
     include ${OpenCV_INCLUDE_DIRS})
   target_link_libraries(test_reacquire_histogram ${OpenCV_LIBS})
+
+  ament_add_gtest(test_lane_guardrail
+    test/test_lane_guardrail.cpp)
+  target_include_directories(test_lane_guardrail PRIVATE
+    include ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(test_lane_guardrail ${OpenCV_LIBS})
+
+  ament_add_gtest(test_class_map_extraction
+    test/test_class_map_extraction.cpp)
+  target_include_directories(test_class_map_extraction PRIVATE
+    include ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(test_class_map_extraction ${OpenCV_LIBS})
 endif()
 
 install(DIRECTORY include/ DESTINATION include)
