@@ -41,8 +41,6 @@ def generate_launch_description():
                 "far_curve_min_x_span": 0.35,
                 "target_lookahead": target_lookahead,
                 "curve_target_lookahead": 0.45,
-                "recovery_target_lookahead": 0.45,
-                "fake_bilateral_score_threshold": 3,
                 "offset_gain": offset_gain,
                 "offset_limit": 45.0,
                 "end_missing_frames": 4,
