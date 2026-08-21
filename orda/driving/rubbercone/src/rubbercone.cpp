@@ -108,6 +108,8 @@ struct PathEstimate {
     bool entry_geometry_valid{false};
     bool curve_caution{false};
     cv::Point2f target{};
+    float heading_slope{0.0f};
+    float curvature{0.0f};
     float confidence{0.0f};
 };
 
@@ -169,8 +171,13 @@ public:
       max_corridor_width_(1.40f),
       offset_limit_(40.0f),
       max_offset_step_(20.0f),
-      curve_max_offset_step_(12.0f),
+      curve_max_offset_step_(24.0f),
       curve_slope_threshold_(0.28f),
+      curve_curvature_threshold_(0.75f),
+      slope_feedforward_gain_(8.0f),
+      curvature_feedforward_gain_(3.0f),
+      one_side_slope_feedforward_gain_(10.0f),
+      one_side_curvature_feedforward_gain_(3.5f),
       filtered_target_y_(0.0f),
       has_filtered_target_y_(false),
       filtered_offset_(0.0f),
@@ -258,6 +265,27 @@ public:
         curve_slope_threshold_ = clampValue(
             static_cast<float>(declare_parameter<double>("curve_slope_threshold", 0.28)),
             0.05f, 1.00f);
+        curve_curvature_threshold_ = clampValue(
+            static_cast<float>(declare_parameter<double>("curve_curvature_threshold", 0.75)),
+            0.10f, 5.00f);
+        slope_feedforward_gain_ = clampValue(
+            static_cast<float>(declare_parameter<double>("slope_feedforward_gain", 8.0)),
+            0.0f, 30.0f);
+        curvature_feedforward_gain_ = clampValue(
+            static_cast<float>(declare_parameter<double>("curvature_feedforward_gain", 3.0)),
+            0.0f, 20.0f);
+        one_side_slope_feedforward_gain_ = clampValue(
+            static_cast<float>(declare_parameter<double>("one_side_slope_feedforward_gain", 10.0)),
+            0.0f, 35.0f);
+        one_side_curvature_feedforward_gain_ = clampValue(
+            static_cast<float>(declare_parameter<double>("one_side_curvature_feedforward_gain", 3.5)),
+            0.0f, 25.0f);
+        max_offset_step_ = clampValue(
+            static_cast<float>(declare_parameter<double>("max_offset_step", 20.0)),
+            4.0f, 45.0f);
+        curve_max_offset_step_ = clampValue(
+            static_cast<float>(declare_parameter<double>("curve_max_offset_step", 24.0)),
+            max_offset_step_, 45.0f);
         nominal_half_width_ = clampValue(
             static_cast<float>(declare_parameter<double>("nominal_half_width", 0.30)),
             0.15f, 0.70f);
@@ -706,6 +734,20 @@ private:
         };
     }
 
+    static float boundarySlopeAt(const BoundaryModel& boundary, float x)
+    {
+        return 2.0f * boundary.curvature * x + boundary.slope;
+    }
+
+    bool isCurveBoundary(const BoundaryModel& boundary, float x) const
+    {
+        if (!boundary.valid) {
+            return false;
+        }
+        return std::abs(boundarySlopeAt(boundary, x)) >= curve_slope_threshold_ ||
+               std::abs(boundary.curvature) >= curve_curvature_threshold_;
+    }
+
     PathEstimate makeOneSidePath(
         const BoundaryModel& left,
         const BoundaryModel& right,
@@ -729,6 +771,8 @@ private:
             target_x,
             use_left ? boundary_y - adaptive_half_width_
                      : boundary_y + adaptive_half_width_};
+        path.heading_slope = boundarySlopeAt(*boundary, target_x);
+        path.curvature = boundary->curvature;
 
         const float quality = boundaryQuality(*boundary);
         const float base = 0.32f;
@@ -763,6 +807,15 @@ private:
         const BoundaryModel left = fitBoundary(left_points);
         const BoundaryModel right = fitBoundary(right_points);
         PathEstimate path;
+        const bool boundary_curve_caution =
+            isCurveBoundary(left, target_lookahead_) ||
+            isCurveBoundary(right, target_lookahead_);
+        const bool curve_caution =
+            curve_hint.direction != CurveDirection::UNKNOWN ||
+            boundary_curve_caution;
+        active_target_lookahead_ = curve_caution
+            ? curve_target_lookahead_
+            : target_lookahead_;
 
         if (enable_gui_) {
             std::lock_guard<std::mutex> lock(debug_mutex_);
@@ -797,8 +850,11 @@ private:
                 path.bilateral = true;
                 path.entry_geometry_valid = rubbercone::entryGeometryValid(
                     left.count, right.count);
-                path.curve_caution = curve_hint.direction != CurveDirection::UNKNOWN;
+                path.curve_caution = curve_caution;
                 path.target = cv::Point2f{target_x, 0.5f * (left_y + right_y)};
+                path.heading_slope = 0.5f * (
+                    boundarySlopeAt(left, target_x) + boundarySlopeAt(right, target_x));
+                path.curvature = 0.5f * (left.curvature + right.curvature);
                 path.confidence = clampValue(0.65f + 0.35f * quality, 0.0f, 1.0f);
                 if (path.curve_caution) {
                     path.confidence = std::min(path.confidence, 0.88f);
@@ -809,8 +865,7 @@ private:
 
         // 한쪽 경계가 가려지거나 시작 위치가 치우친 경우에는 최근에 학습한 통로 폭으로
         // 반대편 경계를 추정한다. 이 상태는 유효하지만 신뢰도를 낮춰 속도를 제한한다.
-        return makeOneSidePath(
-            left, right, curve_hint.direction != CurveDirection::UNKNOWN);
+        return makeOneSidePath(left, right, curve_caution);
     }
 
     float smoothTargetY(const PathEstimate& path)
@@ -825,9 +880,7 @@ private:
         }
 
         const float max_step = path.bilateral
-            ? (path.curve_caution
-                ? std::min(max_target_y_step_bilateral_, 0.14f)
-                : max_target_y_step_bilateral_)
+            ? max_target_y_step_bilateral_
             : max_target_y_step_one_side_;
         const float alpha = path.bilateral
             ? target_filter_alpha_
@@ -860,8 +913,18 @@ private:
 
         if (path.valid) {
             const float target_y = smoothTargetY(path);
+            const float slope_gain = path.bilateral
+                ? slope_feedforward_gain_
+                : one_side_slope_feedforward_gain_;
+            const float curvature_gain = path.bilateral
+                ? curvature_feedforward_gain_
+                : one_side_curvature_feedforward_gain_;
+            const float feedforward_offset =
+                -path.heading_slope * slope_gain -
+                path.curvature * curvature_gain;
             const float raw_offset = clampValue(
-                -target_y * offset_gain_, -offset_limit_, offset_limit_);
+                -target_y * offset_gain_ + feedforward_offset,
+                -offset_limit_, offset_limit_);
             if (!has_filtered_offset_) {
                 filtered_offset_ = raw_offset;
                 has_filtered_offset_ = true;
@@ -1015,15 +1078,19 @@ private:
                       fmt(snapshot.filtered_target.y)
                 : "target 없음",
             3, {180, 180, 255});
-        put("half_width=" + fmt(snapshot.half_width) +
-            "  fit L/R residual=" +
+        put("slope=" + fmt(snapshot.path.heading_slope) +
+            "  curve=" + fmt(snapshot.path.curvature) +
+            "  half_width=" + fmt(snapshot.half_width), 4,
+            {160, 160, 220});
+        put("fit L/R residual=" +
             (snapshot.left.valid ? fmt(snapshot.left.mean_residual) : "-") + "/" +
-            (snapshot.right.valid ? fmt(snapshot.right.mean_residual) : "-"), 4,
+            (snapshot.right.valid ? fmt(snapshot.right.mean_residual) : "-") +
+            "  lookahead=" + fmt(active_target_lookahead_), 5,
             {160, 160, 160});
         put("area: r<=" + fmt(scan_max_range_) +
             "m  ang<=" + fmt(scan_max_angle_ * 180.0f / kPi, 0) +
             "deg  side<=" + fmt(max_lateral_distance_) +
-            "m  cones<=" + std::to_string(max_cone_centers_), 5,
+            "m  cones<=" + std::to_string(max_cone_centers_), 6,
             {120, 120, 180});
 
         cv::putText(canvas, "LEFT", {12, base_y + 24},
@@ -1094,6 +1161,11 @@ private:
     float max_offset_step_;
     float curve_max_offset_step_;
     float curve_slope_threshold_;
+    float curve_curvature_threshold_;
+    float slope_feedforward_gain_;
+    float curvature_feedforward_gain_;
+    float one_side_slope_feedforward_gain_;
+    float one_side_curvature_feedforward_gain_;
 
     float filtered_target_y_;
     bool has_filtered_target_y_;
