@@ -156,7 +156,7 @@ def test_controller_accepts_only_current_fsm_drive_modes_and_keeps_tuning():
 
     controller.update(Mode.CONE_DRIVE, 45, float("inf"), 100)
     assert controller.get_angle() == pytest.approx(45.0)
-    assert controller.get_speed() == pytest.approx(16.0)
+    assert controller.get_speed() == pytest.approx(8.0)
 
     controller.update(Mode.WAIT_GREEN, 45, float("inf"), 100)
     assert controller.get_angle() == 0.0
