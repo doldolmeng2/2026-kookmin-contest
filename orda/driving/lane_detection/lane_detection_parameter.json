@@ -45,7 +45,7 @@
   "horizontal_noise_extra_pad": 30,
   "horizontal_band_corridor_ratio_thresh": 0.1,
   "vertical_noise_band_w": 400,
-  "vertical_noise_min_pixels": 1150,
+  "vertical_noise_min_pixels": 999999,
   "vertical_noise_peak_ratio": 0.0,
   "vertical_noise_extra_pad_half_width": 100,
   "vertical_noise_peak_use_corridor": false,

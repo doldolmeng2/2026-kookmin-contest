@@ -6,6 +6,8 @@
 # 모드별 제어 방식:
 #   CONE_DRIVE  : 완만한 PD 제어 조향 + 신뢰도 기반 속도
 #   LANE_DRIVE  : Pure Pursuit 조향 + 조향각 기반 속도 감속
+#                 PD 조향은 지우지 않고 주석으로 남겨 두었다. 되돌리는 방법은
+#                 update()의 LANE_DRIVE 분기 주석을 참고한다.
 #   FIXED_AVOID : PD 조향(회피 전용 이득) + 조향각 기반 속도 감속
 #
 # 상태 전이와 safety hold 판단은 이 모듈의 책임이 아니다. RaceFSM과
@@ -28,6 +30,13 @@ from main.race_fsm import Mode
 #   kd    : 미분 이득 (오프셋 변화율에 비례한 감쇠)
 #   alpha : 비선형 보정 계수 (0이면 선형 PD)
 PD_PARAMS = {
+    # ── [PD 롤백 테스트용 보관] LANE_DRIVE PD 이득 ────────────────────
+    # 현재 LANE_DRIVE는 Pure Pursuit 조향을 쓰므로 이 이득은 쓰이지 않는다.
+    # doldolmeng2/2025-kookmin-contest 의 modular/main/main/control.py 에
+    # 있던 이득 (0.145, 0.3, 0.0) 을 실차에서 0.105로 낮춰 둔 값이다.
+    # PD로 다시 바꿀 때는 아래 한 줄과 update()의 PD 줄을 함께 살린다.
+    # Mode.LANE_DRIVE: (0.105, 0.3, 0.0),
+    # ──────────────────────────────────────────────────────────────────
     # LiDAR 경로 오프셋은 10 Hz로 갱신된다. 과한 이득은 프레임 사이의
     # 작은 경계 변화도 최대 조향으로 키우므로 라바콘에서는 완만하게 쓴다.
     Mode.CONE_DRIVE: (1.0, 0.0, 0.0),
@@ -41,10 +50,10 @@ PD_PARAMS = {
 # /lane_offset을 차량 중심에서 목표 경로까지의 횡방향 거리 x로 사용하고,
 # 차량 전방 lookahead_px 위치에 목표점 (x, lookahead_px)이 있다고 본다.
 PURE_PURSUIT_PARAMS = {
-    'lookahead_px':       120.0,  #늘리면 조향이 완만해지고, 줄이면 조향이 날카로워진다.
-    'wheelbase_px':        30.0,  #코너에서 조향이 모자라면 늘리면 됨.
-    'steering_gain':        1.0,  #전체적인 조향이 약할 때 늘리면 됨.
-    'max_steering_angle': 40.0,
+    'lookahead_px':       80.0,  #늘리면 조향이 완만해지고, 줄이면 조향이 날카로워진다.
+    'wheelbase_px':        20.0,  #코너에서 5조향이 모자라면 늘리면 됨.
+    'steering_gain':        0.85,  #전체적인 조향이 약할 때 늘리면 됨.
+    'max_steering_angle': 100.0,
 }
 
 # 속도 제어 파라미터: mode → (max_speed, min_speed, scale_factor)
@@ -52,7 +61,11 @@ PURE_PURSUIT_PARAMS = {
 #   min_speed    : 최소 속도 (조향각이 커도 이 속도 아래로 떨어지지 않음)
 #   scale_factor : |조향각| × scale_factor 만큼 최대 속도에서 감속
 SPEED_PARAMS = {
-    Mode.LANE_DRIVE: (43.0, 25.0, 0.5),
+    Mode.LANE_DRIVE: (31.0, 12.0, 0.5),
+    # PD 비교 주행 전, Pure Pursuit 구성에서 쓰던 속도 프로필은 아래와 같다.
+    # 지금은 낮은 속도대(31/12)를 그대로 유지한다. 예전 속도로 되돌리려면
+    # 위 줄을 주석 처리하고 아래 줄을 살린다.
+    # Mode.LANE_DRIVE: (43.0, 25.0, 0.5),
     # 회피 중에는 낮은 속도로 안정적으로 옮겨간다. 빠르면 차선 변경이 끝나기
     # 전에 장애물에 도달한다.
     # ★ 실차 튜닝 지점: 회피가 늦으면 max_speed를 낮추고, 굼뜨면 올린다.
@@ -129,8 +142,13 @@ class Controller:
                 self.angle, rubbercone_confidence)
 
         elif mode is Mode.LANE_DRIVE:
-            # Pure Pursuit 조향 + 조향각 기반 속도 감속
+            # ── 조향 방식 선택 ────────────────────────────────────────
+            # Pure Pursuit 조향 + 조향각 기반 속도 감속 (현재 구성)
+            # PD 비교 주행으로 되돌리려면 아래 PD 줄과 PD_PARAMS의
+            # Mode.LANE_DRIVE 이득 줄을 함께 살리고 Pure Pursuit 줄을 주석 처리한다.
             self.angle = self._compute_steering_pure_pursuit(offset)
+            # self.angle = self._compute_steering_pd(mode, offset)
+            # ──────────────────────────────────────────────────────────
             params     = self.speed_params.get(mode)
             self.speed = (
                 self._compute_speed_from_angle(self.angle, params)

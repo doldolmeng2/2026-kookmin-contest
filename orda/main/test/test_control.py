@@ -33,6 +33,18 @@ class PurePursuitTest(unittest.TestCase):
         controller.update(Mode.LANE_DRIVE, 30, float('inf'))
         self.assertAlmostEqual(controller.get_angle(), expected)
 
+    # ── [PD 롤백 테스트용 보관] LANE_DRIVE가 PD를 쓸 때의 계약 ─────────────
+    # LANE_DRIVE를 PD로 되돌릴 때 아래 테스트를 살리고 위 Pure Pursuit 테스트를
+    # 주석 처리한다. control.py의 PD_PARAMS[Mode.LANE_DRIVE]도 함께 살려야 한다.
+    # def test_lane_drive_uses_pd(self):
+    #     controller = self.make_controller()
+    #     expected = controller._compute_steering_pd(Mode.LANE_DRIVE, 30)
+    #
+    #     fresh = self.make_controller()
+    #     fresh.update(Mode.LANE_DRIVE, 30, float('inf'))
+    #     self.assertAlmostEqual(fresh.get_angle(), expected)
+    # ──────────────────────────────────────────────────────────────────────
+
     def test_pure_pursuit_respects_steering_limit(self):
         controller = self.make_controller()
         controller.pure_pursuit_params['steering_gain'] = 100.0

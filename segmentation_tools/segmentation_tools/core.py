@@ -14,6 +14,18 @@ DEFAULT_COLORS = {
     0: (0, 0, 0), 1: (0, 255, 255), 2: (255, 80, 0),
     3: (0, 80, 255), 4: (80, 80, 80), 5: (255, 0, 255),
 }
+# 중앙선 검증에 쓰는 클래스 번호. CLASS_NAMES 와 같은 값을 이름으로 고정해 둔다.
+BACKGROUND_CLASS = 0
+CENTER_LANE_CLASS = 1
+# 중앙선이 그 위에 그려져 있어야 하는 주행면. road 와 shortcut 둘 뿐이다.
+ROAD_CLASS = 4
+SHORTCUT_CLASS = 5
+DRIVABLE_SURFACE_CLASSES = (ROAD_CLASS, SHORTCUT_CLASS)
+# center_lane 성분 주변 몇 화소까지를 "붙어 있다" 로 볼지. 640x360 기준값이다.
+CENTER_LANE_SUPPORT_RADIUS = 7
+# 테두리의 이 비율 이상이 주행면이어야 진짜 중앙선으로 인정한다.
+CENTER_LANE_MIN_SUPPORT_RATIO = 0.5
+
 # ROI 밖을 덮는 암전 세기. 라벨 대상이 아닌 영역을 한눈에 구분하기 위한 값이다.
 ROI_DIM_STRENGTH = 0.72
 
@@ -188,3 +200,110 @@ def draw_roi(canvas):
     canvas[:top] = (canvas[:top] * (1.0 - ROI_DIM_STRENGTH)).astype(np.uint8)
     cv2.line(canvas, (0, top), (canvas.shape[1] - 1, top), (255, 255, 255), 1)
     return canvas
+
+
+def drivable_surface_mask(label, surface_classes=DRIVABLE_SURFACE_CLASSES):
+    """road/shortcut 화소가 True 인 마스크. np.isin 보다 두 배 이상 빠르다."""
+    mask = label == surface_classes[0]
+    for class_id in surface_classes[1:]:
+        mask |= label == class_id
+    return mask
+
+
+def center_lane_ring(blob, ring_kernel):
+    """center_lane 성분을 radius 만큼 부풀린 테두리(성분 자신은 뺀 고리)."""
+    return cv2.dilate(blob, ring_kernel).astype(bool) & ~blob.astype(bool)
+
+
+def support_ratio(ring, surface):
+    """테두리 중 주행면이 차지하는 비율.
+
+    테두리가 비면(창이 성분으로 꽉 찬 경우) 판정할 근거가 없으므로 1.0 으로 본다.
+    """
+    ring_pixels = int(np.count_nonzero(ring))
+    if ring_pixels == 0:
+        return 1.0
+    return float(np.count_nonzero(ring & surface)) / ring_pixels
+
+
+def center_lane_components(label, radius, surface_classes, preferred_surface):
+    """center_lane 연결 성분마다 (창, 성분마스크, 면적, 전체비율, 우선비율) 을 낸다.
+
+    우선비율은 preferred_surface 한 클래스만 센 값이고, preferred_surface 가 None
+    이면 전체비율과 같다.
+    """
+    center = (label == CENTER_LANE_CLASS).astype(np.uint8)
+    if not center.any():
+        return []
+    ring_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    count, components, stats, _ = cv2.connectedComponentsWithStats(center, connectivity=8)
+    height, width = label.shape
+    found = []
+    for index in range(1, count):
+        x, y, w, h, area = stats[index]
+        # 성분마다 전체 프레임을 훑으면 느리다. 테두리가 들어갈 만큼만 잘라 쓴다.
+        pad = radius + 1
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(width, x + w + pad), min(height, y + h + pad)
+        window = label[y0:y1, x0:x1]
+        blob = (components[y0:y1, x0:x1] == index).astype(np.uint8)
+        ring = center_lane_ring(blob, ring_kernel)
+        ratio_any = support_ratio(ring, drivable_surface_mask(window, surface_classes))
+        ratio_preferred = ratio_any if preferred_surface is None else \
+            support_ratio(ring, window == preferred_surface)
+        found.append(((y0, y1, x0, x1), blob.astype(bool), int(area),
+                      ratio_any, ratio_preferred))
+    return found
+
+
+def filter_center_lane_off_surface(
+    label,
+    radius=CENTER_LANE_SUPPORT_RADIUS,
+    min_support_ratio=CENTER_LANE_MIN_SUPPORT_RATIO,
+    surface_classes=DRIVABLE_SURFACE_CLASSES,
+    preferred_surface=None,
+):
+    """주행면 위에 놓이지 않은 center_lane 을 background 로 지운다.
+
+    중앙선은 언제나 주행면 위에 그려져 있다. 트랙 바깥의 노란 물체를 모델이
+    center_lane 으로 착각하면 그 성분 주변은 주행면이 아니라 background 다.
+    center_lane 연결 성분마다 radius 만큼 부풀린 테두리를 보고, 그 중 주행면 비율이
+    min_support_ratio 미만이면 진짜 중앙선이 아니라고 보고 지운다.
+
+    preferred_surface 를 주면(lane_drive 는 road, shortcut 모드는 shortcut) 그 면
+    위의 중앙선이 우선이다. 우선 면에 놓인 성분이 하나라도 있으면 그것만 남기고
+    나머지는 지운다. 하나도 없을 때만 road/shortcut 을 가리지 않고 판정해, 모드 전환
+    구간에서 중앙선을 통째로 잃지 않게 한다.
+
+    (지워진 라벨, 지운 화소 수) 를 돌려준다. 지울 것이 없으면 입력 배열을 그대로
+    돌려주므로 정상 프레임에서는 복사 비용이 들지 않는다.
+    """
+    if label.ndim != 2:
+        raise ValueError('label must be a 2D class map')
+    radius = int(radius)
+    min_support_ratio = float(min_support_ratio)
+    if radius <= 0 or min_support_ratio <= 0.0:
+        return label, 0
+    components = center_lane_components(
+        label, radius, surface_classes, preferred_surface)
+    if not components:
+        return label, 0
+    on_preferred = {
+        index for index, component in enumerate(components)
+        if component[4] >= min_support_ratio
+    }
+    keep = on_preferred if on_preferred else {
+        index for index, component in enumerate(components)
+        if component[3] >= min_support_ratio
+    }
+    filtered = label
+    removed = 0
+    for index, ((y0, y1, x0, x1), blob, area, _, _) in enumerate(components):
+        if index in keep:
+            continue
+        if filtered is label:
+            filtered = label.copy()
+        filtered[y0:y1, x0:x1][blob] = BACKGROUND_CLASS
+        removed += area
+    return filtered, removed

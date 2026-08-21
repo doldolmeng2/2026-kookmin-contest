@@ -1005,7 +1005,7 @@ class MainNode(Node):
                 self.object_dist,
                 100,
             )
-            speed = float(self.lane_controller.get_speed() / 2.0)
+            speed = float(self.lane_controller.get_speed()) #/2.0 속도 절반
             # 고정장애물이 우리 차선에 있으면 접근할수록 속도를 낮춘다.
             # 구간(FIXED_AVOID) 안팎을 가리지 않는다 — 진입 전에 미리 줄여 두는
             # 편이 회피할 시간을 벌기 때문이다. 회피에 성공해 차선을 옮기면

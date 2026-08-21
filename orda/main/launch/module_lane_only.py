@@ -54,11 +54,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "lane_debug",
-            default_value="false",
+            default_value="true",
             choices=("false", "true"),
             description=(
-                "차선 인식 OpenCV 창 표시 (SlidingWindows / Mask-PIDNet-Center-Lane / "
-                "Vehicle Dynamics). 영상 표시가 CPU를 쓰므로 기록 주행에서는 끌 것."
+                "통합 모니터 창 'Lane Drive Monitor' 표시 "
+                "(CAMERA=세그멘테이션 / VEHICLE=조향, 2채널 1창). "
+                "이 프로파일은 차선 인지를 눈으로 보며 튜닝하는 용도라 기본이 true 다. "
+                "영상 표시가 CPU를 쓰므로 기록 주행에서는 lane_debug:=false 로 끌 것."
             ),
         ),
         DeclareLaunchArgument(
@@ -77,6 +79,17 @@ def generate_launch_description():
                 "/lane_segmentation_mask 로 내보낼 PIDNet 클래스 "
                 "(1=center_lane, 2=left_solid, 3=right_solid). lane_node는 선을 "
                 "하나만 피팅하므로 기본값은 중앙선 단독인 [1] 이다."
+            ),
+        ),
+        DeclareLaunchArgument(
+            "lane_reacquire_fallback",
+            default_value="true",
+            choices=("false", "true"),
+            description=(
+                "차선을 놓쳤을 때 corridor 밖 BEV 전체에서 재탐색한다. "
+                "module_drive.py(production)는 이 값을 true 로 고정하므로, "
+                "production 과 같은 조건으로 비교하려면 true 로 둔다. "
+                "조향 방식만 A/B 로 보고 싶으면 false 로 꺼서 변수를 줄인다."
             ),
         ),
     ]
@@ -139,6 +152,11 @@ def generate_launch_description():
             ),
             "debug_lane_view": ParameterValue(
                 LaunchConfiguration("lane_debug_detail"), value_type=bool
+            ),
+            # lane_node 는 생성자에서 한 번만 읽는다(파라미터 콜백 없음).
+            # 그래서 실행 후 ros2 param set 으로는 바꿀 수 없고 여기서 넘겨야 한다.
+            "enable_reacquire_full_bev_fallback": ParameterValue(
+                LaunchConfiguration("lane_reacquire_fallback"), value_type=bool
             ),
         }],
         remappings=[("/mode_info", "/internal/lane_command")],
