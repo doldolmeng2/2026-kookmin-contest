@@ -28,29 +28,23 @@ import os
 def generate_launch_description():
     share_dir = get_package_share_directory('xycar_lidar')
     parameter_file = LaunchConfiguration('params_file')
-    port = LaunchConfiguration('port')
     node_name = 'xycar_lidar_node'
 
     params_declare = DeclareLaunchArgument('params_file',
                                            default_value=os.path.join(
                                                share_dir, 'params', 'ydlidar.yaml'),
                                            description='FPath to the ROS2 parameters file to use.')
-    port_declare = DeclareLaunchArgument(
-        'port', default_value='/dev/ttyLIDAR',
-        description='Serial device path overriding the port in params_file.',
-    )
 
     driver_node = LifecycleNode(package='xycar_lidar',
                                 executable='xycar_lidar_node',
                                 name='xycar_lidar_node',
                                 output='screen',
                                 emulate_tty=True,
-                                parameters=[parameter_file, {'port': port}],
+                                parameters=[parameter_file],
                                 namespace='/',
                                 )
 
     return LaunchDescription([
         params_declare,
-        port_declare,
         driver_node,
     ])

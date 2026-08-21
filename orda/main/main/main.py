@@ -13,6 +13,7 @@ from rcl_interfaces.msg import ParameterDescriptor
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import (
     Bool,
+    Empty,
     Float32MultiArray,
     Int16,
     Int32,
@@ -25,49 +26,35 @@ from main.control_selector import (
     ControlSource,
     DriveCommand,
 )
-from main.mission_types import (
-    LaneTarget,
-    ObjectLane,
-    ObjectType,
-    RouteTrafficSignal,
-    opposite_lane_target,
-)
-from main.mode_info import (
-    external_mode_code,
-    lane_command_data,
-    lane_info_value,
-)
-from main.overtake import OvertakeGuard
-from main.relative_x_fallback import (
-    RelativeXObstacleLaneFallback,
-    effective_object_lane,
-    object_mission_entry_allowed,
-)
+from main.mission_types import LaneTarget, ObjectType, RouteTrafficSignal
+from main.mode_info import mode_info_data
+from main.overtake import OvertakeGuard, side_clearance
 from main.same_lane_brake import SameLaneBrake, SameLaneBrakeDecision
 from main.shortcut_exit import ShortcutExitGuard
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
-    SIDE_CLEARANCE_MAX_AGE_S,
     MissionTestProfile,
     RaceRuntimeAdapter,
-    dispatch_cone_session_state,
+    dispatch_cone_reset,
     parse_test_profile,
     runtime_safety_monitor,
 )
 
 
 RUBBERCONE_INFO_TOPIC = "/rubbercone_info"
-RUBBERCONE_OFFSET_TOPIC = "/rubbercone_offset"
-RUBBERCONE_SESSION_ACTIVE_TOPIC = "/rubbercone_session_active"
-OBJECT_INFO_TOPIC = "/object_info"
-OBJECT_INFO_RAW_TOPIC = "/object_info_raw"
-SIDE_CLEARANCE_TOPIC = "/side_clearance"
-LANE_COMMAND_TOPIC = "/internal/lane_command"
+RUBBERCONE_RESET_TOPIC = "/rubbercone_reset"
+LANE_VALIDITY_TOPIC = "/lane_valid"
 LANE_CHANGE_STATE_TOPIC = "/lane_change_state"
+LANE_VALIDITY_REQUIRED_RATE_HZ = 10.0
 CONE_EVENT_WARNING_PERIOD_S = 5.0
 
-# /object_info 첫 필드의 신호등 값 규약:
+# /traffic_detection 값 규약 (traffic_light/traffic_node.py 의 infer()):
 #   0 = 미검출, 1 = 적색/주황, 2 = 녹색, 3 = 좌회전 녹색
+#
+# 이 노드는 예전에 같은 토픽을 std_msgs/Bool 로 구독했다. 발행 타입이 Int32라
+# 타입이 어긋나 연결 자체가 성립하지 않았고, /traffic_detection 은 한 번도
+# 도착하지 않았다. 그 결과 INIT 의 필수 입력이 영영 채워지지 않아 WAIT_TRAFFIC
+# 으로 넘어가지 못했다 (런치에서 mode:=3 으로 띄우면 가려지는 증상이다).
 TRAFFIC_GREEN_CODES = (2, 3)
 
 # The controller gains remain the proven legacy implementation. These limits
@@ -97,9 +84,6 @@ BAG_LOOP_BACKJUMP_S = 2.0
 
 # 이 면적을 넘는 박스를 object_type에 따라 FIXED_AVOID 또는 OVERTAKE로 보낸다.
 FIXED_ENTRY_BOX_PX = 1900.0
-# 반복 regression에서 entry 전 동일 물체 independent YOLO 최대 gap은 1.800초였다.
-# perception freshness(0.6초)와 encounter grouping을 분리하고 0.10초 margin만 둔다.
-RELATIVE_X_ENCOUNTER_TIMEOUT_S = 1.90
 
 # 추월 완료 판정 임계값은 main.overtake.OvertakeConfig가 갖는다.
 
@@ -107,12 +91,15 @@ RELATIVE_X_ENCOUNTER_TIMEOUT_S = 1.90
 # states that have a defined 2026 counterpart. Unsupported legacy mission
 # states are rejected instead of being guessed.
 _NUMERIC_INITIAL_MODE = {
-    0: Mode.WAIT_GREEN,
-    1: Mode.LANE_DRIVE,
-    2: Mode.CONE_DRIVE,
-    3: Mode.FIXED_AVOID,
-    4: Mode.OVERTAKE,
-    5: Mode.SHORTCUT,
+    0: Mode.INIT,
+    1: Mode.WAIT_TRAFFIC,
+    2: Mode.LANE_DRIVE,
+    3: Mode.CONE_DRIVE,
+    4: Mode.FIXED_AVOID,
+    5: Mode.OVERTAKE,
+    6: Mode.SHORTCUT,
+    7: Mode.FINISH,
+    8: Mode.STOP,
 }
 
 
@@ -129,9 +116,6 @@ def parse_initial_mode(value) -> Mode:
         stripped = value.strip()
         if stripped.lstrip("-").isdigit():
             return parse_initial_mode(int(stripped))
-        named_mode = Mode.__members__.get(stripped)
-        if named_mode is not None:
-            return named_mode
         try:
             return Mode(stripped)
         except ValueError as exc:
@@ -139,13 +123,13 @@ def parse_initial_mode(value) -> Mode:
     raise ValueError(f"invalid initial mode value: {value!r}")
 
 
-def rubbercone_session_qos() -> QoSProfile:
-    """Return the detector's stateful lifecycle-command QoS contract."""
+def rubbercone_reset_qos() -> QoSProfile:
+    """Return the detector's reliable edge-command QoS contract."""
 
     return QoSProfile(
-        depth=1,
+        depth=10,
         reliability=ReliabilityPolicy.RELIABLE,
-        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        durability=DurabilityPolicy.VOLATILE,
     )
 
 
@@ -157,6 +141,12 @@ def sensor_event_qos(*, depth: int = 1) -> QoSProfile:
         reliability=ReliabilityPolicy.BEST_EFFORT,
         durability=DurabilityPolicy.VOLATILE,
     )
+
+
+def lane_validity_qos() -> QoSProfile:
+    """Return the required QoS for the explicit lane-validity publisher."""
+
+    return sensor_event_qos(depth=10)
 
 
 class MainNode(Node):
@@ -213,24 +203,17 @@ class MainNode(Node):
         self.car_lane = -1
         self.object_type = ObjectType.UNKNOWN
         self.object_confidence = 0.0
-        self.fixed_vehicle_lane = 0
-        self.moving_vehicle_lane = 0
-        self.rubbercone_offset = 0
-        self.rubbercone_end_flag = 0
         self.detected_lane = -1         # 실측 현재 차선 (-1=미확정, 0=중앙, 1=왼쪽, 2=오른쪽)
-        self.side_left = float("inf")   # perception이 승인한 좌측면 최소 거리 (m)
-        self.side_right = float("inf")  # perception이 승인한 우측면 최소 거리 (m)
+        self.side_left = float("inf")   # 좌측면 최소 거리 (m, /scan 에서 계산)
+        self.side_right = float("inf")  # 우측면 최소 거리 (m, /scan 에서 계산)
         self.left = float("inf")
         self.right = float("inf")
-        self.traffic_signal = 0        # /object_info 최신 신호등 코드 (표시용)
+        self.traffic_signal = 0        # /traffic_detection 최신 코드 (표시용)
 
         # 구간(FIXED_AVOID / OVERTAKE) 종료 판정. 순수 로직은 main.overtake가 갖는다.
         self.overtake = OvertakeGuard()
         # 같은 차선 고정장애물 감속. 순수 로직은 main.same_lane_brake 가 갖는다.
         self.same_lane_brake = SameLaneBrake()
-        self.relative_x_fallback = RelativeXObstacleLaneFallback(
-            encounter_timeout_s=RELATIVE_X_ENCOUNTER_TIMEOUT_S,
-        )
         self.last_same_lane_brake = SameLaneBrakeDecision(
             speed_limit=float("inf"), same_lane=False, reason="not evaluated yet"
         )
@@ -252,7 +235,7 @@ class MainNode(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
-        session_qos = rubbercone_session_qos()
+        reset_qos = rubbercone_reset_qos()
 
         self.motor_pub = self.create_publisher(
             Float32MultiArray,
@@ -260,39 +243,20 @@ class MainNode(Node):
             qos_command,
         )
         self.mode_pub = self.create_publisher(
-            Int16,
+            Int32MultiArray,
             "mode_info",
             qos_fast,
         )
-        self.lane_info_pub = self.create_publisher(
-            Int16,
-            "lane_info",
-            qos_fast,
-        )
-        self.lane_command_pub = self.create_publisher(
-            Int32MultiArray,
-            LANE_COMMAND_TOPIC,
-            qos_fast,
-        )
-        self.rubbercone_session_active_pub = self.create_publisher(
-            Bool,
-            RUBBERCONE_SESSION_ACTIVE_TOPIC,
-            session_qos,
-        )
-        self._publish_cone_session_state(
-            self.runtime.fsm.state is Mode.CONE_DRIVE
+        self.rubbercone_reset_pub = self.create_publisher(
+            Empty,
+            RUBBERCONE_RESET_TOPIC,
+            reset_qos,
         )
 
         self.rubbercone_info_sub = self.create_subscription(
             Int32MultiArray,
             RUBBERCONE_INFO_TOPIC,
             self.rubbercone_callback,
-            qos_fast,
-        )
-        self.rubbercone_offset_sub = self.create_subscription(
-            Int32MultiArray,
-            RUBBERCONE_OFFSET_TOPIC,
-            self.rubbercone_offset_callback,
             qos_fast,
         )
         self.lane_offset_sub = self.create_subscription(
@@ -302,15 +266,15 @@ class MainNode(Node):
             qos_fast,
         )
         self.object_info_sub = self.create_subscription(
-            Int32MultiArray,
-            OBJECT_INFO_TOPIC,
+            Float32MultiArray,
+            "object_info",
             self.object_info_callback,
             qos_fast,
         )
-        self.object_info_raw_sub = self.create_subscription(
-            Float32MultiArray,
-            OBJECT_INFO_RAW_TOPIC,
-            self.object_info_raw_callback,
+        self.traffic_sub = self.create_subscription(
+            Int32,
+            "traffic_detection",
+            self.traffic_callback,
             qos_fast,
         )
         self.scan_sub = self.create_subscription(
@@ -319,11 +283,11 @@ class MainNode(Node):
             self.scan_callback,
             qos_fast,
         )
-        self.side_clearance_sub = self.create_subscription(
-            Float32MultiArray,
-            SIDE_CLEARANCE_TOPIC,
-            self.side_clearance_callback,
-            qos_fast,
+        self.lane_validity_sub = self.create_subscription(
+            Bool,
+            LANE_VALIDITY_TOPIC,
+            self.lane_validity_callback,
+            lane_validity_qos(),
         )
         self.lane_change_state_sub = self.create_subscription(
             Int32MultiArray,
@@ -380,40 +344,12 @@ class MainNode(Node):
 
         return self.get_clock().now().nanoseconds / 1_000_000_000.0
 
-    def _publish_cone_session_state(self, active: bool) -> None:
-        message = Bool()
-        message.data = bool(active)
-        self.rubbercone_session_active_pub.publish(message)
-
     def rubbercone_callback(self, msg: Int32MultiArray) -> None:
-        """Consume the detailed internal cone contract used by the FSM."""
-
         received_at = self._now_seconds()
         result = self.runtime.record_cone_message(msg.data, received_at)
         if result.warning is not None:
             key = "cone_queue_overflow" if result.dropped_oldest else "malformed_cone"
             self._warn_throttled(key, result.warning, received_at)
-
-    def rubbercone_offset_callback(self, msg: Int32MultiArray) -> None:
-        """Validate and expose the PPT ``[offset, end_flag]`` contract."""
-
-        received_at = self._now_seconds()
-        data = list(msg.data)
-        if (
-            len(data) != 2
-            or isinstance(data[0], bool)
-            or isinstance(data[1], bool)
-            or not isinstance(data[0], int)
-            or data[1] not in (0, 1)
-        ):
-            self._warn_throttled(
-                "malformed_rubbercone_offset",
-                "rubbercone_offset requires two integers [offset, end_flag]",
-                received_at,
-            )
-            return
-        self.rubbercone_offset = int(data[0])
-        self.rubbercone_end_flag = int(data[1])
 
     def lane_offset_callback(self, msg: Int16) -> None:
         received_at = self._now_seconds()
@@ -424,18 +360,19 @@ class MainNode(Node):
                 received_at,
             )
 
-    def _record_traffic_signal(self, value: int, received_at: float) -> None:
+    def traffic_callback(self, msg: Int32) -> None:
+        received_at = self._now_seconds()
         try:
-            signal = RouteTrafficSignal(value)
+            signal = RouteTrafficSignal(msg.data)
         except (TypeError, ValueError):
             self._warn_throttled(
                 "malformed_traffic",
-                f"invalid object_info traffic value ignored: {value}",
+                f"invalid traffic_detection value ignored: {msg.data}",
                 received_at,
             )
             return
 
-        # Preserve the start-only WAIT_GREEN contract.
+        # Preserve the start-only WAIT_TRAFFIC contract.
         is_green = signal in (
             RouteTrafficSignal.STRAIGHT,
             RouteTrafficSignal.LEFT,
@@ -467,53 +404,30 @@ class MainNode(Node):
             )
         self.traffic_signal = int(signal)
 
-    def object_info_callback(self, msg: Int32MultiArray) -> None:
-        """Consume the PPT ``[traffic, fixed_lane, moving_lane]`` contract."""
-
-        received_at = self._now_seconds()
-        data = list(msg.data)
-        if (
-            len(data) != 3
-            or any(
-                isinstance(value, bool) or not isinstance(value, int)
-                for value in data
-            )
-            or data[0] not in (0, 1, 2, 3)
-            or data[1] not in (0, 1, 2)
-            or data[2] not in (0, 1, 2)
-        ):
-            self._warn_throttled(
-                "malformed_object_info",
-                "object_info requires [traffic(0..3), fixed_lane(0..2), "
-                "moving_lane(0..2)]",
-                received_at,
-            )
-            return
-        self.fixed_vehicle_lane = data[1]
-        self.moving_vehicle_lane = data[2]
-        self._record_traffic_signal(data[0], received_at)
-
-    def scan_callback(self, _msg: LaserScan) -> None:
+    def scan_callback(self, msg: LaserScan) -> None:
         self.runtime.record_scan(self._now_seconds())
+        # 측면 거리는 /object_info 에 담지 않고 여기서 직접 뽑는다.
+        # premerge 가 초음파를 그대로 읽던 구조와 같다. /object_info의
+        # 12필드 계약과 별개로 원시 /scan에서 측면 clearance를 계산한다.
+        self.side_left, self.side_right = side_clearance(
+            msg.ranges,
+            msg.angle_min,
+            msg.angle_increment,
+            msg.range_min,
+            msg.range_max,
+            self.overtake.config,
+        )
 
-    def side_clearance_callback(self, msg: Float32MultiArray) -> None:
-        """Consume perception-owned ``[left_m, right_m]`` side distances."""
+    def lane_validity_callback(self, msg: Bool) -> None:
+        """Record one explicit lane-validity publisher sample."""
 
         received_at = self._now_seconds()
-        data = list(msg.data)
-        if len(data) != 2 or not self.runtime.record_side_clearance(
-            data[0],
-            data[1],
-            received_at,
-        ):
+        if not self.runtime.record_lane_validity(msg.data, received_at):
             self._warn_throttled(
-                "malformed_side_clearance",
-                "side_clearance requires two non-negative finite values or +Infinity",
+                "malformed_lane_validity",
+                "invalid lane-validity message ignored",
                 received_at,
             )
-            return
-        self.side_left = self.runtime.latest_side_left
-        self.side_right = self.runtime.latest_side_right
 
     def lane_position_callback(self, msg: Int16) -> None:
         """lane_detection이 노란 중앙선 실제 위치로 역산한 실측 현재 차선.
@@ -522,19 +436,9 @@ class MainNode(Node):
         """
 
         value = int(msg.data)
-        detected_lane = value if value in (0, 1, 2) else -1
-        # Real callbacks always use the node clock.  Lightweight method
-        # harnesses have no ROS clock, so conservatively timestamp their cached
-        # input at the current state boundary.
-        received_at = (
-            self._now_seconds()
-            if isinstance(self, Node)
-            else self.runtime.context.state_entered_at
-        )
-        if received_at is None:
-            return
-        if self.runtime.record_lane_position(detected_lane, received_at):
-            self.detected_lane = detected_lane
+        self.detected_lane = value if value in (0, 1, 2) else -1
+        # 차선 변경 완료 판정에 쓰인다 (runtime_adapter._update_lane_action).
+        self.runtime.measured_lane = self.detected_lane
 
     def road_surface_callback(self, msg: Int32) -> None:
         """Consume CNN road labels: 0 unknown, 1 black road, 2 white shortcut."""
@@ -552,14 +456,14 @@ class MainNode(Node):
                 "지름길 흰 차선 이후 검은 도로 연속 인식 -> 차선 주행 복귀"
             )
 
-    def object_info_raw_callback(self, msg: Float32MultiArray) -> None:
+    def object_info_callback(self, msg: Float32MultiArray) -> None:
         received_at = self._now_seconds()
         data = msg.data
         result = self.runtime.record_object_info(data, received_at)
         if not result.accepted:
             self._warn_throttled(
-                "malformed_object_info_raw",
-                result.warning or "invalid object_info_raw message ignored",
+                "malformed_object_info",
+                result.warning or "invalid object_info message ignored",
                 received_at,
             )
             return
@@ -580,19 +484,6 @@ class MainNode(Node):
         self.object_confidence = (
             snapshot.confidence if snapshot is not None else 0.0
         )
-        # Object mission을 이미 commit한 뒤에는 entry lane을 다시 분류하지
-        # 않는다. CONE_DRIVE 중에는 edge를 만들지 않지만, 같은 카메라
-        # encounter의 초기 YOLO 상태는 보존해야 LANE_DRIVE 복귀 직후 판단할
-        # 수 있다.
-        if self.runtime.fsm.state in (Mode.LANE_DRIVE, Mode.CONE_DRIVE):
-            self.relative_x_fallback.observe(
-                object_type=self.object_type,
-                box_size=self.box_size,
-                box_cx=self.box_cx,
-                box_cy=self.box_cy,
-                confidence=self.object_confidence,
-                received_at=received_at,
-            )
 
     def lane_change_state_callback(self, msg: Int32MultiArray) -> None:
         received_at = self._now_seconds()
@@ -646,16 +537,14 @@ class MainNode(Node):
                 f"{cycle.transition.target.value}: {cycle.transition.reason}"
             )
 
-        if cycle.cone_session_active_command is not None:
+        if cycle.publish_cone_reset:
             try:
-                dispatch_cone_session_state(
+                dispatch_cone_reset(
                     cycle,
-                    self._publish_cone_session_state,
+                    lambda: self.rubbercone_reset_pub.publish(Empty()),
                 )
             except Exception as exc:  # rclpy publisher errors are fail-safe here.
-                self.get_logger().error(
-                    f"rubbercone session-state publish failed: {exc}"
-                )
+                self.get_logger().error(f"rubbercone reset publish failed: {exc}")
 
         angle, speed = self._shape_selected_control(
             cycle.control.source,
@@ -667,37 +556,25 @@ class MainNode(Node):
         self.motor_pub.publish(motor_msg)
 
         self.lane = self.runtime.context.lane_target.value
+        mode_msg = Int32MultiArray()
         # 차선 변경 명령은 일단 나가면 래치한다.
         #
         # lane_detection 의 추적기는 mode!=5 를 보는 순간 진행도를 버린다
-        # (handleCommand → resetProgress). 그런데 safe_to_drive 는 /object_info_raw
+        # (handleCommand → resetProgress). 그런데 safe_to_drive 는 /object_info
         # 신선도(0.25s)를 따라 매 주기 뒤집히고, YOLO 검출은 간헐적으로 끊긴다.
-        # 그 결과 내부 명령이 5↔3↔0 으로 요동쳐 추적기가 완료(8프레임 안정)를
+        # 그 결과 코드가 5↔3↔0 으로 요동쳐 추적기가 완료(8프레임 안정)를
         # 모으지 못했다. 실측: 변경 시작 279회 / 성공 0회.
         #
         # 이미 시작한 회피는 끝내는 편이 중간에 포기하는 것보다 안전하므로,
         # pending 인 동안에는 인지가 잠깐 끊겨도 명령을 유지한다.
         action = self.runtime.lane_action
-        lane_command_msg = Int32MultiArray()
-        lane_command_msg.data = lane_command_data(
+        mode_msg.data = mode_info_data(
             self.runtime.fsm.state,
             self.lane,
             mission_lane_control_enabled=action.safe_to_drive or action.pending,
             lane_change_active=action.pending,
         )
-        self.lane_command_pub.publish(lane_command_msg)
-
-        # PPT 공식 외부 인터페이스는 모드와 차선을 분리한다. FINISH/STOP은
-        # 아직 팀 코드가 배정되지 않았으므로 임의의 숫자를 발행하지 않는다.
-        mode_code = external_mode_code(self.runtime.fsm.state)
-        if mode_code is not None:
-            mode_msg = Int16()
-            mode_msg.data = int(mode_code)
-            self.mode_pub.publish(mode_msg)
-
-        lane_info_msg = Int16()
-        lane_info_msg.data = lane_info_value(self.lane)
-        self.lane_info_pub.publish(lane_info_msg)
+        self.mode_pub.publish(mode_msg)
 
         self._update_debug_window(now, angle, speed)
 
@@ -721,30 +598,11 @@ class MainNode(Node):
     def is_pass_comp(self, now: float) -> bool:
         """추월 완료 여부. 판정은 main.overtake.OvertakeGuard가 한다."""
 
-        clearance_received_at = self.runtime.side_clearance_received_at
-        zone_entered_at = self.overtake.zone_entered_at
-        clearance_is_fresh = (
-            isinstance(clearance_received_at, (int, float))
-            and not isinstance(clearance_received_at, bool)
-            and np.isfinite(clearance_received_at)
-            and isinstance(now, (int, float))
-            and not isinstance(now, bool)
-            and np.isfinite(now)
-            and 0.0 <= now - clearance_received_at <= SIDE_CLEARANCE_MAX_AGE_S
-            and isinstance(zone_entered_at, (int, float))
-            and not isinstance(zone_entered_at, bool)
-            and np.isfinite(zone_entered_at)
-            and clearance_received_at > zone_entered_at
-        )
-        if not clearance_is_fresh:
-            self.overtake.invalidate_clearance()
-            return False
-
         decision = self.overtake.update_zone(
             now=now,
             lane_target=self.runtime.context.lane_target.value,
-            side_left=self.runtime.latest_side_left,
-            side_right=self.runtime.latest_side_right,
+            side_left=self.side_left,
+            side_right=self.side_right,
             ego_lane=self.detected_lane,
         )
         if decision.side_just_seen:
@@ -771,23 +629,28 @@ class MainNode(Node):
     def _fmt_side(distance: float) -> str:
         """측면 LiDAR 거리를 디버그 창용으로 만든다.
 
-        perception은 유효한 측면 반사가 없으면 inf를 준다. 'inf'를 그대로 찍으면
-        값이 있을 때와 폭이 달라져 눈으로 훑기 나쁘므로 N/A로 통일한다.
+        side_clearance()는 섹터에 유효 반사가 없으면 inf를 준다. 'inf'를 그대로
+        찍으면 값이 있을 때와 폭이 달라져 눈으로 훑기 나쁘므로 N/A로 통일한다.
         """
         if not np.isfinite(distance):
             return "N/A"
         return f"{distance:.2f} m"
 
     def _avoid_direction_text(self) -> str:
-        """Display the avoidance target approved by object perception."""
+        """디바운스를 통과한 회피 방향과 현재 연속 일치 수를 표시한다.
 
-        snapshot = self.runtime.latest_object_snapshot
-        if snapshot is None:
+        car_lane 한 프레임(위 Box 줄)과 실제로 방향을 확정한 값(이 줄)이
+        다를 수 있다는 것을 화면에서 바로 볼 수 있게 한다.
+        """
+        decision = self.runtime.last_avoid_direction
+        if decision is None:
             return "N/A"
-        target = opposite_lane_target(snapshot.lane)
-        if target is None:
-            return "unconfirmed"
-        return f"{self._lane_label(target.value)} (perception stable)"
+        confirmed = (
+            self._lane_label(decision.target.value)
+            if decision.target is not None
+            else "unconfirmed"
+        )
+        return f"{confirmed} (streak {decision.streak})"
 
     def _same_lane_brake_text(self) -> str:
         """같은 차선 감속 상태를 표시한다.
@@ -844,7 +707,6 @@ class MainNode(Node):
 
         self.overtake.reset()
         self.same_lane_brake.reset()
-        self.relative_x_fallback.reset()
         self.last_same_lane_brake = SameLaneBrakeDecision(
             speed_limit=float("inf"), same_lane=False, reason="reset"
         )
@@ -861,18 +723,11 @@ class MainNode(Node):
         self.car_lane = -1
         self.object_type = ObjectType.UNKNOWN
         self.object_confidence = 0.0
-        self.fixed_vehicle_lane = 0
-        self.moving_vehicle_lane = 0
-        self.rubbercone_offset = 0
-        self.rubbercone_end_flag = 0
         self.detected_lane = -1
         self.side_left = float("inf")
         self.side_right = float("inf")
         self.now_speed = 0.0
         self.now_angle = 0.0
-        self._publish_cone_session_state(
-            self.runtime.fsm.state is Mode.CONE_DRIVE
-        )
 
     def _drive_mission_zones(self, now: float) -> None:
         """Create typed obstacle-zone edges and CNN shortcut-exit sessions.
@@ -885,76 +740,30 @@ class MainNode(Node):
         """
 
         state = self.runtime.fsm.state
-        previous_state = self._zone_state
         entered = state is not self._zone_state
         self._zone_state = state
 
         if state is Mode.LANE_DRIVE:
             if entered:
                 self._fixed_entry_sent = False
-                # 초기 세션, bag loop, object mission 복귀는 새 encounter다.
-                # CONE_DRIVE는 object edge를 만들지 않는 일시적 mission이므로
-                # 그 동안 수집한 fresh fallback latch를 같은 encounter로 잇는다.
-                if previous_state is not Mode.CONE_DRIVE:
-                    self.relative_x_fallback.reset()
-            self.relative_x_fallback.expire(now)
             entered_at = self.runtime.context.state_entered_at
-            snapshot = self.runtime.latest_object_snapshot
             # 엣지는 state_entered_at 보다 "뒤"여야 수락되고 한 번만 소비된다.
             if (
                 not self._fixed_entry_sent
-                and snapshot is not None
+                and self.box_size > FIXED_ENTRY_BOX_PX
+                and self.object_type in (ObjectType.FIXED, ObjectType.MOVING)
                 and entered_at is not None
-                and snapshot.received_at > entered_at
-                and self.runtime._event_is_fresh(
-                    snapshot.received_at,
-                    now,
-                    self.runtime.object_max_age_s,
-                )
-                and snapshot.box_px > FIXED_ENTRY_BOX_PX
-                and snapshot.object_type in (ObjectType.FIXED, ObjectType.MOVING)
+                and now > entered_at
             ):
-                if (
-                    snapshot.lane is ObjectLane.UNKNOWN
-                    and not self.relative_x_fallback.decided
-                    and self.relative_x_fallback.latch_for_entry(
-                        self.runtime.context.lane_target
-                    )
-                ):
-                    median_x = self.relative_x_fallback.median_relative_x
-                    lane = self.relative_x_fallback.latched_lane
-                    samples = self.relative_x_fallback.evidence_samples
-                    self.get_logger().info(
-                        "relative-X obstacle lane latched at entry: "
-                        f"type={snapshot.object_type.name} lane={lane.value} "
-                        f"median={median_x:.2f}px samples={samples}"
-                    )
-                effective_lane = effective_object_lane(
-                    snapshot.lane,
-                    self.relative_x_fallback.latched_lane,
-                )
-                if not object_mission_entry_allowed(
-                    self.runtime.context.lane_target,
-                    effective_lane,
-                ):
-                    return
-                if snapshot.object_type is ObjectType.MOVING:
-                    expected_state = Mode.OVERTAKE
+                self._fixed_entry_sent = True
+                if self.object_type is ObjectType.MOVING:
+                    self.runtime.record_overtake_entry(now)
                     label = "방해차량"
                 else:
-                    expected_state = Mode.FIXED_AVOID
+                    self.runtime.record_fixed_zone_entry(now)
                     label = "고정장애물"
-                result = self.runtime.record_object_mission_entry(
-                    expected_state,
-                    snapshot,
-                    now,
-                    effective_lane,
-                )
-                if not result.accepted:
-                    return
-                self._fixed_entry_sent = True
                 self.get_logger().info(
-                    f"{label} 검출 ({snapshot.box_px:.0f}px^2) -> 미션 구간 진입")
+                    f"{label} 검출 ({self.box_size:.0f}px^2) -> 미션 구간 진입")
             return
 
         if state is Mode.FIXED_AVOID:
@@ -962,7 +771,7 @@ class MainNode(Node):
                 self._enter_zone(now)
             # 고정장애물을 추월할 때까지 이 구간에 머문다. 시간으로 먼저
             # 빠져나가면 회피가 끝나기 전에 모드가 바뀌어 차선 변경 명령이
-            # 취소되고, /internal/lane_command가 5↔3↔0 으로 요동친다.
+            # 취소되고, /mode_info 코드가 5↔3↔0 으로 요동친다.
             if not self._zone_exit_sent and self.is_pass_comp(now):
                 self._zone_exit_sent = True
                 self.runtime.record_fixed_zone_exit(now)
@@ -984,7 +793,7 @@ class MainNode(Node):
                 self._shortcut_exit_sent = False
             return
 
-        # 그 밖의 상태(WAIT_GREEN/FINISH)에서는 구간 판정을 쉰다.
+        # 그 밖의 상태(INIT/WAIT_TRAFFIC/REJOIN 등)에서는 구간 판정을 쉰다.
         if entered:
             self._enter_zone(now)
 
@@ -1054,7 +863,7 @@ class MainNode(Node):
         ):
             target_speed = min(target_speed, 5.0)
 
-        if source is ControlSource.HOLD:
+        if source is ControlSource.STOP:
             # 감속은 램프로 한다. 인지가 한 프레임 늦었다고 속도를 즉시 0으로
             # 꺾으면 재가속에 수 초가 걸려, 다음 끊김 전에 순항 속도를 회복하지
             # 못한다. 실측(bag): 속도 0인 사이클 24.2%, 5 미만 83.4%, 평균 2.24

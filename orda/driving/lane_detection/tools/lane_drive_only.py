@@ -9,9 +9,7 @@
 #     따라서 입력이 잠깐 끊겨도 터미널 STOP으로 래치되지 않는다.
 #   - 신호등, 라바콘, 장애물, 차선변경을 전혀 보지 않는다.
 #
-# 제어식은 PD 그대로다. main 패키지 control.py의 LANE_DRIVE는 Pure Pursuit로
-# 바뀌었으므로 더 이상 같지 않다 — PD와 Pure Pursuit를 비교할 때 이 도구를
-# 기준선으로 쓸 수 있다.
+# 제어식은 main 패키지 control.py의 LANE_DRIVE 프로필과 동일하다.
 #   조향: angle = kp * offset + kd * (offset - prev_offset)
 #   속도: speed = max_speed - |angle| * scale_factor, 하한 min_speed
 #   발행: 위 speed에 speed_scale(기본 0.5)을 곱한 값
@@ -33,20 +31,20 @@ from std_msgs.msg import Float32MultiArray, Int16
 
 class LaneDriveOnly(Node):
     def __init__(self):
-        super().__init__('lane_drive_only')
+        super().__init__("lane_drive_only")
 
         # ── 튜닝 파라미터 (control.py의 LANE_DRIVE 값과 동일한 기본값) ──────
-        self.kp = self.declare_parameter('kp', 0.145).value
-        self.kd = self.declare_parameter('kd', 0.3).value
-        self.max_speed = self.declare_parameter('max_speed', 43.0).value
-        self.min_speed = self.declare_parameter('min_speed', 16.0).value
-        self.scale_factor = self.declare_parameter('scale_factor', 0.5).value
+        self.kp = self.declare_parameter("kp", 0.145).value
+        self.kd = self.declare_parameter("kd", 0.3).value
+        self.max_speed = self.declare_parameter("max_speed", 43.0).value
+        self.min_speed = self.declare_parameter("min_speed", 16.0).value
+        self.scale_factor = self.declare_parameter("scale_factor", 0.5).value
         # main.py가 최종 발행 직전에 적용하는 1/2 스케일
-        self.speed_scale = self.declare_parameter('speed_scale', 0.5).value
+        self.speed_scale = self.declare_parameter("speed_scale", 0.5).value
         # 가속 스텝 (감속은 즉시). main.py와 동일하게 사이클당 0.1
-        self.accel_step = self.declare_parameter('accel_step', 0.1).value
+        self.accel_step = self.declare_parameter("accel_step", 0.1).value
         # 이 시간 이상 /lane_offset이 없으면 정지 명령을 낸다
-        self.stale_after_s = self.declare_parameter('stale_after_s', 0.5).value
+        self.stale_after_s = self.declare_parameter("stale_after_s", 0.5).value
 
         # ── 제어 상태 ────────────────────────────────────────────────────
         self.prev_offset = 0.0
@@ -67,18 +65,18 @@ class LaneDriveOnly(Node):
         )
 
         self.motor_pub = self.create_publisher(
-            Float32MultiArray, 'xycar_motor', command_qos
+            Float32MultiArray, "xycar_motor", command_qos
         )
         self.offset_sub = self.create_subscription(
-            Int16, 'lane_offset', self.lane_offset_callback, offset_qos
+            Int16, "lane_offset", self.lane_offset_callback, offset_qos
         )
 
         self.create_timer(0.02, self.control_cycle)
         self.get_logger().info(
-            'lane_drive_only 시작: /lane_offset -> /xycar_motor '
-            f'(kp={self.kp}, kd={self.kd}, '
-            f'speed={self.min_speed * self.speed_scale:.1f}'
-            f'~{self.max_speed * self.speed_scale:.1f})'
+            "lane_drive_only 시작: /lane_offset -> /xycar_motor "
+            f"(kp={self.kp}, kd={self.kd}, "
+            f"speed={self.min_speed * self.speed_scale:.1f}"
+            f"~{self.max_speed * self.speed_scale:.1f})"
         )
 
     def _now(self) -> float:
@@ -143,5 +141,5 @@ def main(args=None):
             rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

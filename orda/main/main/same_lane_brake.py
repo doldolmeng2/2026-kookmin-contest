@@ -145,7 +145,7 @@ class SameLaneBrake:
     ) -> SameLaneBrakeDecision:
         """카메라 신호로 속도 상한을 정한다.
 
-        ``car_lane``  : 장애물이 있는 차선 (/object_info_raw 의 lane_label)
+        ``car_lane``  : 장애물이 있는 차선 (/object_info 의 lane_label)
         ``ego_lane``  : 자차 실측 차선 (/lane_position)
         ``box_px``    : YOLO 박스 면적. 0 이면 이번 프레임에 박스가 없다.
 

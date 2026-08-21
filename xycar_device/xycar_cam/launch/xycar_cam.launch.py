@@ -12,7 +12,7 @@ def generate_launch_description():
     params_path = os.path.join(
         usb_cam_dir,
         'config',
-        'params_1.yaml'
+        'params.yaml'
     )
 
     print(params_path)

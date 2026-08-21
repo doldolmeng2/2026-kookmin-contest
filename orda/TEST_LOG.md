@@ -1,54 +1,5 @@
 # TEST LOG
 
-## 2026-08-15 — PPT interface and FSM contract migration
-
-### Team-approved decisions
-
-- Removed `INIT`; startup readiness is part of `WAIT_GREEN`.
-- Removed `REJOIN`; a fresh rubber-cone end edge returns directly to
-  `LANE_DRIVE`.
-- Official `/mode_info` is `std_msgs/msg/Int16` with `0=WAIT_GREEN`,
-  `1=LANE_DRIVE`, `2=CONE_DRIVE`, `3=FIXED_AVOID`, `4=OVERTAKE`, and
-  `5=SHORTCUT`.
-- Internal `FINISH` and `STOP` have no assigned external value. Main suppresses
-  `/mode_info` while either state is active instead of publishing `0`.
-- Official `/lane_info` is `std_msgs/msg/Int16`: `1=lane 1`, `2=lane 2`,
-  `3=center`.
-- Object Detection publishes official `/object_info`
-  `[traffic_signal, fixed_vehicle_lane, moving_vehicle_lane]`. Fixed and moving
-  representatives occupy independent slots and can survive the same frame.
-- Rubbercone publishes official `/rubbercone_offset [offset, end_flag]`.
-- Object Detection and Rubbercone also publish their detailed internal payloads
-  directly in the same calculation cycle.
-
-### PPT-external implementation topics retained
-
-| Topic | Payload | Reason |
-|---|---|---|
-| `/traffic_detection` | `Int32` traffic code | traffic YOLO → object aggregation |
-| `/object_yolo` | `Float32MultiArray`, fixed and moving 10-field slots | preserve both object categories before lane fusion |
-| `/object_info_raw` | existing detailed 12 fields | distance/box/type evidence used by validated Main logic |
-| `/rubbercone_info` | `[offset, end_flag, confidence]` | confidence required by the existing cone-entry debounce |
-| `/internal/lane_command` | `[legacy_lane_mode, internal_lane]` | isolate the unchanged lane detector's old array input from official `/mode_info` |
-| `/lane_fit` | `[m, b]` | object-to-lane fusion input |
-| `/lane_change_state` | `[changing, success]` | avoidance lane-change completion feedback |
-| `/lane_position` | `Int16` | measured ego lane for side-clearance completion |
-| `/lane_valid` | `Bool` | legacy lane-detector output; Main no longer subscribes after `REJOIN` removal |
-| `/rubbercone_reset` | `Empty` | reset one detector session on cone entry |
-| `/road_surface` | `Int32` road label | shortcut-exit evidence |
-
-### Verification in the scratch clone
-
-- Pure Main/FSM regression excluding ROS-runtime import tests: `418 passed`.
-- Object YOLO preprocessing/dual-slot/parameter tests: `10 passed`.
-- `compileall`, shell syntax, and `git diff --check`: pass.
-- ROS entity tests, C++ package builds, full `colcon test`, bag, and real vehicle:
-  pending in the ROS2 Humble WSL workspace.
-- Known input blocker: the checked-in object model is fixed-only. The YAML fixes
-  `fixed_class_ids: [0]` and deliberately leaves `moving_class_ids` unset. A
-  team-provided moving-object model and exact class-ID mapping are required
-  before `/object_info[2]` can be validated on real data.
-
 ## 2026-08-05 — KMU finals rubber-cone FSM bag integration
 
 ### Baseline

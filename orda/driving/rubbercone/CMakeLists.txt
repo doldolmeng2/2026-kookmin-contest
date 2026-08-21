@@ -37,12 +37,6 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
-  find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(test_entry_readiness test/test_entry_readiness.cpp)
-  target_include_directories(test_entry_readiness PRIVATE include)
-  ament_add_gtest(test_session_lifecycle test/test_session_lifecycle.cpp)
-  target_include_directories(test_session_lifecycle PRIVATE include)
-
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
@@ -51,12 +45,7 @@ if(BUILD_TESTING)
   # comment the line when this package is in a git repo and when
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
-  # Keep the package's existing source layout intact while running the focused
-  # semantic unit tests added for the perception-owned entry contract.
-  set(ament_cmake_uncrustify_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
-
-install(DIRECTORY include/ DESTINATION include)
 
 ament_package()

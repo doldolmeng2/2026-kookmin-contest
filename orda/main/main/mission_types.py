@@ -6,7 +6,7 @@ from typing import Optional
 
 
 class ObjectLane(Enum):
-    """Lane label emitted in ``/object_info_raw`` field 10 (index 9)."""
+    """Lane label emitted in ``/object_info`` field 10 (index 9)."""
 
     # object_detection 의 lane_label 과 같은 값이다 (0=중앙선 근처, 1=왼쪽, 2=오른쪽).
     UNKNOWN = 0
@@ -26,7 +26,7 @@ class LaneTarget(Enum):
 
 
 class RouteTrafficSignal(IntEnum):
-    """Traffic signal in official ``/object_info`` field 1 (index 0)."""
+    """Internal route-traffic contract; no production ROS topic owns it yet."""
 
     UNKNOWN = 0
     RED_AMBER = 1
@@ -35,7 +35,7 @@ class RouteTrafficSignal(IntEnum):
 
 
 class ObjectType(IntEnum):
-    """Semantic class carried by ``/object_info_raw`` field 11."""
+    """Semantic class carried by ``/object_info`` field 11."""
 
     UNKNOWN = -1
     FIXED = 0
@@ -54,7 +54,7 @@ def opposite_lane_target(object_lane: ObjectLane) -> Optional[LaneTarget]:
 
 @dataclass(frozen=True)
 class ObjectSnapshot:
-    """Validated subset of the internal ``/object_info_raw`` message."""
+    """Validated subset of the backward-compatible ``/object_info`` message."""
 
     exists: bool
     distance: Optional[float]

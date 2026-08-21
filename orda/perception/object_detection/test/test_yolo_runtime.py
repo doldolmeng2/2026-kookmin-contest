@@ -1,82 +1,53 @@
 import numpy as np
-import pytest
 
 from object_detection.yolo_runtime import (
-    Detection,
-    LatestFrameRateLimiter,
-    closest_detection_for_classes,
-    detection_slot,
-    normalize_class_ids,
+    closest_detection,
+    decode_detections,
+    prediction_rows,
 )
 
 
-def test_normalize_class_ids_deduplicates_integer_values():
-    assert normalize_class_ids([2, 1, 2]) == {1, 2}
+def test_normalizes_current_one_class_export():
+    output = np.zeros((1, 5, 8400), dtype=np.float32)
+    assert prediction_rows(output).shape == (8400, 5)
 
 
-def test_normalize_class_ids_rejects_negative_values():
-    with pytest.raises(ValueError, match="non-negative"):
-        normalize_class_ids([-1, 2])
+def test_decodes_dynamic_multiclass_export_and_filters_signal_class():
+    # Three anchors, three classes. Class 2 represents a traffic signal and is
+    # excluded from the object detector by allowed_class_ids.
+    output = np.zeros((1, 7, 3), dtype=np.float32)
+    output[0, :4, 0] = [100, 120, 40, 30]
+    output[0, 4:, 0] = [0.9, 0.1, 0.0]
+    output[0, :4, 1] = [300, 250, 80, 70]
+    output[0, 4:, 1] = [0.1, 0.95, 0.0]
+    output[0, :4, 2] = [400, 300, 100, 100]
+    output[0, 4:, 2] = [0.0, 0.0, 0.99]
 
-
-def test_closest_detection_for_classes_filters_before_area_selection():
-    detections = [
-        Detection(0, 0.9, 0, 0, 100, 100),
-        Detection(2, 0.8, 0, 0, 20, 30),
-        Detection(3, 0.7, 0, 0, 30, 30),
-    ]
-    assert closest_detection_for_classes(detections, [2, 3]) == detections[2]
-    assert closest_detection_for_classes(detections, [5]) is None
-
-
-def test_closest_detection_for_classes_accepts_numpy_integer_ids():
-    detection = Detection(2, 0.8, 0, 0, 20, 30)
-    assert closest_detection_for_classes(
-        [detection], np.asarray([2], dtype=np.int64)
-    ) == detection
-
-
-def test_fixed_and_moving_slots_preserve_both_classes_from_one_frame():
-    detections = [
-        Detection(4, 0.8, 0, 0, 30, 30),
-        Detection(0, 0.9, 2, 3, 25, 20),
-    ]
-    payload = (
-        detection_slot(closest_detection_for_classes(detections, [4]), 0)
-        + detection_slot(closest_detection_for_classes(detections, [0]), 1)
+    detections = decode_detections(
+        output,
+        image_shape=(640, 640),
+        scale=1.0,
+        pad_x=0.0,
+        pad_y=0.0,
+        confidence_threshold=0.5,
+        nms_threshold=0.4,
+        allowed_class_ids={0, 1},
     )
-
-    assert len(payload) == 20
-    assert payload[0:2] == [1.0, 0.0]
-    assert payload[10:12] == [1.0, 1.0]
+    assert {item.class_id for item in detections} == {0, 1}
+    assert closest_detection(detections).class_id == 1
 
 
-def test_empty_slots_keep_their_semantic_types():
-    assert detection_slot(None, 0) == [0.0, 0.0] + [0.0] * 8
-    assert detection_slot(None, 1) == [0.0, 1.0] + [0.0] * 8
-
-
-def test_unlimited_rate_limiter_returns_every_frame_immediately():
-    limiter = LatestFrameRateLimiter(0.0)
-    assert limiter.offer("first", 10.0) == "first"
-    assert limiter.offer("second", 10.0) == "second"
-    assert not limiter.has_pending
-
-
-def test_limited_rate_limiter_replaces_pending_frame_with_latest():
-    limiter = LatestFrameRateLimiter(10.0)
-    assert limiter.offer("first", 1.0) == "first"
-    assert limiter.offer("old", 1.02) is None
-    assert limiter.offer("latest", 1.04) is None
-    assert limiter.pop_due(1.099) is None
-    assert limiter.pop_due(1.10) == "latest"
-    assert not limiter.has_pending
-
-
-def test_limited_rate_limiter_preserves_selected_object_identity():
-    limiter = LatestFrameRateLimiter(5.0)
-    first = object()
-    latest = object()
-    assert limiter.offer(first, 0.0) is first
-    assert limiter.offer(latest, 0.1) is None
-    assert limiter.pop_due(0.2) is latest
+def test_accepts_transposed_rows():
+    output = np.array([[20, 20, 16, 16, 0.8]], dtype=np.float32)
+    detections = decode_detections(
+        output,
+        image_shape=(40, 40),
+        scale=1.0,
+        pad_x=0.0,
+        pad_y=0.0,
+        confidence_threshold=0.5,
+        nms_threshold=0.4,
+        allowed_class_ids={0},
+    )
+    assert len(detections) == 1
+    assert detections[0].area == 256

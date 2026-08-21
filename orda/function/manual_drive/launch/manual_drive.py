@@ -27,7 +27,7 @@ def generate_launch_description():
             default_value='false',
             choices=['false', 'true'],
             description=(
-                'false isolates output on /kmu_main_offline/xycar_motor; '
+                'false isolates output on /manual_test/xycar_motor; '
                 'true publishes to the real /xycar_motor topic'
             ),
         ),
@@ -70,7 +70,7 @@ def generate_launch_description():
         name='manual_drive_node',
         output='screen',
         parameters=[manual_parameters],
-        remappings=[('xycar_motor', '/kmu_main_offline/xycar_motor')],
+        remappings=[('xycar_motor', '/manual_test/xycar_motor')],
         condition=UnlessCondition(live_drive),
     )
     live_manual_node = Node(
@@ -88,7 +88,7 @@ def generate_launch_description():
             condition=UnlessCondition(live_drive),
             msg=(
                 'MANUAL TEST ISOLATED: motor output is remapped to '
-                '/kmu_main_offline/xycar_motor'
+                '/manual_test/xycar_motor'
             ),
         ),
         LogInfo(

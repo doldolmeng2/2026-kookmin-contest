@@ -17,13 +17,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
-#if __has_include(<cv_bridge/cv_bridge.hpp>)
-#include <cv_bridge/cv_bridge.hpp>  // Jazzy
-#elif __has_include(<cv_bridge/cv_bridge.h>)
-#include <cv_bridge/cv_bridge.h>    // Humble
-#else
-#error "cv_bridge header not found"
-#endif
+#include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
 
 

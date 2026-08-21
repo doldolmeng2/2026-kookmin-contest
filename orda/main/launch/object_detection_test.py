@@ -17,15 +17,10 @@
 # 아래 자식 프로세스로 띄우면 안정적으로 통신됐으므로 이 파일로 묶는다.
 # ─────────────────────────────────────────────────────────────────────────────
 
-import os
-from typing import List
-
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -35,44 +30,12 @@ def generate_launch_description():
         description='CAMERA VIEW / OBJECT DEBUG 디버그 창 표시 여부'
     )
     enable_gui = LaunchConfiguration('enable_gui')
-    pidnet_model_arg = DeclareLaunchArgument(
-        'pidnet_model',
-        default_value=os.path.join(
-            get_package_share_directory('segmentation_tools'),
-            'model', 'pidnet_s_best.pt',
-        ),
-        description='PIDNet-S checkpoint path'
-    )
-    pidnet_lane_classes_arg = DeclareLaunchArgument(
-        'pidnet_lane_classes',
-        default_value='[1]',
-        description='/lane_segmentation_mask 로 내보낼 PIDNet 클래스 (1=center_lane)'
-    )
 
     resize_node = Node(
         package='image_resize',
         executable='resize_node',
         name='resize_node',
         output='screen',
-    )
-    # lane_node가 /lane_segmentation_mask 를 구독하므로 여기서도 PIDNet이
-    # 필요하다. 없으면 /lane_fit 이 나오지 않아 object_node 의 1/2차선 판정이
-    # 항상 0으로 나온다 (이 파일이 lane_node 를 포함하는 이유가 그것이다).
-    pidnet_node = Node(
-        package='segmentation_tools',
-        executable='pidnet_inference',
-        name='pidnet_inference_node',
-        output='screen',
-        parameters=[{
-            'model_path': LaunchConfiguration('pidnet_model'),
-            'input_topic': '/resized_image',
-            'mask_topic': '/lane_segmentation_mask',
-            'class_topic': '/pidnet_class_map',
-            'lane_classes': ParameterValue(
-                LaunchConfiguration('pidnet_lane_classes'), value_type=List[int]
-            ),
-            'device': 'auto',
-        }],
     )
     lane_node = Node(
         package='lane_detection',
@@ -96,10 +59,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         enable_gui_arg,
-        pidnet_model_arg,
-        pidnet_lane_classes_arg,
         resize_node,
-        pidnet_node,
         lane_node,
         object_yolo_node,
         object_node,

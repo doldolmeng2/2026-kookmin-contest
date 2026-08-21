@@ -3,7 +3,7 @@
 #
 # This harness never starts a hardware driver and never replays recorded motor,
 # detector, lane, traffic, or diagnostic topics.  The production main node's
-# output remains remapped to /kmu_main_offline/xycar_motor.
+# output remains remapped to /bag_test/xycar_motor by module_drive_bag_test.py.
 
 set -Eeuo pipefail
 
@@ -18,8 +18,8 @@ if (( $# > 1 )); then
     exit 2
 fi
 
-if [[ ! -f /opt/ros/jazzy/setup.bash ]]; then
-    echo "ROS Jazzy setup not found: /opt/ros/jazzy/setup.bash" >&2
+if [[ ! -f /opt/ros/humble/setup.bash ]]; then
+    echo "ROS Humble setup not found: /opt/ros/humble/setup.bash" >&2
     exit 2
 fi
 if [[ ! -f "${WORKSPACE_ROOT}/install/setup.bash" ]]; then
@@ -33,7 +33,7 @@ fi
 
 # shellcheck disable=SC1091
 set +u
-source /opt/ros/jazzy/setup.bash
+source /opt/ros/humble/setup.bash
 # shellcheck disable=SC1091
 source "${WORKSPACE_ROOT}/install/setup.bash"
 set -u
@@ -46,12 +46,11 @@ LAUNCH_LOG="${RUN_DIR}/launch.log"
 LANE_MOCK_LOG="${RUN_DIR}/lane_mock.log"
 TRAFFIC_MOCK_LOG="${RUN_DIR}/traffic_mock.log"
 SCAN_MOCK_LOG="${RUN_DIR}/scan_mock.log"
-CLOCK_MOCK_LOG="${RUN_DIR}/clock_mock.log"
-OBJECT_YOLO_MOCK_LOG="${RUN_DIR}/object_yolo_mock.log"
+LANE_VALID_MOCK_LOG="${RUN_DIR}/lane_valid_mock.log"
 BAG_PLAY_LOG="${RUN_DIR}/bag_play.log"
 MOTOR_LOG="${RUN_DIR}/bag_test_motor.log"
 CONE_MOTOR_SAMPLE="${RUN_DIR}/cone_drive_motor_sample.log"
-POST_CONE_LANE_MOTOR_SAMPLE="${RUN_DIR}/post_cone_lane_motor_sample.log"
+REJOIN_LANE_MOTOR_SAMPLE="${RUN_DIR}/rejoin_lane_motor_sample.log"
 RUBBERCONE_LOG="${RUN_DIR}/rubbercone_info.log"
 SUMMARY_LOG="${RUN_DIR}/summary.txt"
 
@@ -59,8 +58,7 @@ LAUNCH_PID=""
 LANE_MOCK_PID=""
 TRAFFIC_MOCK_PID=""
 SCAN_MOCK_PID=""
-CLOCK_MOCK_PID=""
-OBJECT_YOLO_MOCK_PID=""
+LANE_VALID_MOCK_PID=""
 MOTOR_ECHO_PID=""
 RUBBERCONE_ECHO_PID=""
 BAG_PLAY_PID=""
@@ -96,7 +94,7 @@ wait_for_test_graph_cleanup() {
     local nodes
     while (( SECONDS < deadline )); do
         nodes="$(ros2 node list 2>/dev/null || true)"
-        if ! grep -Eq '^/(main_node|traffic_node|rubbercone_node|resize_node|lane_node|object_yolo_node|object_node|kmu_test_lane_mock|kmu_test_traffic_mock|kmu_test_scan_mock|kmu_test_clock_mock|kmu_test_object_yolo_mock)$' \
+        if ! grep -Eq '^/(main_node|traffic_node|rubbercone_node|resize_node|lane_node|object_node|kmu_test_lane_mock|kmu_test_traffic_mock|kmu_test_scan_mock|kmu_test_lane_valid_mock)$' \
             <<<"${nodes}"; then
             return 0
         fi
@@ -115,8 +113,7 @@ cleanup() {
     stop_process "${LANE_MOCK_PID}"
     stop_process "${TRAFFIC_MOCK_PID}"
     stop_process "${SCAN_MOCK_PID}"
-    stop_process "${CLOCK_MOCK_PID}"
-    stop_process "${OBJECT_YOLO_MOCK_PID}"
+    stop_process "${LANE_VALID_MOCK_PID}"
     if wait_for_test_graph_cleanup; then
         echo "cleanup_graph=PASS" | tee -a "${SUMMARY_LOG}"
     else
@@ -189,7 +186,7 @@ if ! ros2 bag info "${BAG_PATH}" \
 fi
 
 if ros2 node list 2>/dev/null \
-    | grep -Eq '^/(main_node|traffic_node|rubbercone_node|resize_node|lane_node|object_yolo_node|object_node|kmu_test_lane_mock|kmu_test_traffic_mock|kmu_test_scan_mock|kmu_test_clock_mock|kmu_test_object_yolo_mock)$'; then
+    | grep -Eq '^/(main_node|traffic_node|rubbercone_node|resize_node|lane_node|object_node|kmu_test_lane_mock|kmu_test_traffic_mock|kmu_test_scan_mock|kmu_test_lane_valid_mock)$'; then
     echo "a bag-test launch or KMU mock node is already running; stop it before retrying" >&2
     exit 1
 fi
@@ -205,36 +202,10 @@ fi
 
 assert_no_real_motor_publishers "before launch"
 
-# Match the production subscriber contracts exactly. WAIT_GREEN is the
-# startup gate, so the empty scan and YOLO mocks prove readiness before the
-# recorded /scan starts. The launch uses simulated time, so a constant nonzero
-# test clock is also required until rosbag takes ownership of /clock.
-python3 -c '
-import time
-
-import rclpy
-from rclpy.node import Node
-from rosgraph_msgs.msg import Clock
-
-rclpy.init()
-node = Node("kmu_test_clock_mock")
-publisher = node.create_publisher(Clock, "/clock", 10)
-started = time.monotonic()
-try:
-    while rclpy.ok():
-        stamp = 1.0 + time.monotonic() - started
-        message = Clock()
-        message.clock.sec = int(stamp)
-        message.clock.nanosec = int((stamp - int(stamp)) * 1_000_000_000)
-        publisher.publish(message)
-        rclpy.spin_once(node, timeout_sec=0.0)
-        time.sleep(0.02)
-finally:
-    node.destroy_node()
-    rclpy.shutdown()
-' >"${CLOCK_MOCK_LOG}" 2>&1 &
-CLOCK_MOCK_PID=$!
-
+# Match the production subscriber contracts exactly.  INIT and WAIT_GREEN are
+# non-motion states, so the main node can discover and receive lane messages
+# before the FSM enters LANE_DRIVE.  The empty scan mock exists only for the
+# INIT readiness gate and is stopped before the recorded /scan starts.
 ros2 topic pub -r 10 -p 100 -n kmu_test_lane_mock \
     --qos-history keep_last --qos-depth 10 \
     --qos-reliability best_effort --qos-durability volatile \
@@ -245,17 +216,9 @@ LANE_MOCK_PID=$!
 ros2 topic pub -r 10 -p 100 -n kmu_test_traffic_mock \
     --qos-history keep_last --qos-depth 10 \
     --qos-reliability best_effort --qos-durability volatile \
-    /traffic_detection std_msgs/msg/Int32 '{data: 2}' \
+    /traffic_detection std_msgs/msg/Bool '{data: true}' \
     >"${TRAFFIC_MOCK_LOG}" 2>&1 &
 TRAFFIC_MOCK_PID=$!
-
-ros2 topic pub -r 10 -p 100 -n kmu_test_object_yolo_mock \
-    --qos-history keep_last --qos-depth 1 \
-    --qos-reliability best_effort --qos-durability volatile \
-    /object_yolo std_msgs/msg/Float32MultiArray \
-    '{data: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}' \
-    >"${OBJECT_YOLO_MOCK_LOG}" 2>&1 &
-OBJECT_YOLO_MOCK_PID=$!
 
 ros2 topic pub -r 10 -p 100 -n kmu_test_scan_mock \
     --qos-history keep_last --qos-depth 10 \
@@ -270,13 +233,14 @@ stdbuf -oL -eL ros2 launch main module_drive_bag_test.py \
     >"${LAUNCH_LOG}" 2>&1 &
 LAUNCH_PID=$!
 
-wait_for_publisher_count /kmu_main_offline/xycar_motor 1 15
+wait_for_publisher_count /bag_test/xycar_motor 1 15
+wait_for_log "FSM INIT -> WAIT_GREEN: required inputs ready" 15
 wait_for_log "FSM WAIT_GREEN -> LANE_DRIVE: green signal debounced" 15
 
 stop_process "${SCAN_MOCK_PID}"
 SCAN_MOCK_PID=""
 
-ros2 topic echo /kmu_main_offline/xycar_motor std_msgs/msg/Float32MultiArray \
+ros2 topic echo /bag_test/xycar_motor std_msgs/msg/Float32MultiArray \
     --field data >"${MOTOR_LOG}" 2>&1 &
 MOTOR_ECHO_PID=$!
 ros2 topic echo /rubbercone_info std_msgs/msg/Int32MultiArray \
@@ -286,31 +250,38 @@ RUBBERCONE_ECHO_PID=$!
 # Mandatory final interlock immediately before playback.
 assert_no_real_motor_publishers "before bag playback"
 
-stop_process "${CLOCK_MOCK_PID}"
-CLOCK_MOCK_PID=""
-
-echo "command=ros2 bag play ${BAG_PATH} --disable-keyboard-controls --clock --topics /scan" \
+echo "command=ros2 bag play ${BAG_PATH} --disable-keyboard-controls --topics /scan" \
     | tee -a "${SUMMARY_LOG}"
-ros2 bag play "${BAG_PATH}" --disable-keyboard-controls --clock --topics /scan \
+ros2 bag play "${BAG_PATH}" --disable-keyboard-controls --topics /scan \
     >"${BAG_PLAY_LOG}" 2>&1 &
 BAG_PLAY_PID=$!
 
 wait_for_log "FSM LANE_DRIVE -> CONE_DRIVE: cone entry confirmed" 20
 
 # Capture a non-zero command only after the FSM has committed CONE_DRIVE.
-timeout 5s ros2 topic echo /kmu_main_offline/xycar_motor \
+timeout 5s ros2 topic echo /bag_test/xycar_motor \
     std_msgs/msg/Float32MultiArray --field data --once \
     --filter 'len(m) >= 2 and (abs(float(m[0])) > 1e-6 or abs(float(m[1])) > 1e-6)' \
     >"${CONE_MOTOR_SAMPLE}" 2>&1
 
-wait_for_log "FSM CONE_DRIVE -> LANE_DRIVE: fresh cone end flag" 20
+# The production graph does not yet provide /lane_valid.  Start this explicit
+# test-only contract only after REJOIN commits, so no pre-REJOIN edge can count.
+wait_for_log "FSM CONE_DRIVE -> REJOIN: fresh cone end flag" 20
+ros2 topic pub -r 10 -p 100 -n kmu_test_lane_valid_mock \
+    --qos-history keep_last --qos-depth 10 \
+    --qos-reliability best_effort --qos-durability volatile \
+    /lane_valid std_msgs/msg/Bool '{data: true}' \
+    >"${LANE_VALID_MOCK_LOG}" 2>&1 &
+LANE_VALID_MOCK_PID=$!
+
+wait_for_log "FSM REJOIN -> LANE_DRIVE: fresh lane validity confirmed" 10
 
 # A committed transition is not enough by itself: prove that the continuing
-# fresh lane-offset mock is selected after the direct lane-drive return.
-timeout 5s ros2 topic echo /kmu_main_offline/xycar_motor \
+# fresh lane-offset mock is selected on the isolated motor topic after REJOIN.
+timeout 5s ros2 topic echo /bag_test/xycar_motor \
     std_msgs/msg/Float32MultiArray --field data --once \
     --filter 'len(m) >= 2 and (abs(float(m[0])) > 1e-6 or abs(float(m[1])) > 1e-6)' \
-    >"${POST_CONE_LANE_MOTOR_SAMPLE}" 2>&1
+    >"${REJOIN_LANE_MOTOR_SAMPLE}" 2>&1
 
 if ! wait "${BAG_PLAY_PID}"; then
     BAG_PLAY_PID=""
@@ -331,18 +302,20 @@ if [[ ! -s "${CONE_MOTOR_SAMPLE}" ]]; then
         | tee -a "${SUMMARY_LOG}" >&2
     exit 1
 fi
-if [[ ! -s "${POST_CONE_LANE_MOTOR_SAMPLE}" ]]; then
-    echo "no non-zero isolated lane motor sample captured after cone exit" \
+if [[ ! -s "${REJOIN_LANE_MOTOR_SAMPLE}" ]]; then
+    echo "no non-zero isolated lane motor sample captured after REJOIN" \
         | tee -a "${SUMMARY_LOG}" >&2
     exit 1
 fi
 
 {
+    echo "init_to_wait_green=PASS"
     echo "wait_green_to_lane=PASS"
     echo "lane_to_cone=PASS"
     echo "cone_drive_nonzero_bag_test_motor=PASS"
-    echo "cone_to_lane=PASS"
-    echo "post_cone_lane_nonzero_bag_test_motor=PASS"
+    echo "cone_to_rejoin=PASS"
+    echo "rejoin_to_lane=PASS"
+    echo "post_rejoin_lane_nonzero_bag_test_motor=PASS"
     echo "real_xycar_motor_isolated=PASS"
     if grep -Fq "Rubber-cone exit detection armed" "${LAUNCH_LOG}"; then
         echo "rubbercone_exit_armed=PASS"

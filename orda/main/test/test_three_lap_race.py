@@ -64,6 +64,16 @@ class SyntheticRace:
             )
         )
 
+    def lane_valid(self):
+        timestamp = self._next_time()
+        return self._step(
+            MissionObservation(
+                now=timestamp,
+                lane_valid=True,
+                lane_valid_received_at=timestamp,
+            )
+        )
+
     def lane_change_success(self):
         timestamp = self._next_time()
         return self._step(
@@ -108,6 +118,10 @@ class SyntheticRace:
     def completion(self, name):
         timestamp = self._next_time()
         fields = {
+            "fixed_avoid_complete": {
+                "fixed_avoid_complete": True,
+                "fixed_avoid_completed_at": timestamp,
+            },
             "overtake_complete": {
                 "overtake_complete": True,
                 "overtake_complete_received_at": timestamp,
@@ -121,8 +135,12 @@ class SyntheticRace:
 
 
 def start_race(race):
+    first = race.green()
+    second = race.green()
     started = race.green()
 
+    assert first.changed is False
+    assert second.changed is False
     assert started.target is Mode.LANE_DRIVE
     assert race.context.completed_laps == 0
     assert race.context.current_lap == 1

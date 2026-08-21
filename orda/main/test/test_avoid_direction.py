@@ -78,7 +78,7 @@ def test_republished_identical_result_cannot_confirm_the_side():
     """object_detection 은 같은 YOLO 결과를 50 Hz 타이머로 재발행한다.
 
     수신 시각은 매번 다르므로 '연속 3표본' 조건은 60 ms 만에 채워진다. 실측
-    (bag 재생)에서 /object_info_raw 메시지의 85.7%가 직전과 완전히 동일한
+    (bag 재생)에서 /object_info 메시지의 85.7%가 직전과 완전히 동일한
     재발행이었고, t=61.38s 에서 단 한 번의 검출이 3번 재발행되며 차선 변경
     명령 [5, 1] 이 나갔다. min_duration_s 가 이를 막는다.
     """

@@ -31,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--start-mode",
         choices=[mode.value for mode in Mode],
-        default=Mode.WAIT_GREEN.value,
+        default=Mode.INIT.value,
     )
     parser.add_argument(
         "--output-dir",

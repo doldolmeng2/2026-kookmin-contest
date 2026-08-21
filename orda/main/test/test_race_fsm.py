@@ -25,32 +25,37 @@ def cone_observation(timestamp, confidence=90, end_flag=False):
 
 def test_mode_set_matches_2026_skeleton():
     assert [(mode.name, mode.value) for mode in Mode] == [
-        ("WAIT_GREEN", "WAIT_GREEN"),
+        ("INIT", "INIT"),
+        ("WAIT_TRAFFIC", "WAIT_TRAFFIC"),
         ("LANE_DRIVE", "LANE_DRIVE"),
         ("CONE_DRIVE", "CONE_DRIVE"),
+        ("REJOIN", "REJOIN"),
         ("FIXED_AVOID", "FIXED_AVOID"),
         ("OVERTAKE", "OVERTAKE"),
         ("SHORTCUT", "SHORTCUT"),
         ("FINISH", "FINISH"),
+        ("STOP", "STOP"),
     ]
-    assert len(Mode) == 7
+    assert len(Mode) == 10
     assert "ROUTE_DECISION" not in Mode.__members__
-    assert Mode.WAIT_TRAFFIC is Mode.WAIT_GREEN
 
 
 def test_mode_values_are_exact_strings():
     assert [mode.value for mode in Mode] == [
-        "WAIT_GREEN",
+        "INIT",
+        "WAIT_TRAFFIC",
         "LANE_DRIVE",
         "CONE_DRIVE",
+        "REJOIN",
         "FIXED_AVOID",
         "OVERTAKE",
         "SHORTCUT",
         "FINISH",
+        "STOP",
     ]
 
 
-def test_wait_green_absorbs_startup_gate_and_waits_for_inputs():
+def test_init_waits_for_inputs_without_changing_entry_time():
     fsm = RaceFSM()
     context = RaceContext(state_entered_at=1.0)
 
@@ -61,12 +66,12 @@ def test_wait_green_absorbs_startup_gate_and_waits_for_inputs():
     )
 
     assert transition.changed is False
-    assert fsm.state is Mode.WAIT_GREEN
+    assert fsm.state is Mode.INIT
     assert context.state_entered_at == 1.0
     assert context.race_started_at is None
 
 
-def test_wait_green_ready_without_traffic_message_does_not_start_race():
+def test_init_ready_enters_wait_green_without_starting_race_clock():
     fsm = RaceFSM()
     context = RaceContext(state_entered_at=1.0)
 
@@ -76,71 +81,130 @@ def test_wait_green_ready_without_traffic_message_does_not_start_race():
         safe(),
     )
 
-    assert transition.changed is False
+    assert transition.changed is True
     assert transition.target is Mode.WAIT_GREEN
-    assert context.state_entered_at == 1.0
+    assert context.state_entered_at == 2.0
     assert context.race_started_at is None
 
 
-def test_one_fresh_stable_green_starts_race():
-    fsm = RaceFSM(initial_state=Mode.WAIT_GREEN)
+def test_green_requires_consecutive_frames_and_resets_on_gap():
+    fsm = RaceFSM(
+        initial_state=Mode.WAIT_GREEN,
+        green_min_consecutive_frames=3,
+    )
     context = RaceContext(state_entered_at=1.0)
+
+    for now in (2.0, 2.1):
+        transition = fsm.step(
+            MissionObservation(
+                now=now,
+                green_detected=True,
+                traffic_message_received_at=now,
+            ),
+            context,
+            safe(),
+        )
+        assert transition.changed is False
+        assert context.state_entered_at == 1.0
+
+    fsm.step(
+        MissionObservation(
+            now=2.2,
+            green_detected=False,
+            traffic_message_received_at=2.2,
+        ),
+        context,
+        safe(),
+    )
+
+    for now in (3.0, 3.1):
+        transition = fsm.step(
+            MissionObservation(
+                now=now,
+                green_detected=True,
+                traffic_message_received_at=now,
+            ),
+            context,
+            safe(),
+        )
+        assert transition.changed is False
 
     transition = fsm.step(
         MissionObservation(
-            now=2.05,
+            now=3.2,
             green_detected=True,
-            traffic_message_received_at=2.0,
+            traffic_message_received_at=3.2,
         ),
         context,
         safe(),
     )
 
     assert transition.target is Mode.LANE_DRIVE
-    assert transition.reason == "stable green signal"
-    assert context.state_entered_at == 2.05
-    assert context.race_started_at == 2.0
+    assert context.state_entered_at == 3.2
+    assert context.race_started_at == 3.0
 
 
-def test_fresh_stable_non_green_keeps_waiting():
-    fsm = RaceFSM(initial_state=Mode.WAIT_GREEN)
+def test_green_debounce_can_also_require_duration():
+    fsm = RaceFSM(
+        initial_state=Mode.WAIT_GREEN,
+        green_min_consecutive_frames=2,
+        green_min_duration_s=0.5,
+    )
     context = RaceContext(state_entered_at=1.0)
 
-    transition = fsm.step(
+    first = fsm.step(
         MissionObservation(
-            now=1.1,
-            green_detected=False,
-            traffic_message_received_at=1.1,
+            now=5.0,
+            green_detected=True,
+            traffic_message_received_at=5.0,
+        ),
+        context,
+        safe(),
+    )
+    second = fsm.step(
+        MissionObservation(
+            now=5.5,
+            green_detected=True,
+            traffic_message_received_at=5.5,
         ),
         context,
         safe(),
     )
 
-    assert transition.changed is False
-    assert transition.reason == "waiting for stable green"
-    assert context.race_started_at is None
+    assert first.changed is False
+    assert second.target is Mode.LANE_DRIVE
+    assert context.race_started_at == 5.0
 
 
-def test_pre_session_stable_green_is_rejected():
-    fsm = RaceFSM(initial_state=Mode.WAIT_GREEN)
+def test_race_clock_uses_first_fresh_green_receipt_not_debounce_commit_tick():
+    fsm = RaceFSM(
+        initial_state=Mode.WAIT_GREEN,
+        green_min_consecutive_frames=3,
+    )
     context = RaceContext(state_entered_at=9.0)
 
-    transition = fsm.step(
-        MissionObservation(
-            now=9.1,
-            green_detected=True,
-            traffic_message_received_at=8.9,
-        ),
-        context,
-        safe(),
+    samples = (
+        (10.05, 10.0),
+        (10.15, 10.1),
+        (10.25, 10.2),
     )
+    for now, received_at in samples:
+        transition = fsm.step(
+            MissionObservation(
+                now=now,
+                green_detected=True,
+                traffic_message_received_at=received_at,
+            ),
+            context,
+            safe(),
+        )
 
-    assert transition.changed is False
-    assert context.race_started_at is None
-    assert context.state_entered_at == 9.0
+    assert transition.target is Mode.LANE_DRIVE
+    assert context.race_started_at == 10.0
+    assert context.state_entered_at == 10.25
 
 
-def test_safety_hold_records_reason_without_state_transition():
+def test_safety_stop_records_reason_and_entry_time():
     fsm = RaceFSM(initial_state=Mode.LANE_DRIVE)
     context = RaceContext(state_entered_at=3.0)
     safety = SafetyDecision(
@@ -156,9 +220,8 @@ def test_safety_hold_records_reason_without_state_transition():
         safety,
     )
 
-    assert transition.target is Mode.LANE_DRIVE
-    assert transition.changed is False
-    assert context.state_entered_at == 3.0
+    assert transition.target is Mode.STOP
+    assert context.state_entered_at == 4.0
     assert context.stop_reason == safety.reason
 
 
@@ -416,9 +479,9 @@ def test_safety_stop_has_priority_over_cone_session_evidence(end_flag):
         safety,
     )
 
-    assert transition.target is Mode.CONE_DRIVE
+    assert transition.target is Mode.STOP
     assert transition.reason == "lidar fault"
-    assert context.state_entered_at == 1.0
+    assert context.state_entered_at == 1.2
     assert context.stop_reason == "lidar fault"
     assert fsm.cone_exit_armed is False
 
@@ -478,7 +541,7 @@ def test_cone_entry_latch_is_rearmed_after_direct_lane_return():
 
 @pytest.mark.parametrize(
     "mode",
-    [Mode.CONE_DRIVE, Mode.FIXED_AVOID, Mode.OVERTAKE],
+    [Mode.CONE_DRIVE, Mode.REJOIN, Mode.FIXED_AVOID, Mode.OVERTAKE],
 )
 def test_cone_entry_sequence_does_not_accumulate_outside_lane_drive(mode):
     fsm = RaceFSM(initial_state=mode)
@@ -519,7 +582,7 @@ def test_custom_cone_config_is_used_without_scattered_thresholds():
     assert transition.target is Mode.CONE_DRIVE
 
 
-@pytest.mark.parametrize("terminal", [Mode.FINISH, Mode.LANE_DRIVE])
+@pytest.mark.parametrize("terminal", [Mode.FINISH, Mode.STOP])
 def test_terminal_states_ignore_further_events_and_faults(terminal):
     fsm = RaceFSM(initial_state=terminal)
     context = RaceContext(state_entered_at=7.0)
@@ -537,7 +600,7 @@ def test_terminal_states_ignore_further_events_and_faults(terminal):
 
 @pytest.mark.parametrize(
     "state",
-    [Mode.LANE_DRIVE, Mode.CONE_DRIVE, Mode.FIXED_AVOID],
+    [Mode.LANE_DRIVE, Mode.CONE_DRIVE, Mode.REJOIN, Mode.FIXED_AVOID],
 )
 def test_legacy_unwired_mission_fields_do_not_invent_transitions(state):
     fsm = RaceFSM(initial_state=state)
@@ -548,6 +611,8 @@ def test_legacy_unwired_mission_fields_do_not_invent_transitions(state):
     )
     observation = MissionObservation(
         now=11.0,
+        lane_valid=True,
+        lane_valid_received_at=11.0,
         cone_detected=True,
         cone_finished=True,
         object_exists=True,
@@ -567,7 +632,8 @@ def test_legacy_unwired_mission_fields_do_not_invent_transitions(state):
     assert context.last_gate_event_at == 9.0
 
 
-def test_safety_hold_keeps_mode_and_fresh_input_has_no_recovery_delay():
+def test_stop_returns_to_the_mode_it_stopped_from_after_hold():
+    """센서가 회복되면 정지 직전 구간으로 복귀한다."""
     fsm = RaceFSM(initial_state=Mode.CONE_DRIVE)
     context = RaceContext(state_entered_at=0.0)
 
@@ -576,15 +642,19 @@ def test_safety_hold_keeps_mode_and_fresh_input_has_no_recovery_delay():
         context,
         SafetyDecision(must_stop=True, reason="stale required inputs: sensor:scan"),
     )
-    assert stop.target is Mode.CONE_DRIVE
+    assert stop.target is Mode.STOP
 
     healthy = SafetyDecision(must_stop=False, inputs_ready=True)
-    resumed = fsm.step(MissionObservation(now=1.1), context, healthy)
+    # 안정화 대기 시간(0.5s) 전에는 아직 복귀하지 않는다
+    assert fsm.step(MissionObservation(now=1.1), context, healthy).changed is False
+    assert fsm.step(MissionObservation(now=1.4), context, healthy).changed is False
+
+    resumed = fsm.step(MissionObservation(now=1.7), context, healthy)
     assert resumed.target is Mode.CONE_DRIVE
     assert context.stop_reason is None
 
 
-def test_missing_inputs_do_not_change_mode():
+def test_stop_does_not_recover_while_inputs_are_still_missing():
     fsm = RaceFSM(initial_state=Mode.LANE_DRIVE)
     context = RaceContext(state_entered_at=0.0)
     fsm.step(
@@ -596,10 +666,11 @@ def test_missing_inputs_do_not_change_mode():
     unhealthy = SafetyDecision(must_stop=False, inputs_ready=False)
     for now in (1.2, 2.0, 5.0):
         assert fsm.step(MissionObservation(now=now), context, unhealthy).changed is False
-    assert fsm.state is Mode.LANE_DRIVE
+    assert fsm.state is Mode.STOP
 
 
-def test_flapping_inputs_do_not_create_mission_transitions():
+def test_flapping_inputs_do_not_bounce_out_of_stop():
+    """입력이 깜빡이면 안정화 타이머가 다시 시작되어 진동하지 않는다."""
     fsm = RaceFSM(initial_state=Mode.LANE_DRIVE)
     context = RaceContext(state_entered_at=0.0)
     fsm.step(
@@ -614,7 +685,7 @@ def test_flapping_inputs_do_not_create_mission_transitions():
     fsm.step(MissionObservation(now=0.1), context, healthy)
     fsm.step(MissionObservation(now=0.3), context, unhealthy)   # 타이머 리셋
     assert fsm.step(MissionObservation(now=0.5), context, healthy).changed is False
-    assert fsm.state is Mode.LANE_DRIVE
+    assert fsm.state is Mode.STOP
 
 
 def test_finish_stays_terminal():

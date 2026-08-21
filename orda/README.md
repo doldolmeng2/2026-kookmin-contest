@@ -162,10 +162,8 @@ main/main/
 [인지]
   rubbercone_node
     sub: /scan
-    pub: /rubbercone_offset             (std_msgs/Int32MultiArray)        [PPT 공식]
-         [offset, end_flag]
-         /rubbercone_info               (std_msgs/Int32MultiArray)        [내부 상세]
-         [offset, end_flag, confidence, entry_ready]
+    pub: /rubbercone_info               (std_msgs/Int32MultiArray)        [유지]
+         [offset, end_flag, confidence]
          confidence: 경로 추정 신뢰도 (0~100)
 
   lane_node
@@ -177,20 +175,13 @@ main/main/
 
   object_yolo_node (Python, ONNX Runtime — object_detection 패키지)   [신규 구조, 2026-08-18]
     sub: /resized_image
-    pub: /object_yolo                   (std_msgs/Float32MultiArray, 20 필드) [내부]
-         /traffic_detection             (std_msgs/Int32)                  [내부]
-         [fixed 10필드 슬롯, moving 10필드 슬롯]
-         슬롯: [detected, object_type, confidence, box_size, box_cx, box_cy,
-                box_x, box_y, box_w, box_h]
-    train-10 detector가 같은 프레임의 신호등 candidate crop을 만들고,
-    light1 classifier가 0=green, 1=left, 2=orange, 3=red를 분류한다.
-    최종 mapping은 green→2, left→3, orange/red→1, 없음/불확실/오류→0이다.
-
-  road_surface_node
-    sub: /pidnet_class_map              (sensor_msgs/Image)
-    pub: /road_surface                  (std_msgs/Int32, 0/1/2)
-    PIDNet class 4/5 ratio와 최대 connected component를 parameterized ROI에서
-    판정한다. normal bag separation 전에는 threshold를 명시해야만 시작한다.
+    pub: /object_yolo                  (std_msgs/Float32MultiArray, 10 필드)
+         [detected, object_type, confidence, box_size, box_cx, box_cy,
+          box_x, box_y, box_w, box_h]
+         차량(red_car/green_car) 중 가장 가까운(면적 최대) 1개만.
+         /traffic_boxes                (std_msgs/Float32MultiArray, 6개씩 반복)
+         [class_id, confidence, x, y, w, h]
+         신호등 색상 클래스 검출 전부(프레임당 여러 개 가능).
 
   object_node (C++ — object_detection 패키지)
     sub: /scan, /resized_image, /lane_fit, /object_yolo, /traffic_boxes
@@ -201,7 +192,7 @@ main/main/
          방해차량 위치: 0=인식x  1=1차선  2=2차선
 
   ※ traffic_light 패키지(traffic_node)는 더 이상 launch 되지 않는다. 신호등 인식은
-    object_yolo_node(검출 + 크롭 분류) + object_node(우선순위 판정·디바운스)가 전담한다.
+    object_yolo_node(추론) + object_node(우선순위 판정·디바운스)가 전담한다.
     자세한 배경은 [인지 파이프라인 변경 이력](#인지perception-파이프라인-변경-이력) 참고.
 
 [제어]
@@ -217,28 +208,12 @@ main/main/
          [legacy_mode_code, lane]
 ```
 
-PPT 외 보조 인지는 `object_yolo_node`와 `road_surface_node`다. 별도
-`interface_adapter_node`는 만들지 않았다. `/object_info` 집계는 `object_node`가 직접,
-공식 모드와 lane detector 호환 명령의 분리는 `main_node`와 launch remap이 직접 맡는다.
-
 ### 인터페이스 변경 사유
 
 | 토픽 | 변경 내용 | 사유 |
 |---|---|---|
-| `/object_info` | `Int32MultiArray [신호등, 고정 객체 차선, 이동 객체 차선]` | Object Detection이 신호등·고정·이동 객체를 한 공식 메시지에서 동시에 표현 |
-| `/object_info_raw` | 기존 12필드 상세값 | Main의 거리·박스·분류 기반 판단을 보존하는 내부 이중 발행 |
-| `/rubbercone_offset` | `[offset, end_flag]` | PPT 공식 2필드 계약 |
-| `/rubbercone_info` | `[offset, end_flag, confidence, entry_ready]` | producer가 승인한 진입 edge를 보존하는 내부 이중 발행 |
-| `/mode_info` | `Int16`, 코드 `0..5` | PPT의 모드 인터페이스. `FINISH`/`STOP`은 팀 코드가 정해질 때까지 발행하지 않음 |
-| `/lane_info` | `Int16`, `1=1차선, 2=2차선, 3=중앙` | PPT의 차선 인터페이스 |
-| `/internal/lane_command` | `[legacy_lane_mode, internal_lane]` | 기존 lane detector의 배열 계약을 launch remap으로 격리하여 차선 알고리즘은 수정하지 않음 |
-| `/traffic_detection` | `Int32` 4상태 | same-frame detector crop classifier와 object_node 사이의 내부 결과 |
-| `/object_yolo` | 고정·이동 객체별 10필드 슬롯 | Python ONNX 결과를 C++ 차선 융합 노드로 전달 |
-| `/lane_fit` | `[m, b]` | 객체 박스를 1·2차선으로 분류하는 내부 회귀선 |
-| `/lane_change_state` | `[changing, success]` | FIXED/OVERTAKE 차선 변경 완료 피드백 |
-| `/lane_position` | `Int16` | 측면 LiDAR 완료 판단에 쓰는 자차 실측 차선 |
-| `/lane_valid` | `Bool` | lane detector가 계속 발행하지만 `REJOIN` 제거 후 Main은 구독하지 않음. 담당자 소스를 임의 수정하지 않아 남긴 레거시 출력 |
-| `/rubbercone_reset` | `Empty` | 한 라바콘 세션의 종료 래치를 새 진입 때 초기화 |
+| `/traffic_detection` | `Bool` → `Int32`(4상태) → **폐지, `/object_info[0]`으로 흡수 (2026-08-18)** | 신호등 인식을 `object_detection` 패키지로 통합하면서 별도 토픽 대신 `/object_info` 하나로 합침 |
+| `/object_info` | `Float32MultiArray` 12필드 → **`Int32MultiArray` 3필드 (2026-08-18)** | `[신호등, 고정차량 위치, 방해차량 위치]`만 최종 소비자(FSM)에 필요 — LiDAR 원시값(exists/거리/각도 등)은 더 이상 안 실음. **`main_node`는 아직 옛 계약을 구독 중이라 미반영** |
 | `/road_surface` | `Int32` 신설 (`0` 미확정, `1` 기본 검은 도로, `2` 흰 지름길) | 지름길을 실제로 본 뒤 기본 도로가 연속 인식될 때만 종료 |
 | `/mode_info` | 현재 `[legacy_mode_code, lane]` 유지 | 실제 소비자인 `lane_detection.cpp`가 아직 3=차선주행, 5=차선변경 계약을 사용한다. 4필드 신규 계약은 소비자 변경 전까지 발행하지 않는다. |
 
@@ -249,31 +224,20 @@ PPT 외 보조 인지는 `object_yolo_node`와 `road_surface_node`다. 별도
 > `Int32MultiArray` 의 인덱스 의미는 이 문서뿐 아니라 **코드 내 상수로도 정의한다.**
 > 문서에만 존재하는 인덱스 규약은 배선 실수의 주된 원인이 된다.
 
-#### Competition detector/classifier assets
-
-Production은 package share의 `model/train-10/best.onnx`와
-`model/classify/light1/weights/best.onnx`를 기본으로 사용하며 launch argument로만
-override한다. 두 파일의 class metadata가 고정 계약과 다르면 fail-fast한다. 저장소의
-기존 단일 클래스 `best.onnx`는 아래 legacy 자산이며 train-10 대체물로 사용하지 않는다.
-
-#### Legacy 고정장애물 YOLO 모델 (`best.onnx`)
+#### 통합 YOLO 모델 (`best.onnx` = `traffic_light/model/best_traffic.onnx`, 동일 파일)
 
 차량(고정장애물/방해차량)과 신호등을 **하나의 YOLO 모델**로 같이 검출한다.
 `object_detection/best.onnx`와 `traffic_light/model/best_traffic.onnx`는 md5까지
 동일한 파일이며, 두 인지 기능이 이 모델 하나를 공유한다.
 
-- 현재 포함 모델은 단일 클래스 `obstacle_car`, 입력 640 고정 → 출력 `(1, 5, 8400)`이다.
-  후처리는 Python ONNX Runtime으로 옮겼고 `(1,C,N)`/`(1,N,C)` 및 동적 클래스 수를
-  처리한다. 클래스 매핑은 `config/object_detection.yaml`의 정수 배열
-  `fixed_class_ids`와 `moving_class_ids`로 관리한다(예: `[0]`, `[1, 2]`).
-- Production YAML은 train-10 계약대로 `fixed_class_ids: [0]`,
-  `moving_class_ids: [1]`을 사용한다. 단일 클래스 legacy weight에는 적용하지 않는다.
-- 검증 성능 mAP50 0.995 / precision 0.999 / recall 1.000
-- 전처리는 **레터박스**(비율 유지 + 회색 114 패딩)를 쓴다. 640×360 원본을 640×640으로
-  늘리면 세로가 1.78배 왜곡되는데 YOLOv8 은 레터박스로 학습되므로 어긋난다.
-  검증용 bag 기준 conf ≥ 0.5 검출률이 82.3% → 98.1% 로 올랐다.
-- `conf_threshold_ = 0.50`. 검출 가능한 프레임의 99%를 잡고, 차량이 없는 프레임의
-  오검출은 conf 0.05 에서도 0이었다.
+**현재 배포(2026-08-18, `train-5`)**: 6클래스, 입력 640 고정 → 출력 `(1, 10, 8400)`.
+```
+0 red_car(고정장애물)   1 green_car(방해차량)
+2 green_light(직진)     3 left_green_light(좌회전)
+4 orange_light(주황)    5 red_light(빨강)
+```
+클래스 ID는 런치 파라미터(`fixed_class_ids`/`moving_class_ids`/`traffic_class_ids`,
+`object_yolo_node.py`)로 넘기므로 재학습해서 순서가 바뀌어도 코드 수정 없이 대응한다.
 
 **학습 이력**:
 
@@ -344,179 +308,12 @@ YOLOv8 ONNX를 `forward()`할 때 shape assertion으로 죽는** 고질적인 �
 **결정**: 신호등 인식을 `traffic_node`에서 떼어내 `object_yolo_node.py` +
 `object_node`로 흡수했다.
 - `object_yolo_node.py`가 같은 프레임 추론 결과에서 차량(`/object_yolo`, 가장 가까운
-  1개)과 신호등(`/traffic_boxes`)을 **같이** 발행한다 — 추론을 두 번 안 해도 된다.
+  1개)과 신호등(`/traffic_boxes`, 프레임당 여러 개)을 **같이** 발행한다 — 추론을
+  두 번 안 해도 된다.
 - `object_node`가 두 토픽을 받아 신호등 우선순위(좌회전>직진>정지)·디바운스와
   차량 차선 판정을 전부 계산해서 `/object_info` **하나**로 낸다.
 - `traffic_node`는 launch에서 뺐다(같이 띄우면 `/traffic_boxes`에 퍼블리셔가
   겹친다). 코드는 참고용으로 남아있다.
-
-#### 신호등 판정을 ROI 크롭 + 분류기 2단계로 (2026-08-19)
-
-> 이 절의 "크롭·분류를 C++ 로 옮겼다"는 부분은 아래 「크롭·분류를 다시
-> `object_yolo_node.py` 로」에서 되돌렸다. 2단계 구조와 전처리 규약 자체는 유효하다.
-
-**배경**: 검출기 하나로 신호등 위치와 색을 같이 맞히게 했더니, **위치는 맞고 색이
-틀리는** 패턴이 남았다 (홀드아웃: 박스 찾기 100%, 클래스 86.9%). 원인은 검출기가
-`green_light`와 `left_green_light`를 **박스 크기**로 가르고 있었다는 것 — 둘은 색이
-같아 화살표를 봐야 하는데, 폭 40px에서는 화살표가 몇 픽셀뿐이라 크기가 더 쉬운
-단서였다. 실제로 같은 신호등을 축소만 해도 `left_green_light` → `green_light`로
-판정이 뒤집혔고, 좌회전 recall이 0.66에 머물렀다.
-
-**결정**: 검출기는 '신호등이 여기 있다'는 **위치만** 쓰고, 무슨 신호인지는 박스를
-잘라(마진 15%) 64×64 정사각으로 늘려 넣는 별도 분류기(`light_cls.onnx`)가 정한다.
-크기를 고정하면 '멀면 작다'는 지름길 단서가 사라진다. 같은 val에서 좌회전 정확도
-0.94, 전체 0.983.
-
-- `object_detection/light_classifier.py` — 크롭·전처리·분류·디바운스. 전처리는 학습
-  크롭 생성(`tools/make_light_crops.py`)과 반드시 같아야 한다(정사각 stretch → RGB
-  → /255 → CHW).
-- `object_yolo_node.py`가 신호등 박스 중 가장 가까운 1개를 잘라 분류하고, 그 결과를
-  `/traffic_boxes`의 `class_id` 자리에 넣는다. **메시지 형식과 클래스 ID 규약은
-  종전 그대로**라서 `object_node`(C++)와 `/object_info` 3필드 계약은 손대지 않았다 —
-  판정 근거만 바뀌었다. 여러 박스를 그대로 내보내면 C++ 우선순위 판정이 검출기
-  클래스를 다시 보게 되어 크롭 분류가 무의미해지므로 1개만 낸다.
-- 분류기 모델이 없거나 `traffic_class_ids` 길이가 분류기 클래스 수와 다르면 경고만
-  남기고 **검출기 클래스를 그대로 내보내는 종전 동작**으로 돌아간다.
-- 관련 파라미터: `light_classifier_path`(빈 값이면 share의 `model/light_cls.onnx`),
-  `light_crop_margin`(0.15), `light_input_size`(64), `light_min_confidence`(0.90).
-  `traffic_class_ids`는 이제 **순서가 의미를 갖는다** — 분류기 출력 순서(green,
-  left_green, orange, red)와 1:1.
-
-**bag 검증 (traffic2~5, `/resized_image`만 재생, rate 0.25)**: 검출된 429프레임의
-크롭 분류 클래스 정확도 94%. 디바운스 후 `/object_info[0]` 오답은 traffic5(초록)에
-17프레임 남았는데, **연속 14프레임이라 디바운스로는 못 걸렀다**.
-
-**확신도 게이트 (`light_min_confidence`, 기본 0.90)**: 위 오답 구간을 뜯어보니
-원인이 분류기가 아니라 **검출기 박스**였다. 오답 프레임의 박스는 폭 200px에 높이
-18px(종횡비 10:1 이상)이고 `y≈0~2`로 화면 상단에 잘려 붙어 있었다 — 학습 크롭
-분포(약 4:1 하우징)를 완전히 벗어나서, 분류기가 늘려진 띠를 보고 찍은 셈이다.
-그래서 확신도가 정답과 깨끗하게 갈렸다:
-
-| | n | 최소 | 25%분위 | 중앙 | 최대 |
-|---|---|---|---|---|---|
-| 정답 | 403 | 0.338 | **0.998** | 1.000 | 1.000 |
-| 오답 | 26 | 0.462 | 0.565 | 0.663 | **0.889** |
-
-0.90 하나로 4개 bag 전체 오답 26 → 0 (남은 고확신 오답 2프레임은 연속되지 않아
-디바운스가 흡수). **첫 정답 판정 시점은 네 bag 모두 전혀 늦어지지 않았다.**
-게이트 탈락은 틀린 상태가 아니라 보류(`0`)로 나가는데, `WAIT_TRAFFIC`에서 `0`은
-"계속 대기"라 안전한 방향이다. 종횡비 게이트(2~8:1)도 시도했으나 오답 감소는
-같으면서 정답을 더 많이 버려서(403→370 vs 381) 채택하지 않았다.
-
-#### 크롭·분류를 다시 `object_yolo_node.py` 로 (2026-08-19, 위 C++ 이전을 되돌림)
-
-**증상**: `rosbag2_2026_08_13-13_33_23` 에서 **초록 신호등에 근접해 하우징이 화면 위로
-빠져나가는 구간에, 분류기가 `orange` 를 0.9 이상으로 확신**했다. `orange` 는
-`traffic_raw=1`(정지)이라 초록불 바로 아래에서 정지 판정이 나간다.
-
-**원인은 분류기가 아니라 크롭 원본 프레임이었다.** `classifyLight()` 는 `/traffic_boxes`
-로 받은 박스를 자기가 들고 있는 `last_raw_img_`(= 가장 최근에 도착한 프레임)에서
-잘랐는데, 그건 그 박스를 만든 프레임이 아니다. 검출기 forward 가 CPU 에서 **73.6 ms**
-(30fps 기준 2~3프레임)이고, 접근 말미의 박스 이동량은 **평균 4~6 px/frame, 최대
-20 px/frame** 인데 그때 박스 높이는 이미 10~25 px 다. 즉 몇 프레임만 밀려도 크롭이
-램프 줄을 통째로 비껴간다. 같은 bag 의 검출 268개에 인위적으로 lag 를 넣어 재현:
-
-| lag | orange 판정 | orange ≥0.90 | orange 최대 |
-|---|---|---|---|
-| 0 (같은 프레임) | 4 | **0** | 0.614 |
-| 3 | 32 | 4 | 0.989 |
-| 6 | 67 | 9 | 0.996 |
-| 8 | 103 | 26 | 0.999 |
-
-`red` 로는 한 번도 안 간다. **분류기에 background 클래스가 없어서** 램프가 안 잡힌
-크롭도 4개 중 하나를 뱉어야 하는데, 그 fallback 이 `orange` 다 — 평평한 패치
-(black/gray114/어두운 하우징)를 넣어도 전부 `orange` 가 argmax 로 나온다.
-
-**결정**: 크롭·분류를 `object_yolo_node.py` 의 `on_image()` 안으로 되돌렸다. 검출에 쓴
-`image` 배열을 그대로 자르므로 프레임 어긋남이 **구조적으로** 생길 수 없다(타임스탬프
-매칭이나 링버퍼가 필요 없다). `light_cls.onnx` 는 크롭당 **1.03 ms** 라 73.6 ms 짜리
-검출기 옆에서 비용이 무시된다.
-
-- `/traffic_boxes` 형식(6개씩 `[class_id, confidence, x, y, w, h]`)은 **그대로**다.
-  `class_id`/`confidence` 자리에 이제 **분류기** 인덱스(0=green 1=left_green 2=orange
-  3=red)와 그 확신도가 들어간다.
-- 박스는 **전부** 내보낸다. 예전 Python 구현이 1개만 낸 이유(C++ 우선순위 판정이
-  검출기 클래스를 다시 보게 됨)가 사라졌고, 좌회전 화살표는 초록 원과 같이 켜지는
-  경우가 많아 여러 박스를 한꺼번에 봐야 한다.
-- **`object_node` 의 `light_net_`/`classifyLight()` 는 남겨 뒀다.** `class_id` 가
-  0~3 밖이면(= Python 쪽이 분류기를 못 띄웠으면) 예전처럼 여기서 직접 자르는 폴백으로
-  간다. 폴백은 위 프레임 어긋남 한계를 그대로 갖는다.
-- 우선순위(좌회전>직진>정지)·디바운스·확신도 게이트는 계속 `object_node` 가 한다.
-  `/object_info` 3필드 계약은 안 바뀐다.
-
-**기하 게이트 (`light_max_aspect` 8.0, `light_edge_min_h` 20)**: 확신도 게이트로는 못
-거르는 두 번째 경로가 있다. 신호등이 화면 위로 빠지면 검출 박스가 보이는 띠만 잡아서
-`203x48 → 226x25 → 240x14`, 종횡비 **4:1 → 17:1** 로 무너진다. 이걸 64×64 정사각으로
-늘리면 학습 크롭 분포(약 4:1 하우징) 밖이다. 같은 프레임에서도 확신도가
-`0.99 → 0.48` 로 붕괴하고 `orange` 가 이기기 시작한다.
-
-같은 bag 의 신호등 검출 391개 기준으로 임계값을 골랐다:
-
-| 종횡비 | n | 오답 | 확신도<0.90 |
-|---|---|---|---|
-| ~5 | 268 | 0 | 12 |
-| 5~8 | 91 | 0 | 4 |
-| 8~10 | 11 | 1 | **11 (전부)** |
-| 10~ | 21 | 4 | **21 (전부)** |
-
-종횡비 8 초과 박스는 **전부 이미 확신도 게이트 아래**라, 상한 8:1 을 걸어도 증거로
-쓰이던 박스 343개를 **하나도 잃지 않는다**. 높이는 단독으로 자르지 않는다 — 멀리 있는
-신호등은 `h` 가 10px 대여도 정상이고(같은 bag 에서 `h<12` 인 24개가 전부 정답), 문제는
-"화면 최상단(`y<=1`)에 붙어 있으면서 납작한" 조합뿐이라 그 교집합에만 `h>=20` 을
-요구한다. 예전에 기각했던 종횡비 게이트는 하한(2:1)까지 있어서 정답을 버렸는데, 여기는
-**상한만** 둔다.
-
-**검증 (같은 bag, 접근 구간 384프레임 전수, 디바운스 3 포함)**:
-
-| | 증거 박스 | 그중 오답 | `/object_info[0]==1`(정지) 프레임 |
-|---|---|---|---|
-| 수정 전 (lag=6) | 119 | 9 | **8** |
-| 수정 전 (lag=8) | 99 | 26 | **18** |
-| 수정 후 (같은 프레임 + 기하 게이트) | **232** | **0** | **0** |
-
-증거 박스 232개는 lag=0 무게이트 기준선과 **정확히 같다** — 게이트가 정답을 하나도
-버리지 않았다. 디바운스는 lag=3 까지만 흡수하고 lag=6 부터 뚫린다.
-
-**남은 한계**: 기하 게이트 하나만으로는 lag 실패 모드를 못 잡는다(lag=3 에서
-오답 4 → 4 그대로). 그건 크롭을 같은 프레임으로 되돌린 쪽이 잡는다 — 두 수정은
-서로 다른 경로를 막으므로 하나만 넣으면 안 된다.
-
-**background 클래스 재학습은 아직 안 했다.** 두 수정을 다 넣은 뒤 이 bag 으로 다시
-재보면, 게이트를 통과한 신호등 박스 **240개가 전부 정답**(중앙 확신도 0.999)이고
-`orange`/`red` 오답은 0이다 — 실차에 "신호등이 꺼져 있는 경우"가 없다는 점과 별개로,
-지금 상태에서 4개 클래스 중 하나를 억지로 골라야 하는 상황 자체가 이 bag 에는 거의
-없다는 뜻이다. 그래서 지금 당장 급한 작업은 아니다.
-
-다만 이유는 "꺼진 신호등"이 아니라 **크롭에 램프 줄이 안 들어오는 모든 경우**다 — 불이
-켜져 있어도 크롭이 하우징 테두리·차양·전선만 담으면 같은 상황이 된다(수정 전 8129~8134
-프레임이 그 예). 그리고 이걸 진짜로 유발할 수 있는 경로가 하나 남아 있다: **검출기가
-신호등이 아닌 걸 신호등으로 오검출하는 경우**다. 이 bag 은 신호등 검출 391개가 전부
-진짜 신호등이라 오검출이 0인데, 프레임 하단(도로·차량·배경)에서 게이트를 통과하는
-모양(종횡비 3~6:1)으로 임의 크롭 576개를 만들어 넣어보면:
-
-| | 결과 |
-|---|---|
-| argmax 분포 | green 258 · orange 250 · left_green 37 · red 31 |
-| 확신도 ≥0.90 로 뚫린 것 | **71개 (12.3%)**, 최대 0.9998 |
-
-즉 **램프 없는 크롭의 12%가 확신도 게이트를 그냥 통과한다** — 모양은 정상, 확신도는
-0.99라 기하 게이트도 확신도 게이트도 못 막는다. 막을 수 있는 건 background 클래스뿐.
-이 경로가 실제로 터지는지는 검출기가 다른 코스·조명에서 신호등 오검출을 내는지에
-달려 있다. **우선순위: 다른 코스에서 신호등 오검출이 관측되면 background 클래스
-재학습이 1순위로 올라간다.** 재학습 데이터는 이미 있다 — 이 bag 의 lag 크롭(램프 없는
-하우징)과 위 임의 크롭이 그대로 hard negative 후보라 새로 촬영할 필요는 없다.
-
-**폴백 상태 감지 (2026-08-19)**: `class_id` 가 -1(Python 쪽 `light_cls.onnx` 미로드)로
-와서 `object_node` 가 `classifyLight()` 폴백을 타면, `/object_yolo`·`/traffic_boxes` 는
-계속 정상 발행되기 때문에 겉보기엔 시스템이 멀쩡해 보인다 — 위 프레임 어긋남 버그가
-소리 없이 되살아나 있는 상태를 아무도 못 알아채는 게 진짜 위험이다. 그래서 이 상태를
-계속 알리는 장치를 넣었다:
-- `object_yolo_node.py`: 분류기를 못 띄웠으면 5초 타이머로 `WARN`을 반복한다(시작 시점
-  로그 한 줄은 스크롤로 사라지므로, 나중에 붙어서 로그를 보는 사람도 알 수 있어야 한다).
-  크롭·추론 자체가 매 프레임 실패하는 경우의 에러 로그도 5초로 묶었다(`throttle_duration_sec`).
-- `object_node`(C++): `onTrafficBoxes()`가 폴백을 탈 때마다 5초 묶음
-  `RCLCPP_WARN_THROTTLE`을 낸다. 폴백조차 안 되면(`light_ok_=false`, 신호등 인식이
-  완전히 죽은 상태) `RCLCPP_ERROR_THROTTLE`로 더 크게 알린다.
 
 **모델 클래스 변천**: `train-3`(7클래스, `4-traffic` 몸체 포함) → `train-4`(같은
 7클래스, 재학습) → `train-5`(6클래스, `4-traffic` 제거 — **현재 배포**). 클래스가

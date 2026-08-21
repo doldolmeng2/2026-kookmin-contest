@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from main.control_selector import ControlSource
-from main.mission_types import LaneTarget, ObjectLane, RouteTrafficSignal
+from main.mission_types import LaneTarget, RouteTrafficSignal
 from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
@@ -18,7 +18,7 @@ BAG_TEST_LAUNCH = ORDA_ROOT / "main" / "launch" / "module_drive_bag_test.py"
 PRODUCTION_LAUNCH = ORDA_ROOT / "main" / "launch" / "module_drive.py"
 
 PROFILE_MODES = {
-    "wait_green": Mode.WAIT_GREEN,
+    "wait_traffic": Mode.WAIT_TRAFFIC,
     "lane": Mode.LANE_DRIVE,
     "lane_one": Mode.LANE_DRIVE,
     "lane_two": Mode.LANE_DRIVE,
@@ -50,12 +50,8 @@ COMPLETION_PROFILES = [
 ]
 
 
-def object_message(lane):
-    return [1.0, 1.2, 0.1, 0.2, 5.0, 100.0, 20.0, 30.0, 4.0, lane.value]
-
-
 def test_race_profile_is_a_noop_and_preserves_normal_startup_contract():
-    fsm = RaceFSM(initial_state=Mode.WAIT_GREEN)
+    fsm = RaceFSM(initial_state=Mode.INIT)
     context = RaceContext()
     runtime = RaceRuntimeAdapter(fsm=fsm, context=context)
 
@@ -63,13 +59,9 @@ def test_race_profile_is_a_noop_and_preserves_normal_startup_contract():
 
     assert runtime.fsm is fsm
     assert runtime.context is context
-    assert runtime.fsm.state is Mode.WAIT_GREEN
+    assert runtime.fsm.state is Mode.INIT
     assert runtime.context.state_entered_at is None
-    assert runtime.step(10.0).transition.changed is False
-
-
-def test_old_wait_traffic_profile_name_is_only_an_input_alias():
-    assert parse_test_profile("wait_traffic") is MissionTestProfile.WAIT_GREEN
+    assert runtime.step(10.0).transition.target is Mode.WAIT_GREEN
 
 
 @pytest.mark.parametrize("profile", list(PROFILE_MODES))
@@ -85,46 +77,6 @@ def test_each_named_profile_starts_in_exact_existing_mode(profile):
         "lane_two": LaneTarget.LANE_TWO,
     }.get(profile, LaneTarget.CENTER)
     assert runtime.context.lane_target is expected_lane
-
-
-@pytest.mark.parametrize(
-    ("profile", "first_lane", "expected_target", "opposite_lane"),
-    [
-        ("fixed", ObjectLane.LEFT, LaneTarget.LANE_TWO, ObjectLane.RIGHT),
-        ("overtake", ObjectLane.RIGHT, LaneTarget.LANE_ONE, ObjectLane.LEFT),
-    ],
-)
-def test_direct_object_profile_locks_the_first_fresh_known_lane(
-    profile,
-    first_lane,
-    expected_target,
-    opposite_lane,
-):
-    runtime = RaceRuntimeAdapter()
-    runtime.bootstrap_test_profile(profile, started_at=10.0)
-
-    assert runtime.record_object_info(object_message(ObjectLane.UNKNOWN), 10.1).accepted
-    runtime.step(10.1)
-    assert runtime.lane_action.target_locked is False
-    assert runtime.lane_action.target is None
-    assert runtime.context.lane_target is LaneTarget.CENTER
-
-    assert runtime.record_object_info(object_message(first_lane), 10.2).accepted
-    runtime.step(10.2)
-    started_at = runtime.lane_action.started_at
-    assert runtime.lane_action.target_locked is True
-    assert runtime.lane_action.target is expected_target
-    assert runtime.context.lane_target is expected_target
-    assert runtime.lane_action.pending is True
-
-    assert runtime.record_object_info(object_message(opposite_lane), 10.3).accepted
-    runtime.step(10.3)
-    assert runtime.lane_action.target_locked is True
-    assert runtime.lane_action.target is expected_target
-    assert runtime.context.lane_target is expected_target
-    assert runtime.lane_action.pending is True
-    assert runtime.lane_action.completed is False
-    assert runtime.lane_action.started_at == started_at
 
 
 def test_shortcut_profile_bootstraps_self_consistent_lap_context():
@@ -176,6 +128,7 @@ def test_bootstrap_discards_cached_sensor_perception_and_action_state():
     runtime.record_scan(9.0)
     runtime.record_lane_offset(4, 9.0)
     runtime.record_cone_message([5, 0, 90], 9.0)
+    runtime.record_lane_validity(True, 9.0)
     runtime.record_traffic(True, 9.0)
     runtime.record_route_traffic(
         RouteTrafficSignal.LEFT,
@@ -191,6 +144,7 @@ def test_bootstrap_discards_cached_sensor_perception_and_action_state():
     assert cycle.observation.sensor_received_at == {}
     assert cycle.observation.perception_received_at == {}
     assert cycle.observation.cone_message_received_at is None
+    assert cycle.observation.lane_valid_received_at is None
     assert cycle.observation.traffic_message_received_at is None
     assert cycle.observation.route_traffic_received_at is None
     assert cycle.observation.lane_change_received_at is None
@@ -229,8 +183,8 @@ def test_profile_start_does_not_weaken_safety_stop_priority():
 
     cycle = runtime.step(10.1, fault_reason="synthetic profile fault")
 
-    assert cycle.transition.target is Mode.FIXED_AVOID
-    assert cycle.control.source is ControlSource.HOLD
+    assert cycle.transition.target is Mode.STOP
+    assert cycle.control.source is ControlSource.STOP
     assert runtime.context.stop_reason == "external fault: synthetic profile fault"
 
 
@@ -248,14 +202,9 @@ def test_bag_launch_exposes_profile_without_weakening_motor_isolation():
     production_source = PRODUCTION_LAUNCH.read_text(encoding="utf-8")
 
     assert "DeclareLaunchArgument(\n        'test_profile'" in bag_source
-    assert "default_value='2'" in bag_source
-    assert "test_profile = LaunchConfiguration('test_profile')" in bag_source
-    assert "from launch_ros.parameter_descriptions import ParameterValue" in bag_source
-    assert "'test_profile': ParameterValue(test_profile, value_type=str)" in bag_source
-    assert "test_profile_arg," in bag_source
-    assert "('xycar_motor', '/kmu_main_offline/xycar_motor')" in bag_source
-    assert "'live_drive', default_value='false'" in bag_source
-    assert "'udp_motor_bridge', default_value='false'" in bag_source
+    assert "default_value='0'" in bag_source
+    assert "'test_profile': test_profile" in bag_source
+    assert "('xycar_motor', '/bag_test/xycar_motor')" in bag_source
     assert "test_profile" not in production_source
 
 

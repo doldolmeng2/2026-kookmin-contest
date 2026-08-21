@@ -22,11 +22,6 @@ find_package(std_srvs REQUIRED)
 
 ############## YDLIDAR SDK START#####################################
 #find ydlidar_sdk package
-# Not installed via apt; defaults to the vendored SDK build under
-# third_party/ when the caller doesn't pass -Dydlidar_sdk_DIR explicitly.
-if(NOT ydlidar_sdk_DIR)
-  set(ydlidar_sdk_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/ydlidar_sdk_install/lib/cmake/ydlidar_sdk")
-endif()
 find_package(ydlidar_sdk REQUIRED)
 
 # Some bundled YDLidar SDK releases export the library name but leave

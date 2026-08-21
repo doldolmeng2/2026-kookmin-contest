@@ -61,14 +61,14 @@ def test_state_specific_stale_reason_contains_input_name():
 def test_motion_disabled_is_not_itself_a_fault():
     monitor = SafetyMonitor(
         {
-            Mode.WAIT_GREEN: (
+            Mode.INIT: (
                 InputRequirement(InputCategory.SENSOR, "lidar"),
             )
         }
     )
 
     decision = monitor.evaluate(
-        Mode.WAIT_GREEN,
+        Mode.INIT,
         RaceContext(),
         MissionObservation(now=1.0),
         motion_enabled=False,

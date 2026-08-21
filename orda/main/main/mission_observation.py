@@ -25,13 +25,12 @@ class MissionObservation:
 
     green_detected: bool = False
     traffic_message_received_at: Optional[float] = None
+    lane_valid: bool = False
+    lane_valid_received_at: Optional[float] = None
     cone_detected: bool = False
     cone_finished: bool = False
     cone_confidence: Optional[int] = None
     cone_end_flag: Optional[bool] = None
-    # ``None`` is the explicit three-field legacy replay contract.  Live
-    # four-field perception publishes a final semantic approval as bool.
-    cone_entry_ready: Optional[bool] = None
     cone_message_received_at: Optional[float] = None
     scan_received_at: Optional[float] = None
     object_exists: bool = False
@@ -50,6 +49,10 @@ class MissionObservation:
     fixed_zone_entry_received_at: Optional[float] = None
     fixed_zone_exited: bool = False
     fixed_zone_exit_received_at: Optional[float] = None
+    # Deprecated pre-merge seam. Production uses fixed_zone_exited; retained
+    # only so old bags/tests fail closed instead of failing deserialization.
+    fixed_avoid_complete: bool = False
+    fixed_avoid_completed_at: Optional[float] = None
     overtake_entered: bool = False
     overtake_entry_received_at: Optional[float] = None
     route_traffic_signal: RouteTrafficSignal = RouteTrafficSignal.UNKNOWN

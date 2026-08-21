@@ -164,20 +164,6 @@ def test_reset_and_enter_zone_clear_state():
     assert g.zone_elapsed(6.0) is None
 
 
-def test_invalidate_clearance_preserves_seen_and_zone_state():
-    g = guard()
-    g.enter_zone(now=0.0)
-    g.update_zone(now=0.1, lane_target=1, side_left=INF, side_right=CAR_SIDE_M)
-    g.update_zone(now=0.2, lane_target=1, side_left=INF, side_right=INF)
-
-    g.invalidate_clearance()
-
-    assert g.clear_started_at is None
-    assert g.side_seen_at == pytest.approx(0.1)
-    assert g.side_seen_distance == pytest.approx(CAR_SIDE_M)
-    assert g.zone_entered_at == pytest.approx(0.0)
-
-
 def test_center_lane_has_no_side_to_watch():
     """중앙(0) 주행 중에는 감시할 반대편이 정해지지 않는다."""
     g = guard()
@@ -185,3 +171,46 @@ def test_center_lane_has_no_side_to_watch():
     assert g.update_zone(
         now=0.1, lane_target=0, side_left=0.1, side_right=0.1
     ).side_just_seen is False
+
+
+# ── 측면 거리 계산 (순수 함수) ───────────────────────────────────────────────
+
+
+def _scan(pairs, *, n=360):
+    """(각도[도], 거리[m]) 목록으로 LaserScan 의 ranges 배열을 만든다."""
+    import math as _m
+    ranges = [float("inf")] * n
+    for deg, dist in pairs:
+        ranges[int((deg + 180.0) % 360.0)] = dist
+    return ranges, _m.radians(-180.0), _m.radians(1.0)
+
+
+def test_side_clearance_splits_left_and_right():
+    from main.overtake import side_clearance
+
+    ranges, a_min, a_inc = _scan([(90, 0.42), (-90, 0.85)])
+    left, right = side_clearance(ranges, a_min, a_inc, 0.1, 16.0)
+
+    assert left == pytest.approx(0.42)
+    assert right == pytest.approx(0.85)
+
+
+def test_side_clearance_ignores_own_body_behind_the_sector():
+    """|각도| > 105도는 자기 차체라 무시해야 한다 (bag 실측 0.10~0.14 m)."""
+    from main.overtake import side_clearance
+
+    ranges, a_min, a_inc = _scan([(130, 0.12), (-130, 0.11)])
+    left, right = side_clearance(ranges, a_min, a_inc, 0.1, 16.0)
+
+    assert left == INF
+    assert right == INF
+
+
+def test_side_clearance_ignores_walls_beyond_max_range():
+    from main.overtake import side_clearance
+
+    ranges, a_min, a_inc = _scan([(90, 1.40), (-90, 1.60)])
+    left, right = side_clearance(ranges, a_min, a_inc, 0.1, 16.0)
+
+    assert left == pytest.approx(1.40)   # 1.5m 이내는 인정
+    assert right == INF                  # 1.5m 초과는 벽으로 보고 무시
