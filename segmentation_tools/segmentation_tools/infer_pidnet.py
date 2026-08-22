@@ -21,9 +21,12 @@ from .pidnet import PIDNet
 from .core import (
     CENTER_LANE_MIN_SUPPORT_RATIO,
     CENTER_LANE_SUPPORT_RADIUS,
+    RAIL_MIN_SUPPORT_RATIO,
+    RAIL_SUPPORT_RADIUS,
     ROAD_CLASS,
     SHORTCUT_CLASS,
     filter_center_lane_off_surface,
+    filter_rails_off_surface,
     label_roi_top,
 )
 
@@ -117,6 +120,8 @@ class PIDNetRunner:
     def __init__(self, model_path, device='auto', width=640, height=360, lane_classes=(1, 2, 3),
                  center_lane_support_radius=CENTER_LANE_SUPPORT_RADIUS,
                  center_lane_min_support_ratio=CENTER_LANE_MIN_SUPPORT_RATIO,
+                 rail_support_radius=RAIL_SUPPORT_RADIUS,
+                 rail_min_support_ratio=RAIL_MIN_SUPPORT_RATIO,
                  use_cuda_graph=True):
         path=Path(model_path).expanduser().resolve()
         if not path.is_file(): raise FileNotFoundError(f'PIDNet checkpoint not found: {path}')
@@ -124,6 +129,8 @@ class PIDNetRunner:
         self.device=torch.device(name); self.width=int(width); self.height=int(height); self.lane_classes=tuple(int(x) for x in lane_classes)
         self.center_lane_support_radius=int(center_lane_support_radius)
         self.center_lane_min_support_ratio=float(center_lane_min_support_ratio)
+        self.rail_support_radius=int(rail_support_radius)
+        self.rail_min_support_ratio=float(rail_min_support_ratio)
         self.preferred_surface=None
         checkpoint=torch.load(path,map_location=self.device,weights_only=False); config=checkpoint.get('config',{}); classes=int(config.get('classes',6))
         # 체크포인트에는 보조 헤드(seghead_p/seghead_d) 가중치가 들어 있으므로
@@ -135,6 +142,7 @@ class PIDNetRunner:
         self.mean=np.array([.485,.456,.406],np.float32); self.std=np.array([.229,.224,.225],np.float32)
         self.checkpoint=path; self.best_epoch=checkpoint.get('epoch'); self.classes=classes
         self.last_center_lane_removed_px=0
+        self.last_rail_removed_px=0
         self.graph=None
         if self.device.type=='cuda':
             torch.backends.cudnn.benchmark=True
@@ -198,6 +206,15 @@ class PIDNetRunner:
             min_support_ratio=self.center_lane_min_support_ratio,
             preferred_surface=self.preferred_surface,
         )
+        # 바깥 실선도 같은 근거로 거른다. 가드레일이 이 두 클래스를 필터 없이
+        # 읽어 좌·우 여유를 min 으로 합치기 때문에, 트랙 밖 오검출 하나가
+        # 반대쪽 여유까지 줄여 조향을 엉뚱하게 민다. 임계값은 중앙선보다 훨씬
+        # 낮다 — 실선은 바깥쪽이 정당하게 background 다(core.py 주석 참고).
+        labels,self.last_rail_removed_px=filter_rails_off_surface(
+            labels,
+            radius=self.rail_support_radius,
+            min_support_ratio=self.rail_min_support_ratio,
+        )
         mask=np.isin(labels,self.lane_classes).astype(np.uint8)*255
         return labels,mask
 
@@ -227,11 +244,20 @@ class PIDNetInferenceNode(Node):
             'center_lane_support_radius',CENTER_LANE_SUPPORT_RADIUS).value
         support_ratio=self.declare_parameter(
             'center_lane_min_support_ratio',CENTER_LANE_MIN_SUPPORT_RATIO).value
+        # 바깥 실선도 같은 검증을 받는다. 임계값만 다르다 — 실선은 바깥쪽이
+        # 정당하게 background 라 중앙선의 0.5 를 그대로 쓰면 진짜를 지운다.
+        # radius<=0 또는 ratio<=0 이면 레일 검증만 꺼진다(중앙선은 그대로).
+        rail_radius=self.declare_parameter(
+            'rail_support_radius',RAIL_SUPPORT_RADIUS).value
+        rail_ratio=self.declare_parameter(
+            'rail_min_support_ratio',RAIL_MIN_SUPPORT_RATIO).value
         warmup_on_start=bool(self.declare_parameter('warmup_on_start',True).value)
         self.runner=PIDNetRunner(
             model_path,device,width,height,lane_classes,
             center_lane_support_radius=support_radius,
-            center_lane_min_support_ratio=support_ratio)
+            center_lane_min_support_ratio=support_ratio,
+            rail_support_radius=rail_radius,
+            rail_min_support_ratio=rail_ratio)
         if warmup_on_start:
             try:
                 elapsed_ms=warmup_runner(self.runner)
@@ -255,6 +281,7 @@ class PIDNetInferenceNode(Node):
         )
         self.bridge=CvBridge(); self.frames=0; self.total_time=0.; self.window_time=0.
         self.center_lane_removed_px=0
+        self.rail_removed_px=0
         self.roi_top=label_roi_top(int(height))
         image_qos=latest_frame_qos()
         self.mask_pub=self.create_publisher(Image,mask_topic,image_qos)
@@ -271,7 +298,7 @@ class PIDNetInferenceNode(Node):
             self.window_title=title
             cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
             cv2.setWindowTitle(self.window_name, title)
-        self.get_logger().info(f'PIDNet-S loaded: {self.runner.checkpoint} epoch={self.runner.best_epoch} device={self.runner.device} lane_classes={self.runner.lane_classes} center_lane_support_radius={self.runner.center_lane_support_radius} center_lane_min_support_ratio={self.runner.center_lane_min_support_ratio} roi_crop_visualization={self.roi_crop_visualization} roi_top={self.roi_top}')
+        self.get_logger().info(f'PIDNet-S loaded: {self.runner.checkpoint} epoch={self.runner.best_epoch} device={self.runner.device} lane_classes={self.runner.lane_classes} center_lane_support_radius={self.runner.center_lane_support_radius} center_lane_min_support_ratio={self.runner.center_lane_min_support_ratio} rail_support_radius={self.runner.rail_support_radius} rail_min_support_ratio={self.runner.rail_min_support_ratio} roi_crop_visualization={self.roi_crop_visualization} roi_top={self.roi_top}')
 
     def mode_callback(self,msg):
         surface=PREFERRED_SURFACE_BY_MODE.get(int(msg.data))
@@ -316,12 +343,14 @@ class PIDNetInferenceNode(Node):
         elapsed=time.perf_counter()-started
         self.frames+=1; self.total_time+=elapsed; self.window_time+=elapsed
         self.center_lane_removed_px+=self.runner.last_center_lane_removed_px
+        self.rail_removed_px+=self.runner.last_rail_removed_px
         if self.frames%100==0:
             self.get_logger().info(
                 f'inference last100={10*self.window_time:.1f} ms '
                 f'({100/max(self.window_time,1e-9):.1f} Hz) '
                 f'lifetime={1000*self.total_time/self.frames:.1f} ms ({self.frames} frames) '
-                f'center_lane_off_surface_removed_px={self.center_lane_removed_px}'
+                f'center_lane_off_surface_removed_px={self.center_lane_removed_px} '
+                f'rail_off_surface_removed_px={self.rail_removed_px}'
             )
             self.window_time=0.
 

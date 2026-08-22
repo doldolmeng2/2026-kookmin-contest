@@ -20,6 +20,8 @@
 //       /mode_info     (std_msgs/Int32MultiArray, [mode, lane])
 // 발행: /lane_offset       (std_msgs/Int16, 픽셀 단위 오프셋)
 //       /lane_fit           (std_msgs/Float32MultiArray, [m, b])
+//       /lane_path_preview  (Float32MultiArray,
+//                            [먼 offset, 곡률, 신뢰도, y비율, source offset])
 //       /lane_change_state  (std_msgs/Int32MultiArray, [변경중, 성공여부])
 //       /lane_guardrail     (std_msgs/Float32MultiArray, [좌 여유, 우 여유] BEV px)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -58,6 +60,7 @@
 #include "lane_detection/lane_guardrail.hpp"
 #include "lane_detection/lane_measurement_publication_policy.hpp"
 #include "lane_detection/lane_pipeline_diagnostics.hpp"
+#include "lane_detection/path_preview.hpp"
 #include "lane_detection/reacquire_histogram.hpp"
 #include "parameter_loader.hpp"
 
@@ -97,6 +100,7 @@ public:
     roi_bottom_y_(static_cast<int>(frame_height_ * config_.roi_bottom_y_coefficient)),
     center_reference_lane_one_(config_.center_reference_lane_one),
     center_reference_lane_two_(config_.center_reference_lane_two),
+    center_reference_center_(config_.center_reference_center),
     lane_change_tracker_(config_.lane_change_tol_straight,
       config_.lane_change_tol_curve,
       config_.lane_change_tol_change,
@@ -148,6 +152,20 @@ public:
       this->declare_parameter<double>("guardrail_band_top_ratio", 0.60));
     rail_config_.band_bottom_ratio = static_cast<float>(
       this->declare_parameter<double>("guardrail_band_bottom_ratio", 0.95));
+
+    // 먼 차선 경로 미리보기. 기존 /lane_offset은 손대지 않고, 슬라이딩 윈도우
+    // 중심점을 정규화 2차식으로 별도 피팅해 /lane_path_preview로 발행한다.
+    // main_node가 기능 플래그를 끄거나 이 신뢰도가 낮으면 기존 제어로 폴백한다.
+    path_preview_target_y_ratio_ = static_cast<float>(std::clamp(
+      this->declare_parameter<double>("path_preview_target_y_ratio", 0.25),
+      0.0, 1.0));
+    path_preview_min_points_ = static_cast<std::size_t>(std::max<int64_t>(
+      3, this->declare_parameter<int64_t>("path_preview_min_windows", 7)));
+    path_preview_min_span_ratio_ = static_cast<float>(std::clamp(
+      this->declare_parameter<double>("path_preview_min_span_ratio", 0.45),
+      0.05, 1.0));
+    path_preview_max_rmse_px_ = static_cast<float>(std::max(
+      1.0, this->declare_parameter<double>("path_preview_max_rmse_px", 25.0)));
 
     // 디버그 게이지 눈금. 제어값이 아니라 표시용이므로 control.py 의
     // GUARDRAIL_PARAMS 와 같은 값으로 맞춰 두기만 하면 된다.
@@ -211,6 +229,13 @@ public:
 
     // 차선 회귀 파라미터 발행: /lane_fit ([m, b], 프레임 좌표계)
     fit_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/lane_fit", qos_fast);
+
+    // [먼 목표 offset px, 정규화 signed curvature, confidence, 목표 BEV y 비율,
+    //  같은 프레임의 /lane_offset 값]
+    // confidence=0은 이번 프레임의 미리보기를 쓰지 말라는 명시적 무효화다.
+    path_preview_pub_ =
+      this->create_publisher<std_msgs::msg::Float32MultiArray>(
+      "/lane_path_preview", qos_fast);
 
     // 바깥 실선 여유 발행: /lane_guardrail ([좌 여유, 우 여유], BEV px)
     // 음수는 미관측이다. /lane_offset 과 같은 콜백에서 나가므로 항상 같은 프레임이다.
@@ -577,9 +602,11 @@ public:
   LineFit fitLaneFromBEV(
     const Mat & bev_binary, bool & ok,
     lane_detection::LanePipelineDiagnostics * diagnostics = nullptr,
-    cv::Mat * dbg_out = nullptr)
+    cv::Mat * dbg_out = nullptr,
+    lane_detection::PathPreview * path_preview_out = nullptr)
   {
     ok = false;
+    if (path_preview_out) {*path_preview_out = lane_detection::PathPreview{};}
 
     const int h = bev_binary.rows, w = bev_binary.cols;
     if (diagnostics) {
@@ -683,6 +710,11 @@ public:
     const int win_h = h / num_windows;
 
     vector<Point> pts;
+    // 곡선 피팅에는 선 굵기에 따라 개수가 달라지는 모든 흰 픽셀이 아니라
+    // 각 슬라이딩 윈도우의 중심 한 점만 쓴다. 그래야 가까운 굵은 마스크가 먼
+    // 경로를 압도하지 않고, BEV 전 구간이 비슷한 가중치로 들어간다.
+    vector<Point2f> window_centers;
+    window_centers.reserve(static_cast<std::size_t>(num_windows));
     int x_current = base_x;
 
     for (int i = 0; i < num_windows; ++i) {
@@ -700,13 +732,23 @@ public:
       }
 
       bool recentered = false;
+      float measured_x = static_cast<float>(x_current);
       if (xs.size() >= minpix) {
         // 픽셀이 충분하면 다음 윈도우 중심을 평균 x로 재조정
         int sum = std::accumulate(xs.begin(), xs.end(), 0);
-        x_current = sum / static_cast<int>(xs.size());
+        measured_x = static_cast<float>(sum) / static_cast<float>(xs.size());
+        x_current = static_cast<int>(std::round(measured_x));
         recentered = true;
       }
       x_current = std::min(std::max(x_current, tracking_x_min), tracking_x_max);
+      if (recentered) {
+        // 다음 윈도우의 탐색 중심은 corridor 안에 제한하되, 곡선 피팅에는
+        // 제한 전 실제 픽셀 평균을 넣는다. 경계에 붙인 추적 상태를 측정값으로
+        // 쓰면 잘못된 평탄 곡선이 낮은 RMSE로 승인될 수 있다.
+        window_centers.emplace_back(
+          measured_x,
+          0.5F * static_cast<float>(y_low + y_high - 1));
+      }
 
       if (dbg_out) {
         cv::Scalar boxColor = recentered ? cv::Scalar(0, 255, 255) : cv::Scalar(0, 165, 255);
@@ -748,6 +790,17 @@ public:
     LineFit fit = fitLineRobust(
       pts, config_.fit_outlier_reject_px,
       config_.fit_outlier_iterations, retained_points);
+    if (path_preview_out) {
+      *path_preview_out = lane_detection::estimatePathPreview(
+        window_centers,
+        w,
+        h,
+        static_cast<float>(ref_x_),
+        path_preview_target_y_ratio_,
+        path_preview_min_points_,
+        path_preview_min_span_ratio_,
+        path_preview_max_rmse_px_);
+    }
     ok = true;
     consecutive_fail_count_ = 0;
     if (diagnostics) {
@@ -777,7 +830,7 @@ public:
   // 현재 모드의 기준선(ref_ratio × bev_width)과의 차이를 반환한다.
   //
   // 반환값:
-  //   + : 중앙선이 기준선보다 오른쪽 (차량이 우측 편향 → 좌조향 필요)
+  //   + : 중앙선이 기준선보다 오른쪽 (목표 경로가 오른쪽 → 우조향 필요)
   //   - : 중앙선이 기준선보다 왼쪽
   // ─────────────────────────────────────────────────────────────────────
   float calcOffsetFromCenterLine(const LineFit & lf, int bev_width) const
@@ -858,10 +911,9 @@ public:
     paint(right_rail_display_, {0, 80, 255});
     paint(center_mask, {0, 255, 0});
 
-    // 기준선은 CAMERA 패널과 **똑같이** 그린다. 예전에는 이 창에만 사다리꼴을
-    // 칙칙한 빨강으로 하나 그렸는데, CAMERA 쪽 빨간 선은 라벨 ROI(y=216)이고
-    // 이 창의 빨간 선은 사다리꼴 윗변(y=251)이라 35px 어긋난 서로 다른 선이
-    // 같은 색으로 보였다. 그래서 마스크가 같은데도 이 창이 더 좁게 보였다.
+    // 기준선은 CAMERA 패널과 동일하게 그린다. 라벨 ROI와 BEV 윗변은 둘 다
+    // y=216에서 시작하며, 주황 사다리꼴은 그중 실제 투시 변환에 사용하는
+    // 가로 범위까지 함께 보여 준다.
     drawReferenceLines(canvas);
     return canvas;
   }
@@ -966,7 +1018,9 @@ public:
   // 오프셋 슬라이더 시각화
   // 화면 상단에 오프셋 크기를 막대+점으로 표시하고 모드/값 텍스트를 출력한다.
   // ─────────────────────────────────────────────────────────────────────
-  Mat drawOffsetSlider(const Mat & bgr, float offset_px, LaneMode mode) const
+  Mat drawOffsetSlider(
+    const Mat & bgr, float offset_px, LaneMode mode,
+    const lane_detection::PathPreview & path_preview) const
   {
     int sw = frame_width_, sh = 50;
     Mat slider(sh, sw, CV_8UC3, Scalar(50, 50, 50));
@@ -977,12 +1031,28 @@ public:
     int dot_x = cx + static_cast<int>(std::round(offset_px));
     dot_x = std::clamp(dot_x, 0, sw - 1);
     circle(slider, Point(dot_x, sh / 2), 6, Scalar(0, 0, 255), FILLED);
+    if (path_preview.valid) {
+      int preview_x = cx + static_cast<int>(std::round(path_preview.target_offset_px));
+      preview_x = std::clamp(preview_x, 0, sw - 1);
+      drawMarker(
+        slider, Point(preview_x, sh / 2), Scalar(255, 0, 255),
+        MARKER_DIAMOND, 13, 2);
+    }
 
     string mode_str = (mode == LaneMode::CENTER) ? "Mode: Center" :
       (mode == LaneMode::LANE_ONE) ? "Mode: 1-Lane" : "Mode: 2-Lane";
     string offset_str = "Offset(px): " + std::to_string(static_cast<int>(std::round(offset_px)));
     putText(slider, mode_str, Point(10, 20), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(220, 220, 220), 1);
     putText(slider, offset_str, Point(10, 42), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(220, 220, 220), 1);
+    if (path_preview.valid) {
+      char preview_text[96];
+      std::snprintf(
+        preview_text, sizeof(preview_text), "Preview %+.0f  conf %.2f",
+        path_preview.target_offset_px, path_preview.confidence);
+      putText(
+        slider, preview_text, Point(std::max(250, sw - 300), 42),
+        FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 120, 255), 1);
+    }
 
     // 슬라이더를 원본 영상 위에 세로로 이어붙임
     Mat out;
@@ -1003,7 +1073,8 @@ public:
     const LineFit & fit_bev,
     bool fit_valid,
     bool show_dbg,
-    const cv::Mat & lane_mask_for_display)
+    const cv::Mat & lane_mask_for_display,
+    const lane_detection::PathPreview & path_preview)
   {
     cv::Mat frame = frame_in.clone();
 
@@ -1024,6 +1095,19 @@ public:
 
     const auto publication_policy =
       lane_detection::measurementPublicationPolicy(fit_valid, mapped);
+
+    // 기존 offset/fit과 독립된 선택 입력. invalid 프레임도 confidence=0으로
+    // 내보내 main_node가 직전 곡선을 계속 붙들지 않고 즉시 기존 제어로
+    // 폴백하게 한다.
+    std_msgs::msg::Float32MultiArray preview_msg;
+    preview_msg.data = {
+      path_preview.valid ? path_preview.target_offset_px : 0.0F,
+      path_preview.valid ? path_preview.signed_curvature : 0.0F,
+      path_preview.valid ? path_preview.confidence : 0.0F,
+      path_preview_target_y_ratio_,
+      static_cast<float>(std::round(offset)),
+    };
+    path_preview_pub_->publish(preview_msg);
 
     // /lane_offset 발행
     if (publication_policy.publish_offset) {
@@ -1051,7 +1135,7 @@ public:
     // waitKey는 debug_lane_view와 무관하게 호출해야 한다. HighGUI 이벤트 펌프
     // 역할을 하므로, 이걸 건너뛰면 남아있는 창이 갱신되지 않는다.
     if (debug_view_ && show_dbg && debug_lane_view_) {
-      cv::Mat vis = drawOffsetSlider(frame, offset, lane_mode_);
+      cv::Mat vis = drawOffsetSlider(frame, offset, lane_mode_, path_preview);
       cv::imshow("Lane View + Offset", vis);
       cv::waitKey(1);
     } else {
@@ -1151,9 +1235,9 @@ public:
   }
 
   // ─────────────────────────────────────────────────────────────────────
-  // 통합 모니터 창: 2개 패널을 한 창에 합친다.
+  // 통합 모니터 창: 3개 패널을 한 창에 합친다.
   //
-  //   [ CAMERA (라벨 ROI 오버레이) ] [ VEHICLE (조향/속도) ]
+  //   [ CAMERA (라벨 ROI 오버레이) ] [ MASK (마스크 단독) ] [ VEHICLE (조향/속도) ]
   //
   // CAMERA 패널: 라벨 ROI(하단 40%, y>=label_roi_top_) 위쪽은 어둡게 죽이고
   // 그 아래에는 중앙선 세그멘테이션 마스크를 반투명 초록으로 겹쳐 그린다.
@@ -1202,9 +1286,9 @@ public:
         overlay(lane_mask_for_display, cv::Scalar(0, 255, 0), CENTER_LANE_OVERLAY_ALPHA);
       }
 
-      // 라벨 ROI(빨강)와 BEV 사다리꼴(주황)은 서로 다른 경계다. 빨간 선만
-      // 그려 두면 "저 선 아래를 다 본다"로 읽히는데, 실제로 오프셋과 레일
-      // 여유를 재는 영역은 그보다 더 아래인 사다리꼴 안쪽뿐이다.
+      // 라벨 ROI(빨강)와 BEV 사다리꼴(주황)의 윗변은 y=216으로 맞췄다.
+      // 실제 오프셋과 레일 여유는 그 아래의 주황 사다리꼴 안쪽만 쓰므로,
+      // 두 선을 함께 그려 세로·가로 측정 범위를 모두 확인할 수 있게 한다.
       // Mask-PIDNet-Lanes 창도 같은 함수를 써서 기준선을 맞춘다.
       drawReferenceLines(vis);
       drawGuardrailReadout(vis);
@@ -1214,17 +1298,37 @@ public:
         cv::Size(std::max(1, vis.cols * panel_h / std::max(1, vis.rows)), panel_h));
     }
 
+    // 마스크 단독 패널. CAMERA 패널은 카메라 영상 위에 반투명(alpha 0.45)으로
+    // 겹치므로 바닥 무늬·반사와 섞여 마스크 경계가 어디까지인지 흐려 보인다.
+    // 같은 마스크를 검은 배경에 불투명하게 한 번 더 그려 나란히 두면, 모델이
+    // 실제로 집은 화소만 그대로 읽을 수 있다. Mask-PIDNet-Lanes 보조 창과 같은
+    // 함수를 쓰므로 색 규약과 기준선이 자동으로 일치한다.
+    cv::Mat mask_panel;
+    {
+      const cv::Mat mask_view = buildClassMaskView(lane_mask_for_display);
+      cv::resize(
+        mask_view, mask_panel,
+        cv::Size(
+          std::max(1, mask_view.cols * panel_h / std::max(1, mask_view.rows)),
+          panel_h));
+    }
+
     // 조향/속도 패널. 정사각 캔버스를 패널 높이에 맞춘다.
     cv::Mat vehicle_panel;
     cv::resize(drawVehicleDynamicsView(), vehicle_panel, cv::Size(panel_h, panel_h));
 
     cv::Mat monitor;
-    cv::hconcat(
-      // 색 범례는 제목이 아니라 패널 안에 그린다(drawGuardrailReadout).
-      // 제목에 넣으면 폭을 넘겨 옆 패널 제목과 겹쳤다.
+    // 색 범례는 제목이 아니라 패널 안에 그린다(drawGuardrailReadout).
+    // 제목에 넣으면 폭을 넘겨 옆 패널 제목과 겹쳤다.
+    //
+    // CAMERA 와 MASK 를 붙여 둔다. 오버레이와 마스크 단독을 눈으로 비교하는
+    // 것이 이 창의 목적이라, 사이에 VEHICLE 이 끼면 대조가 어렵다.
+    const std::vector<cv::Mat> panels{
       withPanelTitle(camera_panel, "CAMERA  segmentation + guardrail"),
+      withPanelTitle(mask_panel, "MASK  segmentation only"),
       withPanelTitle(vehicle_panel, "VEHICLE  steer / speed"),
-      monitor);
+    };
+    cv::hconcat(panels, monitor);
     return monitor;
   }
 
@@ -1232,10 +1336,10 @@ public:
   // BEV 사다리꼴을 카메라 영상 위에 그려, BEV 창이 실제로 어느 범위를 보고
   // 있는지 원본 화면과 대응시킨다.
   //
-  // 라벨 ROI 선(빨강, height*0.6)과 사다리꼴 윗변(roi_top_y_, height*0.7)은
-  // 서로 다른 값이다. 빨간 선만 보이면 그 아래 전부를 재는 것처럼 읽히는데,
-  // 오프셋과 레일 여유는 사다리꼴 안쪽에서만 나온다. 아래쪽 변은 화면 밖
-  // (bottom_width 계수 2 → 폭 1280)이라 옆변이 아래로 벌어지는 모양으로 보인다.
+  // 라벨 ROI 선(빨강)과 사다리꼴 윗변은 둘 다 height*0.6이다. 학습된
+  // 하단 40% 전체를 BEV가 쓰도록 세로 시야를 맞췄으며, 오프셋과 레일 여유는
+  // 주황 사다리꼴 안쪽에서만 나온다. 아래쪽 변은 화면 밖(bottom_width 계수 2
+  // → 폭 1280)이라 옆변이 아래로 벌어져 보인다.
   //
   // 가드레일이 실제 측정에 쓰는 근거리 밴드(band_top~band_bottom)는 BEV 세로
   // 비율이므로, 사다리꼴 높이를 그 비율로 나눠 원본 위에 다시 표시한다.
@@ -1251,6 +1355,56 @@ public:
       vis, "label ROI", {vis.cols - 84, std::max(10, roi_top - 5)},
       cv::FONT_HERSHEY_SIMPLEX, 0.36, {0, 0, 255}, 1, cv::LINE_AA);
     drawBevFootprint(vis);
+    drawCenterReference(vis);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 조향 기준선: "중앙선이 화면 어디에 보이도록 맞추려는가" 를 그린다.
+  //
+  // /lane_offset 은 BEV 좌표에서 (중앙선 위치 - 기준선) 이고, 기준선은 BEV 폭
+  // 비율(center_reference_*)로만 주어진다. 그 비율이 카메라 화면 어디인지 볼
+  // 방법이 없어서, 차가 한쪽으로 치우쳐 가도 기준선이 틀린 건지 인지가 틀린
+  // 건지 구분할 수 없었다. 초록 마스크(검출된 중앙선)와 이 선이 겹치면 차가
+  // 제자리에 있는 것이고, 벌어진 만큼이 곧 offset 이다.
+  //
+  // 투영변환은 직선을 직선으로 보내므로 BEV 세로선의 양 끝 두 점이면 충분하다.
+  // ─────────────────────────────────────────────────────────────────────
+  void drawCenterReference(cv::Mat & vis) const
+  {
+    if (vis.empty() || frame_width_ <= 0 || frame_height_ <= 0) {return;}
+    if (bev_size_.width <= 1 || bev_size_.height <= 1 || H_inv_.empty()) {return;}
+
+    const float ratio = std::clamp(getActiveRefRatio(), 0.0f, 1.0f);
+    const float bev_x = ratio * static_cast<float>(bev_size_.width);
+    std::vector<cv::Point2f> src = {
+      {bev_x, 0.0f}, {bev_x, static_cast<float>(bev_size_.height - 1)}};
+    std::vector<cv::Point2f> dst;
+    cv::perspectiveTransform(src, dst, H_inv_);
+    if (dst.size() != 2 ||
+      !std::isfinite(dst[0].x) || !std::isfinite(dst[0].y) ||
+      !std::isfinite(dst[1].x) || !std::isfinite(dst[1].y)) {return;}
+
+    const double sx = static_cast<double>(vis.cols) / frame_width_;
+    const double sy = static_cast<double>(vis.rows) / frame_height_;
+    auto scaled = [&](const cv::Point2f & p) {
+        return cv::Point(
+          static_cast<int>(std::lround(p.x * sx)),
+          static_cast<int>(std::lround(p.y * sy)));
+      };
+    const cv::Scalar color{255, 255, 0};   // cyan — 초록 마스크와 구분된다
+    cv::line(vis, scaled(dst[0]), scaled(dst[1]), color, 2, cv::LINE_AA);
+
+    const char * mode_text = (lane_mode_ == LaneMode::CENTER) ? "CENTER" :
+      (lane_mode_ == LaneMode::LANE_ONE) ? "1-LANE" : "2-LANE";
+    char label[96];
+    std::snprintf(
+      label, sizeof(label), "aim %s %.3f  x=%.0f", mode_text, ratio, dst[1].x);
+    const cv::Point anchor = scaled(dst[1]);
+    cv::putText(
+      vis, label,
+      {std::clamp(anchor.x - 60, 2, std::max(2, vis.cols - 190)),
+        std::max(12, vis.rows - 8)},
+      cv::FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv::LINE_AA);
   }
 
   void drawBevFootprint(cv::Mat & vis) const
@@ -1502,8 +1656,11 @@ public:
   {
     float r;
     if (m == LaneMode::CENTER) {
-      // 중앙 주행: 두 차선 기준값의 중간. 별도 설정 키가 필요 없다.
-      r = 0.5f * (center_reference_lane_one_ + center_reference_lane_two_);
+      // 중앙 주행은 독립 설정값을 쓴다(기본 0.5 = 화면 정중앙).
+      // 예전에는 좌/우 기준의 평균이었는데, 두 값이 0.5 대칭이 아니면
+      // (0.63/0.35 → 0.49) 중앙 주행이 조용히 한쪽으로 밀렸다. 그러면서
+      // 좌/우 차선 기준을 손댈 때마다 중앙까지 같이 움직여 원인을 찾기 어려웠다.
+      r = center_reference_center_;
     } else {
       r = (m == LaneMode::LANE_ONE) ? center_reference_lane_one_ :
         center_reference_lane_two_;
@@ -1552,6 +1709,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr offset_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr validity_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr fit_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr path_preview_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr lane_change_state_pub_;
   rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr lane_position_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr guardrail_pub_;
@@ -1574,6 +1732,12 @@ private:
   double guardrail_display_margin_px_ = 190.0;
   double guardrail_display_min_trust_px_ = 15.0;
 
+  // ── 곡선 경로 미리보기 설정 ─────────────────────────────────────────
+  float path_preview_target_y_ratio_ = 0.25F;
+  std::size_t path_preview_min_points_ = 7U;
+  float path_preview_min_span_ratio_ = 0.45F;
+  float path_preview_max_rmse_px_ = 25.0F;
+
   // ── 실측 현재 차선 판정 상태 (인지 기반, 제어 목표와 무관) ──────────
   int detected_lane_ = -1;     // 확정된 실측 차선 (-1=미확정)
   int pending_lane_ = -1;      // 디바운스 중인 후보 차선
@@ -1594,6 +1758,7 @@ private:
   int roi_top_y_, roi_bottom_y_;
   float center_reference_lane_one_;
   float center_reference_lane_two_;
+  float center_reference_center_;
 
   // ── BEV 투시변환 행렬 ───────────────────────────────────────────────
   cv::Mat H_;           // 사다리꼴 → BEV 정변환
@@ -1826,7 +1991,9 @@ private:
     bool show_dbg = debug_view_ && (frame_count_ % debug_stride_ == 0);
 
     bool valid = false;
-    LineFit center_fit = fitLaneFromBEV(bev_yellow, valid, diagnostics);
+    lane_detection::PathPreview path_preview;
+    LineFit center_fit = fitLaneFromBEV(
+      bev_yellow, valid, diagnostics, nullptr, &path_preview);
 
     std_msgs::msg::Bool validity_msg;
     validity_msg.data = valid;
@@ -1853,7 +2020,8 @@ private:
 
     // (6) 토픽 발행 + 디버그 출력
     const auto publication_policy = publishAndDebug(
-      frame, offset, center_fit, valid, show_dbg, lane_mask_for_display);
+      frame, offset, center_fit, valid, show_dbg, lane_mask_for_display,
+      path_preview);
 
     if (diagnostics) {
       diagnostics->fit_valid = valid;

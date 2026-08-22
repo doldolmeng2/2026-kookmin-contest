@@ -9,7 +9,7 @@ import rclpy
 from rclpy.context import Context
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from rcl_interfaces.msg import ParameterDescriptor
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import (
     Bool,
@@ -19,7 +19,15 @@ from std_msgs.msg import (
     Int32MultiArray,
 )
 
-from main.control import Controller
+from main.control import (
+    GUARDRAIL_PARAMS,
+    GUARDRAIL_TUNABLES,
+    STEERING_FILTER_PARAMS,
+    STEERING_FILTER_TUNABLES,
+    Controller,
+    validate_guardrail_params,
+    validate_steering_filter_params,
+)
 from main.control_selector import (
     CommandCandidate,
     ControlSource,
@@ -59,6 +67,7 @@ from main.runtime_adapter import (
 RUBBERCONE_INFO_TOPIC = "/rubbercone_info"
 RUBBERCONE_OFFSET_TOPIC = "/rubbercone_offset"
 RUBBERCONE_SESSION_ACTIVE_TOPIC = "/rubbercone_session_active"
+LANE_PATH_PREVIEW_TOPIC = "/lane_path_preview"
 OBJECT_INFO_TOPIC = "/object_info"
 OBJECT_INFO_RAW_TOPIC = "/object_info_raw"
 SIDE_CLEARANCE_TOPIC = "/side_clearance"
@@ -95,6 +104,13 @@ STOP_DECEL_STEP = 0.6
 # 가드레일을 쓰지 않는다 — 오래된 여유로 조향을 더하면 이미 지나간 코너를
 # 향해 꺾게 된다. 24 Hz 기준 한 프레임이 42ms 라 두 프레임 남짓으로 잡았다.
 GUARDRAIL_MAX_SKEW_S = 0.10
+
+# /lane_path_preview도 /lane_offset과 같은 lane_node 영상 콜백에서 발행된다.
+# 두 토픽이 이 범위를 벗어나면 서로 다른 프레임의 경로를 섞지 않고 즉시 기존
+# offset-only Pure Pursuit로 폴백한다. 24 Hz 기준 한 프레임(약 42 ms)보다
+# 짧게 잡고, 메시지 안의 source offset도 함께 대조한다.
+LANE_PATH_PREVIEW_MAX_SKEW_S = 0.03
+LANE_PATH_PREVIEW_DEFAULT_MIN_CONFIDENCE = 0.55
 
 # 이보다 크게 시각이 역행하면 "bag이 처음부터 다시 재생됨"으로 본다.
 # 실차 wall clock도 NTP 보정으로 아주 드물게 살짝 뒤로 갈 수 있어, 그런 미세
@@ -145,6 +161,22 @@ def parse_initial_mode(value) -> Mode:
     raise ValueError(f"invalid initial mode value: {value!r}")
 
 
+def validate_curve_preview_min_confidence(value) -> float:
+    """Return a finite confidence threshold in the closed interval [0, 1]."""
+
+    if isinstance(value, bool):
+        raise ValueError("curve_preview_min_confidence must be a number in [0, 1]")
+    try:
+        converted = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "curve_preview_min_confidence must be a number in [0, 1]"
+        ) from exc
+    if not np.isfinite(converted) or not 0.0 <= converted <= 1.0:
+        raise ValueError("curve_preview_min_confidence must be in [0, 1]")
+    return converted
+
+
 def rubbercone_session_qos() -> QoSProfile:
     """Return the detector's stateful lifecycle-command QoS contract."""
 
@@ -179,7 +211,30 @@ class MainNode(Node):
             ParameterDescriptor(dynamic_typing=True),
         )
         self.declare_parameter("show_debug", False)
+        # 터미널에서 Enter 를 눌러 모터 출력만 껐다 켠다. 인지·FSM·조향은 계속
+        # 돌고 바퀴로 나가는 속도만 막히므로, 차를 세운 채로 차선 인식을 보며
+        # 튜닝할 수 있다. 기본은 꺼짐이고, 튜닝 프로파일(module_lane_only)에서만
+        # 켠다 — 기본값을 켜 두면 테스트가 제어 터미널 입력을 가로챌 수 있다.
+        self.declare_parameter("enter_motor_toggle", False)
         self.declare_parameter("lane_guardrail", True)
+        # 새 곡선 미리보기는 기존 /lane_offset과 병렬 입력이다. false로 바꾸면
+        # lane_node를 재시작하지 않고도 다음 제어 사이클부터 기존 Pure Pursuit로
+        # 즉시 돌아간다.
+        self.declare_parameter("curve_preview_enabled", True)
+        self.declare_parameter(
+            "curve_preview_min_confidence",
+            LANE_PATH_PREVIEW_DEFAULT_MIN_CONFIDENCE,
+        )
+        # 가드레일 이득은 실차에서 반복해 찾는 값이라 ROS 파라미터로 열어 둔다.
+        # 기본값을 control.GUARDRAIL_PARAMS 에서 그대로 읽으므로 소스 기본값과
+        # 파라미터 기본값이 갈라질 수 없다. 이름은 'guardrail_' + 항목명이다.
+        for name in GUARDRAIL_TUNABLES:
+            self.declare_parameter(f"guardrail_{name}", GUARDRAIL_PARAMS[name])
+        # 지터 억제 값도 실차 계측으로 찾는 값이라 같은 방식으로 열어 둔다.
+        # 이름은 control.STEERING_FILTER_PARAMS 의 항목명 그대로다 — 이미
+        # 충분히 구체적이라 접두어를 붙이면 길기만 하다.
+        for name in STEERING_FILTER_TUNABLES:
+            self.declare_parameter(name, STEERING_FILTER_PARAMS[name])
         test_profile = parse_test_profile(
             self.get_parameter("test_profile").value
         )
@@ -188,6 +243,25 @@ class MainNode(Node):
         self.lane_guardrail_enabled = bool(
             self.get_parameter("lane_guardrail").value
         )
+        self.curve_preview_enabled = bool(
+            self.get_parameter("curve_preview_enabled").value
+        )
+        self.curve_preview_min_confidence = (
+            validate_curve_preview_min_confidence(
+                self.get_parameter("curve_preview_min_confidence").value
+            )
+        )
+        # launch 인자로 들어온 값도 ros2 param set 과 같은 검증을 거친다.
+        # 여기서 던지면 노드가 뜨지 않는데, 잘못된 이득으로 주행이 시작되는
+        # 것보다 낫다.
+        self._guardrail_overrides = validate_guardrail_params({
+            name: self.get_parameter(f"guardrail_{name}").value
+            for name in GUARDRAIL_TUNABLES
+        })
+        self._steering_filter_overrides = validate_steering_filter_params({
+            name: self.get_parameter(name).value
+            for name in STEERING_FILTER_TUNABLES
+        })
 
         # bag --loop 재생 감지용. use_sim_time=True 로 띄우고 bag을 --clock 과
         # 함께 재생하면, 루프가 돌 때 /clock 시각이 뒤로 튄다. 그 역행을 잡아
@@ -209,6 +283,9 @@ class MainNode(Node):
             )
         self.lane_controller = Controller()
         self.cone_controller = Controller()
+        self._apply_guardrail_params()
+        self._apply_steering_filter_params()
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         self.lane = 1
         self.object_dist = float("inf")
@@ -311,6 +388,12 @@ class MainNode(Node):
             self.lane_offset_callback,
             qos_fast,
         )
+        self.lane_path_preview_sub = self.create_subscription(
+            Float32MultiArray,
+            LANE_PATH_PREVIEW_TOPIC,
+            self.lane_path_preview_callback,
+            qos_fast,
+        )
         self.lane_guardrail_sub = self.create_subscription(
             Float32MultiArray,
             "lane_guardrail",
@@ -374,6 +457,18 @@ class MainNode(Node):
         self._status_img_lock = threading.Lock()
         self._status_img = None
 
+        # ── 모터 출력 게이트 ─────────────────────────────────────────────
+        # set() 이면 주행, clear() 면 정지다. Event 자체가 스레드 안전하므로
+        # 터미널 스레드와 제어 타이머가 락 없이 같은 값을 본다.
+        self._motor_gate = threading.Event()
+        self._motor_gate.set()
+        if bool(self.get_parameter("enter_motor_toggle").value):
+            threading.Thread(
+                target=self._run_motor_toggle_loop,
+                name="enter_motor_toggle",
+                daemon=True,
+            ).start()
+
         self.create_timer(0.02, self.control_cycle)
 
     def run_display_loop(self) -> None:
@@ -390,6 +485,52 @@ class MainNode(Node):
             if image is not None:
                 cv2.imshow("Status", image)
             cv2.waitKey(30)
+
+    def _set_motor_enabled(self, enabled: bool) -> None:
+        """모터 출력 게이트를 바꾸고 바뀐 상태만 로그로 남긴다."""
+
+        if enabled == self._motor_gate.is_set():
+            return
+        if enabled:
+            self._motor_gate.set()
+            self.get_logger().info("MOTOR ON  — 주행. Enter 로 정지.")
+        else:
+            self._motor_gate.clear()
+            self.get_logger().warning("MOTOR OFF — 정지. Enter 로 주행.")
+
+    def _run_motor_toggle_loop(self) -> None:
+        """터미널에서 Enter 를 받을 때마다 모터 출력을 껐다 켠다.
+
+        sys.stdin 이 아니라 /dev/tty 를 직접 연다. `ros2 launch` 는 자식 노드의
+        stdin 을 파이프로 바꿔 버리므로(asyncio subprocess_exec 의 기본값이
+        stdin=PIPE 다), sys.stdin 을 읽으면 런치 시스템이 그 파이프에 무언가
+        써 주기 전까지 영원히 막힌다 — 터미널에서 Enter 를 아무리 눌러도 오지
+        않는다. 제어 터미널은 그 파이프와 무관하게 /dev/tty 로 열 수 있다.
+
+        데몬 스레드에서 돈다. readline 은 막히는 호출이라, 종료할 때 이 스레드를
+        기다리면 노드가 내려가지 못한다.
+        """
+
+        try:
+            terminal = open("/dev/tty", "r")
+        except OSError as exc:
+            # 제어 터미널이 없는 실행(리다이렉트, 서비스, CI)에서는 토글만
+            # 포기하고 주행은 그대로 둔다.
+            self.get_logger().warning(
+                f"Enter 모터 토글 비활성: 제어 터미널을 열 수 없습니다 ({exc})"
+            )
+            return
+
+        self.get_logger().info(
+            "Enter 모터 토글 준비됨: 이 터미널에서 Enter 를 누를 때마다 "
+            "모터 출력이 정지/주행 으로 바뀝니다."
+        )
+        with terminal:
+            while self.context.ok():
+                if terminal.readline() == "":
+                    # 터미널이 닫혔다. 계속 돌면 빈 줄을 무한히 읽는다.
+                    return
+                self._set_motor_enabled(not self._motor_gate.is_set())
 
     def _now_seconds(self) -> float:
         """Read the node ROS clock used by both callbacks and FSM steps."""
@@ -437,6 +578,27 @@ class MainNode(Node):
             self._warn_throttled(
                 "malformed_lane",
                 "invalid lane_offset message ignored",
+                received_at,
+            )
+
+    def lane_path_preview_callback(self, msg: Float32MultiArray) -> None:
+        """Validate the optional far-path preview published beside lane_offset."""
+
+        received_at = self._now_seconds()
+        data = list(msg.data)
+        if len(data) != 5:
+            self._warn_throttled(
+                "malformed_lane_path_preview",
+                "lane_path_preview requires "
+                "[target_offset_px, curvature_norm, confidence, target_y_ratio, "
+                "source_lane_offset_px]",
+                received_at,
+            )
+            return
+        if not self.runtime.record_lane_path_preview(*data, received_at):
+            self._warn_throttled(
+                "malformed_lane_path_preview",
+                "invalid lane_path_preview message ignored",
                 received_at,
             )
 
@@ -696,6 +858,16 @@ class MainNode(Node):
             cycle.control.command,
             now,
         )
+        # Enter 로 내린 모터 차단. 조향은 제어가 계산한 값을 그대로 내보내고
+        # 속도만 0 으로 막는다 — 코너에서 멈출 때 앞바퀴를 0 으로 펴면 다시
+        # 출발할 때 차가 코스 밖을 향한다.
+        #
+        # now_speed 도 함께 0 으로 되돌린다. 이 값은 램프의 현재 상태라, 그냥
+        # 두면 다시 켠 순간 멈추기 직전 속도로 튄다. 0 에서 시작하면 평소
+        # 가속과 같은 LANE_ACCEL_STEP 램프를 탄다.
+        if not self._motor_gate.is_set():
+            self.now_speed = 0.0
+            speed = 0.0
         motor_msg = Float32MultiArray()
         motor_msg.data = [float(angle), float(speed)]
         self.motor_pub.publish(motor_msg)
@@ -875,6 +1047,8 @@ class MainNode(Node):
         self.runtime.context.lane_target = self._initial_lane_target
         self.lane_controller = Controller()
         self.cone_controller = Controller()
+        self._apply_guardrail_params()
+        self._apply_steering_filter_params()
 
         self.overtake.reset()
         self.same_lane_brake.reset()
@@ -1022,6 +1196,114 @@ class MainNode(Node):
         if entered:
             self._enter_zone(now)
 
+    def _apply_guardrail_params(self) -> None:
+        """현재 파라미터 값을 두 컨트롤러에 밀어 넣는다.
+
+        _reset_runtime 이 Controller 를 새로 만들기 때문에(bag --loop 되감기)
+        생성 직후마다 다시 불러야 한다. 그러지 않으면 루프가 한 바퀴 돌 때
+        런타임에 맞춰 둔 이득이 소스 기본값으로 조용히 되돌아간다.
+        """
+
+        for controller in (self.lane_controller, self.cone_controller):
+            controller.apply_guardrail_params(self._guardrail_overrides)
+
+    def _apply_steering_filter_params(self) -> None:
+        """지터 억제 값을 두 컨트롤러에 밀어 넣는다.
+
+        _apply_guardrail_params 와 같은 이유로, Controller 를 새로 만들 때마다
+        다시 불러야 소스 기본값으로 되돌아가지 않는다.
+        """
+
+        for controller in (self.lane_controller, self.cone_controller):
+            controller.apply_steering_filter_params(
+                self._steering_filter_overrides)
+
+    def _on_set_parameters(self, parameters) -> SetParametersResult:
+        """주행 중 ros2 param set 을 그 자리에서 반영한다.
+
+        rclpy 는 이 콜백을 값이 커밋되기 **전에** 부른다. 그래서 먼저 전부
+        검증하고, 통과했을 때만 컨트롤러에 밀어 넣는다. 한 번의 호출에 여러
+        항목이 실려 오면 하나만 잘못돼도 전부 거절한다 — 절반만 적용된 이득으로
+        주행하는 상태를 만들지 않기 위해서다. (set_parameters 는 항목마다 콜백을
+        따로 부르므로 요청끼리는 어차피 독립이고, ros2 param set 도 한 번에
+        하나다. 이 규칙은 set_parameters_atomically 와 파라미터 파일 로드처럼
+        여러 항목이 한 콜백에 실려 오는 경로에서 의미가 있다.)
+
+        여기 없는 파라미터(mode, lane_target 등)는 손대지 않는다. 그것들은
+        시작 시점에 한 번 읽고 끝이라, 런타임에 바꿔도 반영되지 않는다는
+        기존 동작을 그대로 둔다.
+        """
+
+        overrides = {}
+        filter_overrides = {}
+        guardrail_enabled = None
+        curve_preview_enabled = None
+        curve_preview_min_confidence = None
+        for parameter in parameters:
+            if parameter.name == "lane_guardrail":
+                guardrail_enabled = bool(parameter.value)
+            elif parameter.name == "curve_preview_enabled":
+                curve_preview_enabled = bool(parameter.value)
+            elif parameter.name == "curve_preview_min_confidence":
+                curve_preview_min_confidence = parameter.value
+            elif parameter.name.startswith("guardrail_"):
+                overrides[parameter.name[len("guardrail_"):]] = parameter.value
+            elif parameter.name in STEERING_FILTER_TUNABLES:
+                filter_overrides[parameter.name] = parameter.value
+        if (
+            not overrides
+            and not filter_overrides
+            and guardrail_enabled is None
+            and curve_preview_enabled is None
+            and curve_preview_min_confidence is None
+        ):
+            return SetParametersResult(successful=True)
+
+        try:
+            checked_filter = validate_steering_filter_params(filter_overrides)
+            checked = validate_guardrail_params(overrides)
+            checked_curve_confidence = (
+                validate_curve_preview_min_confidence(
+                    curve_preview_min_confidence
+                )
+                if curve_preview_min_confidence is not None
+                else None
+            )
+        except ValueError as exc:
+            self.get_logger().warn(f"control parameter rejected: {exc}")
+            return SetParametersResult(successful=False, reason=str(exc))
+
+        if guardrail_enabled is not None:
+            self.lane_guardrail_enabled = guardrail_enabled
+            self.get_logger().info(f"lane_guardrail -> {guardrail_enabled}")
+        if checked:
+            self._guardrail_overrides.update(checked)
+            self._apply_guardrail_params()
+            self.get_logger().info(
+                "guardrail params -> "
+                + ", ".join(f"{k}={v}" for k, v in sorted(checked.items()))
+            )
+        if checked_filter:
+            self._steering_filter_overrides.update(checked_filter)
+            self._apply_steering_filter_params()
+            self.get_logger().info(
+                "steering filter params -> "
+                + ", ".join(
+                    f"{k}={v}" for k, v in sorted(checked_filter.items()))
+            )
+        if curve_preview_enabled is not None:
+            self.curve_preview_enabled = curve_preview_enabled
+            self.get_logger().info(
+                f"curve_preview_enabled -> {curve_preview_enabled}"
+            )
+        if checked_curve_confidence is not None:
+            self.curve_preview_min_confidence = checked_curve_confidence
+            self.get_logger().info(
+                "curve_preview_min_confidence -> "
+                f"{checked_curve_confidence:.2f}"
+            )
+        return SetParametersResult(successful=True)
+
     def _guardrail_for(self, control_mode, lane_received_at: float):
         """Return the guardrail margins only where the term is allowed to act.
 
@@ -1046,6 +1328,62 @@ class MainNode(Node):
             return None
         return margins
 
+    def _curve_preview_for(
+        self,
+        control_mode,
+        lane_received_at: float,
+        lane_offset: float,
+    ):
+        """Return a fresh, confident preview or ``None`` for exact legacy control.
+
+        The feature gate lives here rather than in lane_node, so a single runtime
+        parameter switch changes the next motor command without restarting the
+        perception pipeline. Lane changes deliberately keep the established
+        offset/ref-transition controller; a far preview from the moving reference
+        would otherwise add a second lane-change command.
+        """
+
+        if not self.curve_preview_enabled or control_mode is not Mode.LANE_DRIVE:
+            return None
+        # lane_action.pending is the authoritative command latch. It becomes
+        # true before lane_node feedback can arrive, so relying on the feedback
+        # topic alone leaves a window where preview steering fights the change.
+        if self.runtime.lane_action.pending:
+            return None
+        preview = self.runtime.latest_lane_path_preview
+        received_at = self.runtime.lane_path_preview_received_at
+        if preview is None or received_at is None:
+            return None
+        if abs(received_at - lane_received_at) > LANE_PATH_PREVIEW_MAX_SKEW_S:
+            return None
+        (
+            target_offset,
+            curvature,
+            confidence,
+            _target_y_ratio,
+            source_lane_offset,
+        ) = preview
+        # Separate BestEffort topics have no shared Header. Pairing their receipt
+        # times is not enough when one topic drops, so also require the offset
+        # copied into the preview message to match the selected lane input.
+        if abs(source_lane_offset - float(lane_offset)) > 0.5:
+            return None
+        if confidence < self.curve_preview_min_confidence:
+            return None
+        # Start continuously at zero contribution at the confidence threshold;
+        # otherwise crossing 0.55 by one sample causes a visible steering step.
+        if self.curve_preview_min_confidence >= 1.0:
+            effective_confidence = 1.0
+        else:
+            effective_confidence = (
+                confidence - self.curve_preview_min_confidence
+            ) / (1.0 - self.curve_preview_min_confidence)
+        if effective_confidence <= 0.0:
+            return None
+        if self.runtime.lane_change_in_progress(self._now_seconds()):
+            return None
+        return target_offset, curvature, effective_confidence
+
     def _command_candidates(self):
         lane_candidate = None
         lane_received_at = self.runtime.latest_lane_received_at
@@ -1063,6 +1401,9 @@ class MainNode(Node):
                 self.object_dist,
                 100,
                 self._guardrail_for(control_mode, lane_received_at),
+                self._curve_preview_for(
+                    control_mode, lane_received_at, lane_offset
+                ),
             )
             speed = float(self.lane_controller.get_speed()) #/2.0 속도 절반
             # 고정장애물이 우리 차선에 있으면 접근할수록 속도를 낮춘다.

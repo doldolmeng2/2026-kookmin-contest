@@ -92,6 +92,9 @@ Config load_config(const std::string & path)
   // ── 차선별 기준선 비율 ────────────────────────────────────────────
   config.center_reference_lane_one = j["center_reference_lane_one"];
   config.center_reference_lane_two = j["center_reference_lane_two"];
+  // 없으면 화면 정중앙(0.5). 예전처럼 두 차선 값의 평균으로 되돌리지 않는다 —
+  // 그 평균은 두 값이 대칭일 때만 중앙이었다.
+  config.center_reference_center = j.value("center_reference_center", 0.5f);
 
   // ── 수평 노이즈 억제 파라미터 ─────────────────────────────────────
   config.horizontal_noise_width = j["horizontal_noise_width"];

@@ -26,20 +26,39 @@ CENTER_LANE_SUPPORT_RADIUS = 7
 # 테두리의 이 비율 이상이 주행면이어야 진짜 중앙선으로 인정한다.
 CENTER_LANE_MIN_SUPPORT_RATIO = 0.5
 
+# 바깥 실선(가드레일이 읽는 클래스). 중앙선과 같은 검증을 받아야 하지만
+# 임계값은 같을 수 없다 — 아래 RAIL_MIN_SUPPORT_RATIO 주석 참고.
+LEFT_SOLID_CLASS = 2
+RIGHT_SOLID_CLASS = 3
+RAIL_CLASSES = (LEFT_SOLID_CLASS, RIGHT_SOLID_CLASS)
+RAIL_SUPPORT_RADIUS = 7
+# 중앙선은 양옆이 모두 주행면이라 테두리의 대부분이 road 다(그래서 0.5).
+# 바깥 실선은 정의상 한쪽이 트랙 밖이라 테두리의 절반은 정당하게 background 고,
+# 화면 가장자리에 걸리거나 코너에서 비스듬히 보이면 더 낮아진다. 0.5 를 그대로
+# 쓰면 진짜 실선을 지운다.
+#
+# 다행히 진짜와 가짜의 간격이 넓다:
+#   진짜 실선  : 안쪽이 road  → 대략 0.3 ~ 0.6
+#   트랙 밖 오검출 : 사방이 background → 거의 0
+# 그래서 "road 가 조금이라도 붙어 있으면 인정" 쪽으로 낮게 잡는다. 0 이 아니라
+# 비율로 두는 이유는 road 화소 몇 개가 튀어 들어온 것에 속지 않기 위해서다.
+RAIL_MIN_SUPPORT_RATIO = 0.15
+
 # ROI 밖을 덮는 암전 세기. 라벨 대상이 아닌 영역을 한눈에 구분하기 위한 값이다.
 ROI_DIM_STRENGTH = 0.72
 
 # 라벨링 대상은 프레임 아래 40% 뿐이다. 그 위는 칠해도 저장하지 않는다.
-# lane_detection 런타임 ROI(아래 사다리꼴, 윗변 y=251)보다 위까지 잡아 두었다.
-# 런타임 ROI 를 나중에 올리더라도 라벨을 다시 만들지 않아도 되게 한 여유분이다.
+# lane_detection 런타임 ROI도 같은 y=216에서 시작해 학습된 전방
+# 범위를 모두 쓰되, 라벨이 없는 위쪽은 절대 참조하지 않는다.
 LABEL_ROI_BOTTOM_FRACTION = 0.4
 
 # lane_detection 런타임이 BEV 변환 전에 잘라내는 사다리꼴 ROI.
 # lane_detection_parameter.json 의 roi_* 계수와 같은 값이며, lane_detection.cpp 와
-# 똑같이 float 곱 뒤 int 절삭으로 꼭짓점을 구한다 (640x360 에서 윗변 y = 251).
-LANE_DETECTION_ROI_TOP_Y_COEFFICIENT = 0.7
+# 같은 float 곱 뒤 int 절삭으로 꼭짓점을 구한다
+# (640x360에서 윗변 y=216, x=151..489).
+LANE_DETECTION_ROI_TOP_Y_COEFFICIENT = 0.6
 LANE_DETECTION_ROI_BOTTOM_Y_COEFFICIENT = 1.0
-LANE_DETECTION_ROI_TOP_WIDTH_COEFFICIENT = 0.9
+LANE_DETECTION_ROI_TOP_WIDTH_COEFFICIENT = 0.53
 LANE_DETECTION_ROI_BOTTOM_WIDTH_COEFFICIENT = 2.0
 
 
@@ -226,13 +245,13 @@ def support_ratio(ring, surface):
     return float(np.count_nonzero(ring & surface)) / ring_pixels
 
 
-def center_lane_components(label, radius, surface_classes, preferred_surface):
-    """center_lane 연결 성분마다 (창, 성분마스크, 면적, 전체비율, 우선비율) 을 낸다.
+def lane_components(label, lane_class, radius, surface_classes, preferred_surface):
+    """lane_class 연결 성분마다 (창, 성분마스크, 면적, 전체비율, 우선비율) 을 낸다.
 
     우선비율은 preferred_surface 한 클래스만 센 값이고, preferred_surface 가 None
     이면 전체비율과 같다.
     """
-    center = (label == CENTER_LANE_CLASS).astype(np.uint8)
+    center = (label == lane_class).astype(np.uint8)
     if not center.any():
         return []
     ring_kernel = cv2.getStructuringElement(
@@ -255,6 +274,12 @@ def center_lane_components(label, radius, surface_classes, preferred_surface):
         found.append(((y0, y1, x0, x1), blob.astype(bool), int(area),
                       ratio_any, ratio_preferred))
     return found
+
+
+def center_lane_components(label, radius, surface_classes, preferred_surface):
+    """lane_components 의 center_lane 고정판 (기존 호출부 호환용)."""
+    return lane_components(
+        label, CENTER_LANE_CLASS, radius, surface_classes, preferred_surface)
 
 
 def filter_center_lane_off_surface(
@@ -285,18 +310,57 @@ def filter_center_lane_off_surface(
     min_support_ratio = float(min_support_ratio)
     if radius <= 0 or min_support_ratio <= 0.0:
         return label, 0
-    components = center_lane_components(
-        label, radius, surface_classes, preferred_surface)
+    return filter_lane_off_surface(
+        label,
+        CENTER_LANE_CLASS,
+        radius=radius,
+        min_support_ratio=min_support_ratio,
+        surface_classes=surface_classes,
+        preferred_surface=preferred_surface,
+        winner_take_all=True,
+    )
+
+
+def filter_lane_off_surface(
+    label,
+    lane_class,
+    radius,
+    min_support_ratio,
+    surface_classes=DRIVABLE_SURFACE_CLASSES,
+    preferred_surface=None,
+    winner_take_all=True,
+):
+    """주행면에 붙어 있지 않은 lane_class 성분을 background 로 지운다.
+
+    winner_take_all 은 중앙선 전용 규칙이다. 중앙선은 프레임에 하나뿐이라
+    "우선 면(road 또는 shortcut) 위의 것이 하나라도 있으면 그것만 남긴다" 가
+    모드 전환 구간에서 옳다. 바깥 실선은 좌우가 각각 독립으로 존재해야 하므로
+    이 규칙을 쓰면 한쪽이 다른 쪽을 지워 버린다 — 레일은 False 로 부른다.
+    """
+    if label.ndim != 2:
+        raise ValueError('label must be a 2D class map')
+    radius = int(radius)
+    min_support_ratio = float(min_support_ratio)
+    if radius <= 0 or min_support_ratio <= 0.0:
+        return label, 0
+    components = lane_components(
+        label, lane_class, radius, surface_classes, preferred_surface)
     if not components:
         return label, 0
-    on_preferred = {
-        index for index, component in enumerate(components)
-        if component[4] >= min_support_ratio
-    }
-    keep = on_preferred if on_preferred else {
-        index for index, component in enumerate(components)
-        if component[3] >= min_support_ratio
-    }
+    if winner_take_all:
+        on_preferred = {
+            index for index, component in enumerate(components)
+            if component[4] >= min_support_ratio
+        }
+        keep = on_preferred if on_preferred else {
+            index for index, component in enumerate(components)
+            if component[3] >= min_support_ratio
+        }
+    else:
+        keep = {
+            index for index, component in enumerate(components)
+            if component[3] >= min_support_ratio
+        }
     filtered = label
     removed = 0
     for index, ((y0, y1, x0, x1), blob, area, _, _) in enumerate(components):
@@ -306,4 +370,40 @@ def filter_center_lane_off_surface(
             filtered = label.copy()
         filtered[y0:y1, x0:x1][blob] = BACKGROUND_CLASS
         removed += area
+    return filtered, removed
+
+
+def filter_rails_off_surface(
+    label,
+    radius=RAIL_SUPPORT_RADIUS,
+    min_support_ratio=RAIL_MIN_SUPPORT_RATIO,
+    rail_classes=RAIL_CLASSES,
+    surface_classes=DRIVABLE_SURFACE_CLASSES,
+):
+    """주행면에 붙어 있지 않은 left_solid/right_solid 를 background 로 지운다.
+
+    가드레일(lane_guardrail.hpp)은 이 두 클래스를 필터 없이 그대로 읽고,
+    mergeRailMargins 가 두 클래스의 좌·우 여유를 각각 min 으로 합친다. 그래서
+    차량 왼쪽에 뜬 가짜 right_solid 덩어리 하나가 왼쪽 여유를 줄여 버리고,
+    가드레일이 있지도 않은 레일을 피해 반대쪽으로 조향을 더한다. 여기서 지우면
+    그 경로가 막힌다.
+
+    preferred_surface 를 쓰지 않는다. 실선은 road 든 shortcut 이든 자기가 접한
+    주행면에 붙어 있으면 진짜다 — 어느 면인지는 중앙선 쪽에서 이미 가린다.
+
+    (지워진 라벨, 지운 화소 수) 를 돌려준다.
+    """
+    filtered = label
+    removed = 0
+    for lane_class in rail_classes:
+        filtered, class_removed = filter_lane_off_surface(
+            filtered,
+            lane_class,
+            radius=radius,
+            min_support_ratio=min_support_ratio,
+            surface_classes=surface_classes,
+            preferred_surface=None,
+            winner_take_all=False,
+        )
+        removed += class_removed
     return filtered, removed
