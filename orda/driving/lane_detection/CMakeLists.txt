@@ -10,6 +10,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 # cv_bridge(4.5.4 기준 빌드)와 ABI 가 다른 /usr/local 의 OpenCV 4.11 이 잡히지
@@ -32,7 +33,8 @@ add_executable(lane_node
 add_executable(hls_hsv_tuner_node src/hls_hsv_tuner.cpp)
 
 # ROS2 의존성 연결
-ament_target_dependencies(lane_node ament_index_cpp rclcpp std_msgs sensor_msgs cv_bridge)
+ament_target_dependencies(
+  lane_node ament_index_cpp rclcpp diagnostic_msgs std_msgs sensor_msgs cv_bridge)
 ament_target_dependencies(hls_hsv_tuner_node rclcpp sensor_msgs cv_bridge)
 
 # include 경로 추가
@@ -73,6 +75,29 @@ if(BUILD_TESTING)
   ament_add_gtest(test_lane_measurement_publication_policy
     test/test_lane_measurement_publication_policy.cpp)
   target_include_directories(test_lane_measurement_publication_policy PRIVATE include)
+
+  ament_add_gtest(test_lane_pipeline_diagnostics
+    test/test_lane_pipeline_diagnostics.cpp)
+  target_include_directories(test_lane_pipeline_diagnostics PRIVATE include)
+  ament_target_dependencies(test_lane_pipeline_diagnostics diagnostic_msgs std_msgs)
+
+  ament_add_gtest(test_reacquire_histogram
+    test/test_reacquire_histogram.cpp)
+  target_include_directories(test_reacquire_histogram PRIVATE
+    include ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(test_reacquire_histogram ${OpenCV_LIBS})
+
+  ament_add_gtest(test_lane_guardrail
+    test/test_lane_guardrail.cpp)
+  target_include_directories(test_lane_guardrail PRIVATE
+    include ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(test_lane_guardrail ${OpenCV_LIBS})
+
+  ament_add_gtest(test_class_map_extraction
+    test/test_class_map_extraction.cpp)
+  target_include_directories(test_class_map_extraction PRIVATE
+    include ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(test_class_map_extraction ${OpenCV_LIBS})
 endif()
 
 install(DIRECTORY include/ DESTINATION include)

@@ -179,7 +179,7 @@ class LabelEditorTest(unittest.TestCase):
         # 라벨 없는 영역을 쓰게 되므로 이 테스트가 먼저 깨진다.
         polygon = lane_detection_roi_polygon((360, 640))
         self.assertEqual([list(point) for point in polygon],
-                         [[32, 251], [608, 251], [960, 360], [-320, 360]])
+                         [[151, 216], [489, 216], [960, 360], [-320, 360]])
         self.assertGreaterEqual(int(polygon[:, 1].min()), label_roi_top(360))
 
     def test_clear_outside_roi_keeps_inside_and_reports_count(self):

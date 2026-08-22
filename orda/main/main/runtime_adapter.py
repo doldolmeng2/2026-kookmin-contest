@@ -359,6 +359,12 @@ class RaceRuntimeAdapter:
         self.green_detected = False
         self.latest_lane_offset: Optional[int] = None
         self.latest_lane_received_at: Optional[float] = None
+        self.latest_lane_path_preview: Optional[
+            tuple[float, float, float, float, float]
+        ] = None
+        self.lane_path_preview_received_at: Optional[float] = None
+        self.latest_lane_guardrail: Optional[tuple[float, float]] = None
+        self.lane_guardrail_received_at: Optional[float] = None
         self.latest_cone_event: Optional[ConeMessageEvent] = None
         self.latest_object_snapshot: Optional[ObjectSnapshot] = None
         self._pending_object_entry_evidence: Optional[ObjectEntryEvidence] = None
@@ -426,6 +432,10 @@ class RaceRuntimeAdapter:
         self.green_detected = False
         self.latest_lane_offset = None
         self.latest_lane_received_at = None
+        self.latest_lane_path_preview = None
+        self.lane_path_preview_received_at = None
+        self.latest_lane_guardrail = None
+        self.lane_guardrail_received_at = None
         self.latest_cone_event = None
         self.latest_object_snapshot = None
         self._pending_object_entry_evidence = None
@@ -480,6 +490,70 @@ class RaceRuntimeAdapter:
         self.latest_lane_offset = offset
         self.latest_lane_received_at = received_at
         self.perception_received_at["lane_offset"] = received_at
+        return True
+
+    def record_lane_guardrail(
+        self,
+        left: float,
+        right: float,
+        received_at: float,
+    ) -> bool:
+        """Record one /lane_guardrail measurement (BEV px, negative = unseen).
+
+        lane_node publishes this in the same callback as /lane_offset, so the
+        two always describe the same frame. Both margins unseen is a valid
+        reading -- it means no outer solid line was visible -- and the
+        controller decays its term to zero on that.
+        """
+
+        if not self._valid_timestamp(received_at):
+            return False
+        if not self._valid_number(left) or not self._valid_number(right):
+            return False
+        if (
+            self.lane_guardrail_received_at is not None
+            and received_at <= self.lane_guardrail_received_at
+        ):
+            return False
+        self.latest_lane_guardrail = (float(left), float(right))
+        self.lane_guardrail_received_at = received_at
+        self.perception_received_at["lane_guardrail"] = received_at
+        return True
+
+    def record_lane_path_preview(
+        self,
+        target_offset: float,
+        curvature: float,
+        confidence: float,
+        target_y_ratio: float,
+        source_lane_offset: float,
+        received_at: float,
+    ) -> bool:
+        """Record one validated far-path preview paired with ``lane_offset``."""
+
+        values = (
+            target_offset,
+            curvature,
+            confidence,
+            target_y_ratio,
+            source_lane_offset,
+        )
+        if not self._valid_timestamp(received_at):
+            return False
+        if any(not self._valid_number(value) for value in values):
+            return False
+        if not 0.0 <= float(confidence) <= 1.0:
+            return False
+        if not 0.0 <= float(target_y_ratio) <= 1.0:
+            return False
+        if (
+            self.lane_path_preview_received_at is not None
+            and received_at <= self.lane_path_preview_received_at
+        ):
+            return False
+        self.latest_lane_path_preview = tuple(float(value) for value in values)
+        self.lane_path_preview_received_at = received_at
+        self.perception_received_at["lane_path_preview"] = received_at
         return True
 
     def record_lane_position(self, value: int, received_at: float) -> bool:
@@ -726,6 +800,23 @@ class RaceRuntimeAdapter:
         )
         self.perception_received_at["lane_change_state"] = received_at
         return InputRecordResult(True)
+
+    def lane_change_in_progress(self, now: float) -> bool:
+        """True while the newest fresh /lane_change_state says a change is on.
+
+        The guardrail term must stay out of a deliberate lane change: crossing
+        a line is the point of the manoeuvre, so a repulsion term would fight
+        it. A stale event does not count -- if the topic went quiet we no
+        longer know a change is underway.
+        """
+
+        if not self._lane_change_events:
+            return False
+        newest = self._lane_change_events[-1]
+        if not newest.changing:
+            return False
+        age = now - newest.received_at
+        return 0.0 <= age <= self.lane_change_max_age_s
 
     def record_route_traffic(
         self,

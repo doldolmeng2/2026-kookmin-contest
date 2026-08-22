@@ -85,6 +85,18 @@ def generate_launch_description():
         description='상태 OpenCV 창 표시 여부 (실차 제어 시 false 권장)'
     )
     show_debug = LaunchConfiguration('show_debug')
+    lane_guardrail_arg = DeclareLaunchArgument(
+        'lane_guardrail',
+        default_value='true',
+        choices=('false', 'true'),
+        description=(
+            '바깥 실선(left_solid/right_solid)에 가까워질수록 반대쪽으로 '
+            '조향을 더한다. Pure Pursuit 단독은 조향이 38.9 에서 포화하므로 '
+            '코너에서 차선을 벗어나도 더 꺾지 못한다. false 면 반발항이 정확히 '
+            '0 이 되어 Pure Pursuit 단독 거동과 완전히 같다.'
+        )
+    )
+    lane_guardrail = LaunchConfiguration('lane_guardrail')
     lane_debug_arg = DeclareLaunchArgument(
         'lane_debug',
         default_value='false',
@@ -127,6 +139,30 @@ def generate_launch_description():
     )
     pidnet_lane_classes = ParameterValue(
         LaunchConfiguration('pidnet_lane_classes'), value_type=List[int]
+    )
+    pidnet_center_lane_support_radius_arg = DeclareLaunchArgument(
+        'pidnet_center_lane_support_radius',
+        default_value='7',
+        description=(
+            '중앙선 검증 반경(화소). center_lane 성분을 이만큼 부풀린 테두리를 보고 '
+            '그 아래가 주행면인지 확인한다. 0 이면 검증을 끈다. 어느 주행면을 우선할지는 '
+            '/mode_info 를 따른다 (lane_drive=road, shortcut=shortcut, 그 외 모드는 둘 다).'
+        )
+    )
+    pidnet_center_lane_support_radius = ParameterValue(
+        LaunchConfiguration('pidnet_center_lane_support_radius'), value_type=int
+    )
+    pidnet_center_lane_min_support_ratio_arg = DeclareLaunchArgument(
+        'pidnet_center_lane_min_support_ratio',
+        default_value='0.5',
+        description=(
+            '중앙선으로 인정할 최소 주행면 비율. 성분 테두리 중 road/shortcut 이 '
+            '이 비율 미만이면 트랙 밖 오검출로 보고 지운다. 0 이면 검증을 끈다. '
+            '(실측: 도로 위 중앙선 0.77~1.00, 트랙 밖 유령 0.00)'
+        )
+    )
+    pidnet_center_lane_min_support_ratio = ParameterValue(
+        LaunchConfiguration('pidnet_center_lane_min_support_ratio'), value_type=float
     )
     rubbercone_offset_filter_alpha_arg = DeclareLaunchArgument(
         'rubbercone_offset_filter_alpha',
@@ -253,6 +289,9 @@ def generate_launch_description():
             'mode': mode,
             'lane_target': lane_target,
             'show_debug': show_debug,
+            'lane_guardrail': ParameterValue(
+                lane_guardrail, value_type=bool
+            ),
         }],
         remappings=[('xycar_motor', motor_output_topic)],
     )
@@ -297,7 +336,10 @@ def generate_launch_description():
             'input_topic': '/resized_image',
             'mask_topic': '/lane_segmentation_mask',
             'class_topic': '/pidnet_class_map',
+            'mode_topic': '/mode_info',
             'lane_classes': pidnet_lane_classes,
+            'center_lane_support_radius': pidnet_center_lane_support_radius,
+            'center_lane_min_support_ratio': pidnet_center_lane_min_support_ratio,
             'device': 'auto',
         }],
     )
@@ -313,11 +355,18 @@ def generate_launch_description():
         name='lane_node',
         output='screen',
         parameters=[{
+            # J4012 production opt-in; lane_node code default remains false.
+            'enable_reacquire_full_bev_fallback': True,
             'debug_view': ParameterValue(
                 LaunchConfiguration('lane_debug'), value_type=bool
             ),
             'debug_lane_view': ParameterValue(
                 LaunchConfiguration('lane_debug_detail'), value_type=bool
+            ),
+            # lane_node 가 /pidnet_class_map 에서 직접 중앙선을 뽑으므로,
+            # pidnet 과 같은 클래스 목록을 받아야 의미가 어긋나지 않는다.
+            'center_classes': ParameterValue(
+                LaunchConfiguration('pidnet_lane_classes'), value_type=List[int]
             ),
         }],
         remappings=[('/mode_info', '/internal/lane_command')],
@@ -389,10 +438,13 @@ def generate_launch_description():
         mode_arg,
         lane_target_arg,
         show_debug_arg,
+        lane_guardrail_arg,
         lane_debug_arg,
         lane_debug_detail_arg,
         pidnet_model_arg,
         pidnet_lane_classes_arg,
+        pidnet_center_lane_support_radius_arg,
+        pidnet_center_lane_min_support_ratio_arg,
         rubbercone_offset_filter_alpha_arg,
         rubbercone_end_missing_frames_arg,
         rubbercone_scan_max_range_arg,

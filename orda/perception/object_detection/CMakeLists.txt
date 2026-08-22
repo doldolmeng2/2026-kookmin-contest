@@ -56,10 +56,16 @@ install(DIRECTORY include/ DESTINATION include)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
   ament_add_gtest(test_lane_stabilizer test/test_lane_stabilizer.cpp)
   target_include_directories(test_lane_stabilizer PRIVATE include)
   ament_add_gtest(test_side_clearance test/test_side_clearance.cpp)
   target_include_directories(test_side_clearance PRIVATE include)
+  ament_add_pytest_test(test_yolo_runtime test/test_yolo_runtime.py)
+  ament_add_pytest_test(
+    test_object_yolo_contract test/test_object_yolo_contract.py)
+  ament_add_pytest_test(
+    test_traffic_classifier test/test_traffic_classifier.py)
 endif()
 
 ament_package()

@@ -1,0 +1,17 @@
+# xycar 장치 고정 심링크
+#
+# 이 파일이 없으면 /dev/ttyLIDAR 가 생기지 않아 xycar_lidar 가
+# "cannot bind to the specified [serial port:/dev/ttyLIDAR]" 로 즉시 죽고,
+# 카메라는 재연결 때마다 video0 -> video1 -> ... 로 번호가 밀려 usb_cam 이
+# "Device specified is not available" 로 죽는다.
+#
+# 설치:  sudo src/orda/main/tools/udev/apply.sh
+
+# YDLIDAR G2B — Silicon Labs CP2102 USB-UART bridge (10c4:ea60)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", GROUP="dialout", MODE="0660", SYMLINK+="ttyLIDAR"
+
+# VESC 모터 컨트롤러 — STMicroelectronics ChibiOS RT Virtual COM Port (0483:5740)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", GROUP="dialout", MODE="0660", SYMLINK+="ttyMOTOR"
+
+# HD USB Camera (32e4:9230) — index==0 인 캡처 노드만. index==1 은 메타데이터 노드라 열면 안 된다.
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="32e4", ATTRS{idProduct}=="9230", ATTR{index}=="0", GROUP="video", MODE="0660", SYMLINK+="xycar_cam"

@@ -3,10 +3,47 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Generic, Iterable, Optional, TypeVar
 
 import cv2
 import numpy as np
+
+
+T = TypeVar("T")
+
+
+class LatestFrameRateLimiter(Generic[T]):
+    """Keep at most one pending item and release only the newest when due."""
+
+    def __init__(self, max_rate_hz: float) -> None:
+        self.max_rate_hz = float(max_rate_hz)
+        self.period_s = (
+            1.0 / self.max_rate_hz if self.max_rate_hz > 0.0 else 0.0
+        )
+        self.next_allowed_s = 0.0
+        self._latest: Optional[T] = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.period_s > 0.0
+
+    @property
+    def has_pending(self) -> bool:
+        return self._latest is not None
+
+    def offer(self, item: T, now_s: float) -> Optional[T]:
+        if not self.enabled:
+            return item
+        self._latest = item
+        return self.pop_due(now_s)
+
+    def pop_due(self, now_s: float) -> Optional[T]:
+        if self._latest is None or now_s < self.next_allowed_s:
+            return None
+        selected = self._latest
+        self._latest = None
+        self.next_allowed_s = now_s + self.period_s
+        return selected
 
 
 @dataclass(frozen=True)
@@ -148,3 +185,51 @@ def closest_detection(detections: Iterable[Detection]) -> Optional[Detection]:
     """Choose the largest box, matching the existing closest-object policy."""
 
     return max(detections, key=lambda item: item.area, default=None)
+
+
+def normalize_class_ids(values: Iterable[int]) -> set[int]:
+    """Return a validated, de-duplicated set of non-negative class IDs."""
+
+    try:
+        normalized = {int(value) for value in values}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("class IDs must be integers") from exc
+    if any(value < 0 for value in normalized):
+        raise ValueError("class IDs must be non-negative")
+    return normalized
+
+
+def closest_detection_for_classes(
+    detections: Iterable[Detection], class_ids: Iterable[int]
+) -> Optional[Detection]:
+    """Choose the largest detection whose class belongs to ``class_ids``."""
+
+    allowed = normalize_class_ids(class_ids)
+    return closest_detection(
+        detection for detection in detections if detection.class_id in allowed
+    )
+
+
+def detection_slot(
+    detection: Optional[Detection],
+    semantic_type: int,
+) -> list[float]:
+    """Encode one fixed/moving detection as the canonical ten-field slot."""
+
+    if semantic_type not in (0, 1):
+        raise ValueError("semantic type must be fixed(0) or moving(1)")
+    if detection is None:
+        return [0.0, float(semantic_type)] + [0.0] * 8
+    center_x, center_y = detection.center
+    return [
+        1.0,
+        float(semantic_type),
+        float(detection.confidence),
+        float(detection.area),
+        float(center_x),
+        float(center_y),
+        float(detection.x),
+        float(detection.y),
+        float(detection.width),
+        float(detection.height),
+    ]
