@@ -273,10 +273,10 @@ def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
         "lane_detection",
         "object_detection",
         "segmentation_tools",
+        "image_resize",
     }
-    assert "image_resize" not in packages
-    assert "executable='resize_node'" not in source
     assert "'input_topic': '/resized_image'" in source
+    # 하드웨어 드라이버만 빠진다. resize_node 는 처리 노드라 남는다.
     assert not {"xycar_cam", "xycar_lidar"}.intersection(packages)
     assert "default_value='false'" in source
     assert "'udp_motor_bridge', default_value='false'" in source
@@ -307,6 +307,44 @@ def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
         and node.func.id == "IncludeLaunchDescription"
         for node in ast.walk(tree)
     )
+
+
+def test_bag_launch_has_exactly_one_resized_image_supplier():
+    """/resized_image 공급자가 0개도 2개도 되지 않게 막는다.
+
+    resize_node 가 빠져 있던 동안, /image_raw 만 재생하는 bag 에서는
+    /resized_image 발행자가 0이었다. 구독자(object_yolo_node, lane_node,
+    pidnet)는 조용히 대기만 하고 경고 하나 안 났다. 반대로 bag 이
+    /resized_image 를 재생하는데 resize_node 까지 띄우면 같은 토픽에 두 벌이
+    섞여 들어간다.
+    """
+    source = BAG_TEST_LAUNCH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    resize_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "Node"
+        and any(
+            keyword.arg == "package"
+            and ast.literal_eval(keyword.value) == "image_resize"
+            for keyword in node.keywords
+        )
+    ]
+    assert len(resize_calls) == 1
+
+    # bag 이 /resized_image 를 재생할 때만 resize_node 를 끈다.
+    condition = next(
+        keyword.value
+        for keyword in resize_calls[0].keywords
+        if keyword.arg == "condition"
+    )
+    assert isinstance(condition, ast.Call)
+    assert condition.func.id == "UnlessCondition"
+    assert condition.args[0].id == "replay_resized_image"
+    assert "'replay_resized_image', default_value='false'" in source
 
 
 def test_rubbercone_bag_runner_enforces_safe_scan_only_playback():

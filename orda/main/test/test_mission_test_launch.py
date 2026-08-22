@@ -215,7 +215,11 @@ def test_production_bridge_and_bag_isolation_contracts():
     assert "('xycar_motor', '/kmu_main_offline/xycar_motor')" in bag_source
     assert "udp_motor_bridge" in bag_source
     assert "default_value='false'" in bag_source
-    assert "executable='resize_node'" not in bag_source
+    # bag 런치도 resize_node 를 띄운다 (2026-08-22). /image_raw 만 재생하는
+    # bag 에서 /resized_image 발행자가 0이 되어 인지가 조용히 멈추던 문제 때문.
+    # bag 이 /resized_image 를 직접 재생할 때만 replay_resized_image:=true 로 끈다.
+    assert "executable='resize_node'" in bag_source
+    assert "UnlessCondition(replay_resized_image)" in bag_source
 
 
 def test_bag_launch_requires_explicit_live_bridge_opt_in_and_string_profile():

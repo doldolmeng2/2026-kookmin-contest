@@ -770,8 +770,17 @@ ros2 launch main module_drive.py
 # 5=cone, 6=fixed, 7=overtake, 8=shortcut
 ros2 launch main module_drive_mission_test.py test_profile:=2 live_drive:=false
 
-# bag 파일 테스트
+# bag 파일 테스트 (resize_node 가 /image_raw 를 리사이즈해 /resized_image 를 만든다)
 ros2 launch main module_drive_bag_test.py
+ros2 bag play <bag> --loop --clock --topics /scan /image_raw /xycar_ultrasonic
+
+# bag 에 녹화된 /resized_image 를 그대로 쓰고 싶을 때 (차가 실제로 본 프레임)
+ros2 launch main module_drive_bag_test.py replay_resized_image:=true
+ros2 bag play <bag> --loop --clock --topics /scan /image_raw /resized_image /xycar_ultrasonic
+#   ※ 둘을 섞으면 /resized_image 발행자가 둘이 된다. 반대로 둘 다 빠지면
+#     발행자가 0이라 인지 전체가 경고 없이 멈춘다.
+#   ※ bag play 는 하나만 띄운다 — 두 개를 --clock 으로 돌리면 시뮬레이션
+#     시간이 앞뒤로 튄다.
 
 # 국민대 라바콘 FSM bag 통합 테스트 (scan-only, motor 출력 격리)
 ./main/tools/run_rubbercone_bag_test.sh \

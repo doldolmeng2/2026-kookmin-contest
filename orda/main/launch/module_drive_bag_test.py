@@ -6,11 +6,14 @@
 # module_drive.py와의 차이점:
 #   - 하드웨어 드라이버 (카메라, LiDAR) 런치 파일 미포함
 #     → bag 파일이 /image_raw, /scan 등 토픽을 직접 재생하기 때문
+#   - resize_node 는 하드웨어가 아니라 처리 노드라 그대로 띄운다.
+#     bag 이 /resized_image 를 직접 재생하는 경우에만
+#     replay_resized_image:=true 로 끈다 (발행자 중복 방지)
 #   - joy_node 미포함 (하드웨어 없음)
 #   - main_node의 모터 명령을 /kmu_main_offline/xycar_motor로 격리
 #
 # 시작되는 노드:
-#   main_node, rubbercone_node,
+#   main_node, rubbercone_node, resize_node,
 #   lane_node, object_yolo_node, object_node
 #
 # 신호등 인식은 traffic_light 패키지(traffic_node)가 아니라 object_detection
@@ -204,6 +207,20 @@ def generate_launch_description():
         'perception_camera_topic', default_value='/resized_image'
     )
     perception_camera_topic = LaunchConfiguration('perception_camera_topic')
+    # /resized_image 공급자는 정확히 하나여야 한다.
+    #   false(기본): resize_node 가 bag 의 /image_raw 를 리사이즈해서 만든다.
+    #                /resized_image 가 없는 bag 도 그대로 돌릴 수 있다.
+    #   true       : bag 이 /resized_image 를 직접 재생하는 경우. 차가 실제로
+    #                본 프레임(드롭 타이밍 포함)을 재현하려면 이쪽을 쓴다.
+    # 둘 다 켜면 발행자가 둘이라 같은 토픽에 두 벌이 섞여 들어간다.
+    replay_resized_image_arg = DeclareLaunchArgument(
+        'replay_resized_image', default_value='false',
+        description=(
+            'true 면 bag 이 /resized_image 를 재생한다고 보고 resize_node 를 '
+            '띄우지 않는다'
+        ),
+    )
+    replay_resized_image = LaunchConfiguration('replay_resized_image')
 
     # ── 소프트웨어 노드 (하드웨어 드라이버 제외) ────────────────────────────
     main_parameters = [{
@@ -213,6 +230,17 @@ def generate_launch_description():
         'show_debug': show_debug,
         'use_sim_time': True,
     }]
+    # 프로덕션(module_drive.py)과 같은 resize_node 다. bag 테스트에서 빠져 있어서
+    # /image_raw 만 재생하면 /resized_image 발행자가 0이 되고, 인지 전체가
+    # 경고 없이 멈춰 있었다.
+    resize_node = Node(
+        package='image_resize',
+        executable='resize_node',
+        name='resize_node',
+        output='screen',
+        parameters=[{'use_sim_time': True}],
+        condition=UnlessCondition(replay_resized_image),
+    )
     isolated_main_node = Node(
         package='main',
         executable='main_node',
@@ -336,6 +364,8 @@ def generate_launch_description():
         object_enable_gui_arg,
         model_path_arg,
         perception_camera_topic_arg,
+        replay_resized_image_arg,
+        resize_node,
         isolated_main_node,
         live_main_node,
         live_motor_bridge,
