@@ -15,7 +15,7 @@
 // 정지) 판정 + 디바운스(debounce_frames 연속)를 여기서 계산한다.
 //
 // 발행:
-//   /object_info (std_msgs/Int32MultiArray, 3개 필드) — 유일한 출력 토픽.
+//   /object_info (std_msgs/Int32MultiArray, 3개 필드) — FSM(main_node)이 쓰는 요약.
 //   신호등/고정차량/방해차량 정보를 이 하나로 통합해서 낸다 (별도
 //   /traffic_detection 토픽은 발행하지 않는다).
 //   [신호등 정보, 고정차량 위치, 방해차량 위치]
@@ -24,6 +24,15 @@
 //     방해차량 위치: 0=인식x  1=1차선  2=2차선   (object_type=MOVING 일 때만)
 //   차량 위치 둘은 /object_yolo 로 받은 최신 박스(lane_label)를 object_type 에
 //   따라 갈라 넣는다. 각 값 모두 box_max_age_s_ 보다 오래되면 0(인식x)으로 리셋된다.
+//
+//   /object_info_raw (std_msgs/Float32MultiArray, 12개 필드) — 옛 계약 그대로.
+//   [exists, min_dist, angle, span, cluster_count,
+//    box_area, box_cx, box_cy, box_dx, lane_label, object_type, confidence]
+//   main_node(runtime_adapter.record_object_info)가 아직 이 12필드 계약을 읽는다.
+//   /object_info 는 3필드 Int32MultiArray 로 이미 바뀌었고, ROS2는 같은 토픽
+//   이름에 타입이 둘이면 아예 연결되지 않으므로 이름을 나눠 둘 다 발행한다.
+//   LiDAR 필드는 클러스터가 없으면 exists=0, min_dist=+inf, 나머지 0이다.
+//   박스 필드는 box_max_age_s_ 보다 오래되면 전부 0(+object_type=-1)으로 나간다.
 //
 // 디버그 창 (enable_gui=true 시):
 //   "OBJECT DEBUG" : exists / distance / cluster_size (LiDAR 클러스터링, 표시 전용)
@@ -147,6 +156,10 @@ public:
 
         // 장애물 정보 발행 [신호등, 고정차량 위치, 방해차량 위치]
         pub_obj_ = this->create_publisher<std_msgs::msg::Int32MultiArray>("/object_info", qos_fast);
+
+        // 옛 12필드 계약(main_node 가 구독하는 형식)을 같은 틱에 같이 낸다.
+        pub_obj_raw_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
+            "/object_info_raw", qos_fast);
 
         // ── YOLO 모델 초기화 ────────────────────────────────────────────
         // 모델 경로는 개발 PC / 실차 두 곳을 순서대로 확인한다 (resolveModelPath).
@@ -541,28 +554,39 @@ private:
     // 발행 타이머 콜백 (50Hz)
     //
     // LiDAR 상태와 YOLO 박스 상태를 스냅샷으로 읽고
-    // /object_info를 발행한다. 스레드 안전성을 뮤텍스로 보장한다.
+    // /object_info(요약 3필드)와 /object_info_raw(옛 12필드)를 같은 스냅샷으로
+    // 발행한다. 스레드 안전성을 뮤텍스로 보장한다.
     // ─────────────────────────────────────────────────────────────────────
     void onPublishTick() {
-        // LiDAR 클러스터링 결과는 이제 /object_info 에 안 실린다. OBJECT DEBUG
-        // 패널 표시용으로만 계속 읽는다 (onScan 자체는 그대로 둔다).
+        // LiDAR 클러스터링 결과는 요약 토픽(/object_info)에는 안 실린다.
+        // OBJECT DEBUG 패널과 /object_info_raw 의 앞 5필드가 소비자다.
         bool  lidar_ok;
         float minr;
+        float ang;
+        float span;
         int   cnt;
         {
             std::lock_guard<std::mutex> lk(mtx_state_);
             lidar_ok = lidar_valid_;
             minr     = st_min_r_;
+            ang      = st_min_r_ang_;
+            span     = st_span_;
             cnt      = st_count_;
         }
 
         float box_area;
+        float box_cx, box_cy, box_dx;
+        float box_conf;
         int   lane_label;
         int   object_type;
         rclcpp::Time box_stamp{0, 0, RCL_ROS_TIME};
         {
             std::lock_guard<std::mutex> lk(mtx_box_);
             box_area    = last_box_area_pix_;
+            box_cx      = last_box_cx_;
+            box_cy      = last_box_cy_;
+            box_dx      = last_box_dx_;
+            box_conf    = last_object_confidence_;
             lane_label  = last_lane_label_;
             object_type = last_object_type_;
             box_stamp   = last_box_stamp_;
@@ -575,7 +599,19 @@ private:
         if (!box_fresh || box_area <= 0.0f) {
             lane_label  = 0;
             object_type = -1;
+            // raw 계약에서도 "이 프레임에는 카메라 증거 없음"은 박스 필드 전부 0이다
+            // (옛 publisher 가 onImage 에서 하던 리셋과 같은 값).
+            box_area = 0.0f;
+            box_cx   = 0.0f;
+            box_cy   = 0.0f;
+            box_dx   = 0.0f;
+            box_conf = 0.0f;
         }
+        // confidence 는 0..1 을 벗어나면 소비자(runtime_adapter)가 메시지 전체를
+        // 버린다. 검출기 값이 튀어도 한 필드 때문에 12필드가 통째로 날아가지
+        // 않도록 여기서 잘라 낸다 (NaN 도 0 으로).
+        if (!(box_conf >= 0.0f)) box_conf = 0.0f;
+        if (box_conf > 1.0f)     box_conf = 1.0f;
 
         int32_t traffic_state;
         rclcpp::Time traffic_stamp{0, 0, RCL_ROS_TIME};
@@ -604,9 +640,32 @@ private:
         out.data = { traffic_state, fixed_lane, moving_lane };
         pub_obj_->publish(out);
 
-        // 디버그 패널 갱신 (LiDAR exists 는 여기서만 쓰인다)
+        // 클러스터가 없으면 resetLidarState() 가 min_dist=+inf, 각도/폭/개수 0 을
+        // 넣어 둔다. 옛 계약의 "미검출" 표현이 그대로라 변환 없이 싣는다.
+        const float exists = (lidar_ok && (minr <= detect_threshold_m_)) ? 1.0f : 0.0f;
+
+        // /object_info_raw: [exists, min_dist, angle, span, cluster_count,
+        //                    box_area, box_cx, box_cy, box_dx, lane_label,
+        //                    object_type, confidence]
+        std_msgs::msg::Float32MultiArray raw;
+        raw.data = {
+            exists,
+            minr,
+            ang,
+            span,
+            static_cast<float>(cnt),
+            box_area,
+            box_cx,
+            box_cy,
+            box_dx,
+            static_cast<float>(lane_label),
+            static_cast<float>(object_type),
+            box_conf,
+        };
+        pub_obj_raw_->publish(raw);
+
+        // 디버그 패널 갱신
         if (enable_gui_) {
-            const float exists = (lidar_ok && (minr <= detect_threshold_m_)) ? 1.0f : 0.0f;
             std::lock_guard<std::mutex> lk(mtx_);
             dbg_exists_   = exists;
             dbg_dist_     = minr;
@@ -846,11 +905,9 @@ private:
         {
             cv::Mat canvas(240, 480, CV_8UC3, cv::Scalar(30, 30, 30));
             float exists, dist, csz;
-            bool ok;
             {
                 std::lock_guard<std::mutex> lk(mtx_);
                 exists = dbg_exists_; dist = dbg_dist_; csz = dbg_csize_;
-                ok = last_rx_ok_;
             }
 
             // 소수점 형식 문자열 변환 헬퍼
@@ -1015,6 +1072,7 @@ private:
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr  sub_yolo_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr  sub_traffic_boxes_;
     rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr       pub_obj_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr     pub_obj_raw_;
     rclcpp::TimerBase::SharedPtr timer_;      // 디버그 창 갱신 타이머
     rclcpp::TimerBase::SharedPtr pub_timer_;  // 발행 타이머
 

@@ -190,6 +190,13 @@ main/main/
          신호등 정보:   0=인식x  1=정지(빨강/주황)  2=직진(초록)  3=좌회전
          고정차량 위치: 0=인식x  1=1차선  2=2차선
          방해차량 위치: 0=인식x  1=1차선  2=2차선
+         /object_info_raw               (std_msgs/Float32MultiArray, 12 필드)  [추가, 2026-08-22]
+         [exists, min_dist, angle, span, cluster_count,
+          box_area, box_cx, box_cy, box_dx, lane_label, object_type, confidence]
+         옛 12필드 계약 그대로. `main_node`(`runtime_adapter.record_object_info`)가
+         아직 이 형식을 읽으므로, 같은 발행 틱에서 요약본과 함께 낸다.
+         (`/object_info` 는 타입이 이미 `Int32MultiArray` 라 같은 이름으로는
+         타입 충돌로 아예 연결되지 않아 토픽을 나눴다.)
 
   ※ traffic_light 패키지(traffic_node)는 더 이상 launch 되지 않는다. 신호등 인식은
     object_yolo_node(추론) + object_node(우선순위 판정·디바운스)가 전담한다.
@@ -213,6 +220,7 @@ main/main/
 | 토픽 | 변경 내용 | 사유 |
 |---|---|---|
 | `/traffic_detection` | `Bool` → `Int32`(4상태) → **폐지, `/object_info[0]`으로 흡수 (2026-08-18)** | 신호등 인식을 `object_detection` 패키지로 통합하면서 별도 토픽 대신 `/object_info` 하나로 합침 |
+| `/object_info_raw` | **신설 (2026-08-22)** — 옛 `Float32MultiArray` 12필드를 `object_node` 가 그대로 재발행 | `main_node` 가 옛 계약을 읽는 동안 타입 충돌 없이 이어 붙이기 위한 다리. `main_node` 를 3필드 계약으로 옮기면 없앤다 |
 | `/object_info` | `Float32MultiArray` 12필드 → **`Int32MultiArray` 3필드 (2026-08-18)** | `[신호등, 고정차량 위치, 방해차량 위치]`만 최종 소비자(FSM)에 필요 — LiDAR 원시값(exists/거리/각도 등)은 더 이상 안 실음. **`main_node`는 아직 옛 계약을 구독 중이라 미반영** |
 | `/road_surface` | `Int32` 신설 (`0` 미확정, `1` 기본 검은 도로, `2` 흰 지름길) | 지름길을 실제로 본 뒤 기본 도로가 연속 인식될 때만 종료 |
 | `/mode_info` | 현재 `[legacy_mode_code, lane]` 유지 | 실제 소비자인 `lane_detection.cpp`가 아직 3=차선주행, 5=차선변경 계약을 사용한다. 4필드 신규 계약은 소비자 변경 전까지 발행하지 않는다. |

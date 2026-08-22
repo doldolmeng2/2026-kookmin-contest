@@ -29,9 +29,10 @@ install(PROGRAMS
   scripts/object_yolo_node.py
   DESTINATION lib/${PROJECT_NAME})
 
+# best_simplified.onnx 는 이 브랜치에 없고 로드하는 코드도 없다.
+# 목록에 남겨 두면 install 단계에서 통째로 실패한다.
 install(FILES
   best.onnx
-  best_simplified.onnx
   DESTINATION share/${PROJECT_NAME}/model)
 
 ament_package()
