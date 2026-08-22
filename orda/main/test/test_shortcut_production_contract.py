@@ -1,6 +1,6 @@
 import pytest
 
-from main.control_selector import CommandCandidate, DriveCommand
+from main.control_selector import CommandCandidate, ControlSource, DriveCommand
 from main.mission_observation import MissionObservation
 from main.mission_types import RouteTrafficSignal
 from main.race_context import RaceContext
@@ -133,3 +133,23 @@ def test_stop_discards_old_shortcut_exit_evidence_before_recovery():
     next_cycle = adapter.step(1.9, lane=command)
     assert next_cycle.transition.changed is False
     assert adapter.fsm.state is Mode.SHORTCUT
+
+
+def test_shortcut_ignores_route_traffic_hold_and_uses_lane_command():
+    adapter = RaceRuntimeAdapter(
+        fsm=RaceFSM(initial_state=Mode.SHORTCUT),
+        context=RaceContext(
+            completed_laps=1,
+            shortcut_lap=2,
+            state_entered_at=1.0,
+        ),
+    )
+    adapter.record_route_traffic(RouteTrafficSignal.RED_AMBER, 1.1)
+    command = CommandCandidate(DriveCommand(7.0, 5.0), received_at=1.1)
+
+    cycle = adapter.step(1.1, lane=command)
+
+    assert cycle.transition.target is Mode.SHORTCUT
+    assert cycle.control.source is ControlSource.LANE
+    assert cycle.control.command == DriveCommand(7.0, 5.0)
+    assert adapter.traffic_stop_override is False

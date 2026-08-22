@@ -44,6 +44,7 @@ from main.relative_x_fallback import (
     object_mission_entry_allowed,
 )
 from main.same_lane_brake import SameLaneBrake, SameLaneBrakeDecision
+from main.shortcut_entry import ShortcutEntryDecision, ShortcutEntryGuard
 from main.shortcut_exit import ShortcutExitGuard
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
@@ -237,6 +238,8 @@ class MainNode(Node):
         self._zone_state: Optional[Mode] = None   # 직전 사이클의 FSM 상태
         self._zone_exit_sent = False              # 현재 구간의 종료 엣지를 이미 냈는지
         self._fixed_entry_sent = False            # 이번 LANE_DRIVE 세션에서 진입 엣지를 냈는지
+        self.shortcut_entry = ShortcutEntryGuard()
+        self._last_shortcut_entry_decision: Optional[ShortcutEntryDecision] = None
         self.shortcut_exit = ShortcutExitGuard()
         self._shortcut_exit_sent = False
 
@@ -435,12 +438,53 @@ class MainNode(Node):
             )
             return
 
+        # 지름길 주행 중에는 YOLO traffic/object 판단이 주황 조명 오인식 등으로
+        # 주행을 멈추게 만들 수 있으므로 main 제어 입력으로 쓰지 않는다.
+        if self.runtime.fsm.state is Mode.SHORTCUT:
+            self.traffic_signal = int(signal)
+            return
+
         # Preserve the start-only WAIT_GREEN contract.
         is_green = signal in (
             RouteTrafficSignal.STRAIGHT,
             RouteTrafficSignal.LEFT,
         )
         self.runtime.record_traffic(is_green, received_at)
+
+        shortcut_decision: Optional[ShortcutEntryDecision] = None
+        if self.runtime.fsm.state is Mode.LANE_DRIVE:
+            if signal is RouteTrafficSignal.LEFT:
+                self.runtime.traffic_stop_override = False
+            shortcut_decision = self.shortcut_entry.update(
+                signal is RouteTrafficSignal.LEFT,
+                received_at,
+            )
+            self._last_shortcut_entry_decision = shortcut_decision
+            if shortcut_decision.enter:
+                result = self.runtime.record_route_traffic(
+                    RouteTrafficSignal.LEFT,
+                    received_at,
+                    encounter_started=True,
+                )
+                if not result.accepted:
+                    self._warn_throttled(
+                        "malformed_route_traffic",
+                        result.warning or "invalid route traffic input ignored",
+                        received_at,
+                    )
+                else:
+                    self._traffic_encounter_active = True
+                    self.get_logger().info(
+                        "좌회전 신호 1초 감지 후 미검출 확인 -> 지름길 진입"
+                    )
+                self.traffic_signal = int(signal)
+                return
+            if signal is RouteTrafficSignal.LEFT or self.shortcut_entry.armed:
+                self.traffic_signal = int(signal)
+                return
+        else:
+            self.shortcut_entry.reset()
+            self._last_shortcut_entry_decision = None
 
         # One lap encounter edge per visible traffic-light episode.
         # RED_AMBER does not start an encounter. UNKNOWN rearms the edge.
@@ -471,6 +515,9 @@ class MainNode(Node):
         """Consume the PPT ``[traffic, fixed_lane, moving_lane]`` contract."""
 
         received_at = self._now_seconds()
+        if self.runtime.fsm.state is Mode.SHORTCUT:
+            return
+
         data = list(msg.data)
         if (
             len(data) != 3
@@ -537,7 +584,7 @@ class MainNode(Node):
             self.detected_lane = detected_lane
 
     def road_surface_callback(self, msg: Int32) -> None:
-        """Consume CNN road labels: 0 unknown, 1 black road, 2 white shortcut."""
+        """Consume road labels: 0 unknown, 1 normal road, 2 shortcut label."""
 
         if self.runtime.fsm.state is not Mode.SHORTCUT:
             return
@@ -549,11 +596,14 @@ class MainNode(Node):
             self._shortcut_exit_sent = True
             self.runtime.record_shortcut_complete(now)
             self.get_logger().info(
-                "지름길 흰 차선 이후 검은 도로 연속 인식 -> 차선 주행 복귀"
+                "지름길 라벨 연속 미검출 -> 차선 주행 복귀"
             )
 
     def object_info_raw_callback(self, msg: Float32MultiArray) -> None:
         received_at = self._now_seconds()
+        if self.runtime.fsm.state is Mode.SHORTCUT:
+            return
+
         data = msg.data
         result = self.runtime.record_object_info(data, received_at)
         if not result.accepted:
@@ -706,6 +756,8 @@ class MainNode(Node):
 
         self.overtake.enter_zone(now)
         self._zone_exit_sent = False
+        self.shortcut_entry.reset()
+        self._last_shortcut_entry_decision = None
         self.shortcut_exit.reset()
         self._shortcut_exit_sent = False
 
@@ -850,6 +902,8 @@ class MainNode(Node):
         )
         self._zone_state = None
         self._zone_exit_sent = False
+        self.shortcut_entry.reset()
+        self._last_shortcut_entry_decision = None
         self.shortcut_exit.reset()
         self._shortcut_exit_sent = False
 
@@ -980,6 +1034,8 @@ class MainNode(Node):
 
         if state is Mode.SHORTCUT:
             if entered:
+                self.shortcut_entry.reset()
+                self._last_shortcut_entry_decision = None
                 self.shortcut_exit.reset()
                 self._shortcut_exit_sent = False
             return

@@ -1082,6 +1082,8 @@ class RaceRuntimeAdapter:
             fault_reason=fault_reason,
         )
         transition = self.fsm.step(observation, self.context, safety)
+        if self.fsm.state is Mode.SHORTCUT:
+            self.traffic_stop_override = False
         self._update_lane_action(observation, transition)
         control = self.selector.select(
             self.fsm.state,
@@ -1089,7 +1091,10 @@ class RaceRuntimeAdapter:
             lane=lane,
             cone=cone,
             mission_lane_authorized=self.lane_action.safe_to_drive,
-            traffic_hold=self.traffic_stop_override,
+            traffic_hold=(
+                self.traffic_stop_override
+                and self.fsm.state is not Mode.SHORTCUT
+            ),
             safety_hold=safety.must_stop,
         )
         fsm_control = ControlCycleResult(transition=transition, control=control)
