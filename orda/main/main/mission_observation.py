@@ -56,6 +56,10 @@ class MissionObservation:
     route_traffic_received_at: Optional[float] = None
     traffic_encounter_started: bool = False
     traffic_encounter_received_at: Optional[float] = None
+    # True only for an edge emitted by TrafficEncounterGate and retained by
+    # RaceRuntimeAdapter. Such an edge may outlive the normal message TTL while
+    # safety HOLD is active, but it is still consumed exactly once afterward.
+    traffic_encounter_approved: bool = False
     overtake_complete: bool = False
     shortcut_complete: bool = False
     overtake_complete_received_at: Optional[float] = None

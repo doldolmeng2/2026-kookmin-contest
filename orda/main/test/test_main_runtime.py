@@ -35,10 +35,12 @@ from main.main import (
     sensor_event_qos,
 )
 from main.overtake import OvertakeGuard
+from main.object_mission_episode import ObjectMissionEpisodeGate
 from main.relative_x_fallback import RelativeXObstacleLaneFallback
+from main.traffic_encounter import TrafficEncounterGate
 from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
-from main.runtime_adapter import RaceRuntimeAdapter
+from main.runtime_adapter import RaceRuntimeAdapter, runtime_safety_monitor
 from main.mission_types import (
     LaneTarget,
     ObjectLane,
@@ -55,13 +57,16 @@ class CallbackHarness:
             context=RaceContext(state_entered_at=0.5),
         )
         self.warnings = []
-        self._traffic_encounter_active = False
+        self.traffic_encounter = TrafficEncounterGate(1.0)
         self.fixed_vehicle_lane = 0
         self.moving_vehicle_lane = 0
         self.traffic_signal = 0
         self.overtake = OvertakeGuard()
         self.relative_x_fallback = RelativeXObstacleLaneFallback(
             encounter_timeout_s=RELATIVE_X_ENCOUNTER_TIMEOUT_S,
+        )
+        self.object_mission_episode = ObjectMissionEpisodeGate(
+            RELATIVE_X_ENCOUNTER_TIMEOUT_S,
         )
         self.side_left = float("inf")
         self.side_right = float("inf")
@@ -145,7 +150,9 @@ def _record_object_entry(harness, object_type, lane, *, now):
     assert harness.runtime.record_lane_offset(0, now)
     assert harness.runtime.record_scan(now)
     MainNode._drive_mission_zones(harness, now)
-    return harness.runtime.step(now)
+    cycle = harness.runtime.step(now)
+    MainNode._commit_object_mission_episode(harness, cycle)
+    return cycle
 
 
 def test_main_cone_callback_records_ros_clock_receipt_once():
@@ -451,8 +458,10 @@ def test_relative_x_same_lane_creates_one_edge_and_locks_target(
     assert harness.runtime.record_lane_offset(0, 1.31)
     assert harness.runtime.record_scan(1.31)
     cycle = harness.runtime.step(1.31)
+    MainNode._commit_object_mission_episode(harness, cycle)
 
     assert cycle.transition.target is expected_state
+    assert harness._fixed_entry_sent is True
     assert harness.runtime.context.lane_target is expected_target
     assert harness.runtime.lane_action.target_locked is True
 
@@ -482,6 +491,84 @@ def test_fresh_relative_x_latch_survives_cone_return_for_same_encounter():
 
     assert len(harness.runtime._mission_events["fixed_zone_entry"]) == 1
     assert harness.relative_x_fallback.latched_lane is ObjectLane.RIGHT
+
+
+def test_completed_overtake_cannot_reenter_until_object_episode_releases():
+    harness = ObjectEntryHarness(
+        [1.10, 2.10, 4.20],
+        mode=Mode.LANE_DRIVE,
+        state_entered_at=1.0,
+    )
+
+    first = _record_object_entry(
+        harness,
+        ObjectType.MOVING,
+        ObjectLane.RIGHT,
+        now=1.11,
+    )
+    assert first.transition.target is Mode.OVERTAKE
+    assert harness.object_mission_episode.consumed is True
+
+    # A real control cycle records ownership of the active mission state.
+    harness._zone_state = Mode.OVERTAKE
+    assert harness.runtime.record_overtake_complete(2.0).accepted
+    completed = harness.runtime.step(2.0)
+    assert completed.transition.target is Mode.LANE_DRIVE
+
+    # Same detector episode stays fresh after the mission completed.
+    MainNode.object_info_raw_callback(
+        harness,
+        _object_entry_message(ObjectType.MOVING, ObjectLane.RIGHT),
+    )
+    MainNode._drive_mission_zones(harness, 2.11)
+    assert len(harness.runtime._mission_events["overtake_entry"]) == 0
+
+    # Only the shared 1.90 s clear boundary creates a new encounter.
+    MainNode._drive_mission_zones(harness, 4.01)
+    MainNode.object_info_raw_callback(
+        harness,
+        _object_entry_message(ObjectType.MOVING, ObjectLane.LEFT),
+    )
+    MainNode._drive_mission_zones(harness, 4.21)
+    assert len(harness.runtime._mission_events["overtake_entry"]) == 1
+
+
+def test_object_episode_is_consumed_only_after_entry_survives_safety_hold():
+    harness = ObjectEntryHarness(
+        [2.0, 2.1],
+        mode=Mode.LANE_DRIVE,
+        state_entered_at=1.0,
+    )
+    harness.runtime.safety_monitor = runtime_safety_monitor()
+
+    MainNode.object_info_raw_callback(
+        harness,
+        _object_entry_message(ObjectType.MOVING, ObjectLane.RIGHT),
+    )
+    assert harness.runtime.record_lane_offset(0, 0.0)
+    assert harness.runtime.record_scan(2.0)
+    assert harness.runtime.record_side_clearance(1.0, 1.0, 2.0)
+    MainNode._drive_mission_zones(harness, 2.0)
+    held = harness.runtime.step(2.0)
+    MainNode._commit_object_mission_episode(harness, held)
+    assert held.safety.must_stop is True
+    assert harness.runtime.fsm.state is Mode.LANE_DRIVE
+    assert harness.object_mission_episode.consumed is False
+    assert harness._fixed_entry_sent is False
+
+    MainNode.object_info_raw_callback(
+        harness,
+        _object_entry_message(ObjectType.MOVING, ObjectLane.RIGHT),
+    )
+    assert harness.runtime.record_lane_offset(0, 2.1)
+    assert harness.runtime.record_scan(2.1)
+    assert harness.runtime.record_side_clearance(1.0, 1.0, 2.1)
+    MainNode._drive_mission_zones(harness, 2.1)
+    committed = harness.runtime.step(2.1)
+    MainNode._commit_object_mission_episode(harness, committed)
+    assert committed.transition.target is Mode.OVERTAKE
+    assert harness.object_mission_episode.consumed is True
+    assert harness._fixed_entry_sent is True
 
 
 @pytest.mark.parametrize(
@@ -920,7 +1007,8 @@ def test_main_object_info_maps_straight_to_green_and_route_signal():
 
     assert cycle.observation.green_detected is True
     assert cycle.observation.route_traffic_signal is RouteTrafficSignal.STRAIGHT
-    assert cycle.observation.traffic_encounter_started is True
+    # The start fixture releases WAIT_GREEN but is not a completed race lap.
+    assert cycle.observation.traffic_encounter_started is False
     assert harness.warnings == []
 
 
@@ -936,7 +1024,7 @@ def test_main_object_info_red_sets_route_stop_override():
     assert harness.warnings == []
 
 
-def test_main_traffic_encounter_is_one_edge_until_unknown_rearms():
+def test_main_traffic_encounter_brief_unknown_does_not_rearm():
     harness = CallbackHarness(
         [7.0, 7.1, 7.2, 7.3],
         mode=Mode.LANE_DRIVE,
@@ -956,8 +1044,58 @@ def test_main_traffic_encounter_is_one_edge_until_unknown_rearms():
 
     assert first.observation.traffic_encounter_started is True
     assert repeated.observation.traffic_encounter_started is False
+    assert second.observation.traffic_encounter_started is False
+    assert harness.runtime.context.completed_laps == 1
+
+
+def test_main_traffic_encounter_sustained_unknown_rearms():
+    harness = CallbackHarness([7.0, 7.2, 8.3], mode=Mode.LANE_DRIVE)
+    MainNode.object_info_callback(harness, SimpleNamespace(data=[2, 0, 0]))
+    first = harness.runtime.step(7.0)
+    MainNode.object_info_callback(harness, SimpleNamespace(data=[0, 0, 0]))
+    harness.runtime.step(7.2)
+    MainNode.object_info_callback(harness, SimpleNamespace(data=[3, 0, 0]))
+    second = harness.runtime.step(8.3)
+    assert first.observation.traffic_encounter_started is True
     assert second.observation.traffic_encounter_started is True
     assert harness.runtime.context.completed_laps == 2
+
+
+def test_wait_green_then_three_physical_traffic_episodes_complete_three_laps():
+    harness = CallbackHarness(
+        [1.0, 2.0, 3.1, 4.0, 5.1, 6.0, 7.1],
+        mode=Mode.WAIT_GREEN,
+    )
+
+    def traffic(signal, now):
+        assert harness.runtime.record_lane_offset(0, now)
+        assert harness.runtime.record_scan(now)
+        MainNode.object_info_callback(
+            harness,
+            SimpleNamespace(data=[signal.value, 0, 0]),
+        )
+        return harness.runtime.step(now)
+
+    # Startup green starts the race but is not a lap encounter.
+    traffic(RouteTrafficSignal.STRAIGHT, 1.0)
+    assert harness.runtime.context.completed_laps == 0
+
+    traffic(RouteTrafficSignal.UNKNOWN, 2.0)
+    traffic(RouteTrafficSignal.STRAIGHT, 3.1)
+    assert harness.runtime.context.completed_laps == 1
+
+    traffic(RouteTrafficSignal.UNKNOWN, 4.0)
+    second = traffic(RouteTrafficSignal.LEFT, 5.1)
+    assert second.transition.target is Mode.SHORTCUT
+    assert harness.runtime.context.completed_laps == 2
+    assert harness.runtime.context.shortcut_lap == 3
+
+    assert harness.runtime.record_shortcut_complete(5.5).accepted
+    assert harness.runtime.step(5.5).transition.target is Mode.LANE_DRIVE
+    traffic(RouteTrafficSignal.UNKNOWN, 6.0)
+    third = traffic(RouteTrafficSignal.LEFT, 7.1)
+    assert third.transition.target is Mode.FINISH
+    assert harness.runtime.context.completed_laps == 3
 
 
 def test_main_object_info_invalid_value_is_rejected():
@@ -1217,6 +1355,58 @@ def test_hold_source_ramps_speed_down_and_holds_the_steering_angle():
     assert speed == pytest.approx(21.5 - STOP_DECEL_STEP)
     # 곡선 주행 중 앞바퀴를 펴면 감속하는 동안 코스 밖으로 밀려난다.
     assert angle == pytest.approx(12.0)
+
+
+def test_finish_commit_publishes_terminal_zero_on_first_and_next_cycle():
+    """Committed FINISH bypasses HOLD shaping at the actual publisher seam."""
+
+    class CapturePublisher:
+        def __init__(self):
+            self.messages = []
+
+        def publish(self, message):
+            self.messages.append(tuple(message.data))
+
+    rclpy.init(args=['--ros-args', '-p', 'mode:=1'])
+    node = None
+    try:
+        node = MainNode()
+        node.runtime.fsm.state = Mode.LANE_DRIVE
+        node.runtime.context.state_entered_at = 1.0
+        node.runtime.context.completed_laps = 2
+        node.runtime.context.race_started_at = 1.0
+        node.now_speed = 17.8
+        node.now_angle = 11.0
+        capture = CapturePublisher()
+        node.motor_pub = capture
+
+        assert node.runtime.record_lane_offset(0, 10.0)
+        assert node.runtime.record_scan(10.0)
+        assert node.runtime.record_route_traffic(
+            RouteTrafficSignal.LEFT,
+            10.0,
+            encounter_started=True,
+        ).accepted
+        node._now_seconds = lambda: 10.0
+
+        node.control_cycle()
+
+        assert node.runtime.fsm.state is Mode.FINISH
+        assert capture.messages[-1] == pytest.approx((0.0, 0.0))
+        assert node.now_angle == pytest.approx(0.0)
+        assert node.now_speed == pytest.approx(0.0)
+
+        node._now_seconds = lambda: 10.02
+        node.control_cycle()
+
+        assert node.runtime.fsm.state is Mode.FINISH
+        assert capture.messages[-1] == pytest.approx((0.0, 0.0))
+        assert node.now_angle == pytest.approx(0.0)
+        assert node.now_speed == pytest.approx(0.0)
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
 
 
 def test_hold_source_still_reaches_a_full_stop_quickly():

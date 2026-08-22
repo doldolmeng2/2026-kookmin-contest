@@ -20,6 +20,7 @@
   <exec_depend>lane_detection</exec_depend>
   <exec_depend>object_detection</exec_depend>
   <exec_depend>rubbercone</exec_depend>
+  <exec_depend>road_surface</exec_depend>
   <exec_depend>joy</exec_depend>
   <exec_depend>xycar_cam</exec_depend>
   <exec_depend>xycar_lidar</exec_depend>

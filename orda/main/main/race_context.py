@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import ClassVar, Optional
 
-from .mission_types import LaneTarget
+from .mission_types import LaneTarget, PendingRouteAction
 
 
 @dataclass(init=False)
@@ -19,6 +19,7 @@ class RaceContext:
     state_entered_at: Optional[float]
     cone_entered_at: Optional[float]
     last_traffic_encounter_at: Optional[float]
+    pending_route_action: Optional[PendingRouteAction]
     stop_reason: Optional[str]
 
     def __init__(
@@ -30,6 +31,7 @@ class RaceContext:
         state_entered_at: Optional[float] = None,
         cone_entered_at: Optional[float] = None,
         last_traffic_encounter_at: Optional[float] = None,
+        pending_route_action: Optional[PendingRouteAction] = None,
         stop_reason: Optional[str] = None,
         *,
         # Compatibility-only constructor aliases. They are never stored as a
@@ -56,6 +58,9 @@ class RaceContext:
         self.state_entered_at = state_entered_at
         self.cone_entered_at = cone_entered_at
         self.last_traffic_encounter_at = last_traffic_encounter_at
+        self.pending_route_action = self._validate_pending_route_action(
+            pending_route_action
+        )
         self.stop_reason = stop_reason
 
     @property
@@ -116,3 +121,16 @@ class RaceContext:
             return LaneTarget(value)
         except (TypeError, ValueError) as exc:
             raise ValueError("invalid lane_target") from exc
+
+    @staticmethod
+    def _validate_pending_route_action(
+        value: Optional[PendingRouteAction],
+    ) -> Optional[PendingRouteAction]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("invalid pending_route_action")
+        try:
+            return PendingRouteAction(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid pending_route_action") from exc

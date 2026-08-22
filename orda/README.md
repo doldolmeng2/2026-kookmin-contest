@@ -350,7 +350,18 @@ YOLOv8 ONNX를 `forward()`할 때 shape assertion으로 죽는** 고질적인 �
 - `traffic_node`는 launch에서 뺐다(같이 띄우면 `/traffic_boxes`에 퍼블리셔가
   겹친다). 코드는 참고용으로 남아있다.
 
-#### 신호등 판정을 ROI 크롭 + 분류기 2단계로 (2026-08-19)
+#### 단일 detector 직접 매핑 (2026-08-22, 현재 production)
+
+차량과 신호등은 `model/train10_detector_best.onnx` 한 개로 추론한다. detector
+class 1/2/3/5는 `/traffic_boxes` signal index 0/1/2/3으로 직접 매핑하고, generic
+class 6은 상태 증거에서 제외한다. 별도 crop classifier와 C++ fallback은 제거했다.
+`/object_yolo`, `/traffic_boxes`, `/object_info`, `/object_info_raw` 계약과 기존
+traffic 우선순위·디바운스·freshness는 유지한다.
+
+#### 신호등 ROI 크롭 + 분류기 2단계 (2026-08-19, 폐기된 역사 기록)
+
+> 아래 절은 단일 detector 전환 전에 사용한 2-model 설계의 분석 기록이다.
+> 현재 production 실행 경로나 배포 모델 계약으로 사용하지 않는다.
 
 > 이 절의 "크롭·분류를 C++ 로 옮겼다"는 부분은 아래 「크롭·분류를 다시
 > `object_yolo_node.py` 로」에서 되돌렸다. 2단계 구조와 전처리 규약 자체는 유효하다.
@@ -363,7 +374,7 @@ YOLOv8 ONNX를 `forward()`할 때 shape assertion으로 죽는** 고질적인 �
 판정이 뒤집혔고, 좌회전 recall이 0.66에 머물렀다.
 
 **결정**: 검출기는 '신호등이 여기 있다'는 **위치만** 쓰고, 무슨 신호인지는 박스를
-잘라(마진 15%) 64×64 정사각으로 늘려 넣는 별도 분류기(`light_cls.onnx`)가 정한다.
+잘라(마진 15%) 64×64 정사각으로 늘려 넣는 별도 분류기가 정했다.
 크기를 고정하면 '멀면 작다'는 지름길 단서가 사라진다. 같은 val에서 좌회전 정확도
 0.94, 전체 0.983.
 
@@ -377,8 +388,7 @@ YOLOv8 ONNX를 `forward()`할 때 shape assertion으로 죽는** 고질적인 �
   클래스를 다시 보게 되어 크롭 분류가 무의미해지므로 1개만 낸다.
 - 분류기 모델이 없거나 `traffic_class_ids` 길이가 분류기 클래스 수와 다르면 경고만
   남기고 **검출기 클래스를 그대로 내보내는 종전 동작**으로 돌아간다.
-- 관련 파라미터: `light_classifier_path`(빈 값이면 share의 `model/light_cls.onnx`),
-  `light_crop_margin`(0.15), `light_input_size`(64), `light_min_confidence`(0.90).
+- 관련 classifier path/crop/input/confidence 파라미터는 단일 detector 전환에서 제거됐다.
   `traffic_class_ids`는 이제 **순서가 의미를 갖는다** — 분류기 출력 순서(green,
   left_green, orange, red)와 1:1.
 
@@ -409,8 +419,8 @@ YOLOv8 ONNX를 `forward()`할 때 shape assertion으로 죽는** 고질적인 �
 빠져나가는 구간에, 분류기가 `orange` 를 0.9 이상으로 확신**했다. `orange` 는
 `traffic_raw=1`(정지)이라 초록불 바로 아래에서 정지 판정이 나간다.
 
-**원인은 분류기가 아니라 크롭 원본 프레임이었다.** `classifyLight()` 는 `/traffic_boxes`
-로 받은 박스를 자기가 들고 있는 `last_raw_img_`(= 가장 최근에 도착한 프레임)에서
+**원인은 분류기가 아니라 크롭 원본 프레임이었다.** 당시 C++ crop 함수는 `/traffic_boxes`
+로 받은 박스를 자기가 들고 있는 최신 raw frame에서
 잘랐는데, 그건 그 박스를 만든 프레임이 아니다. 검출기 forward 가 CPU 에서 **73.6 ms**
 (30fps 기준 2~3프레임)이고, 접근 말미의 박스 이동량은 **평균 4~6 px/frame, 최대
 20 px/frame** 인데 그때 박스 높이는 이미 10~25 px 다. 즉 몇 프레임만 밀려도 크롭이
@@ -429,7 +439,7 @@ YOLOv8 ONNX를 `forward()`할 때 shape assertion으로 죽는** 고질적인 �
 
 **결정**: 크롭·분류를 `object_yolo_node.py` 의 `on_image()` 안으로 되돌렸다. 검출에 쓴
 `image` 배열을 그대로 자르므로 프레임 어긋남이 **구조적으로** 생길 수 없다(타임스탬프
-매칭이나 링버퍼가 필요 없다). `light_cls.onnx` 는 크롭당 **1.03 ms** 라 73.6 ms 짜리
+매칭이나 링버퍼가 필요 없다). 당시 crop model은 크롭당 **1.03 ms** 라 73.6 ms 짜리
 검출기 옆에서 비용이 무시된다.
 
 - `/traffic_boxes` 형식(6개씩 `[class_id, confidence, x, y, w, h]`)은 **그대로**다.
@@ -438,7 +448,7 @@ YOLOv8 ONNX를 `forward()`할 때 shape assertion으로 죽는** 고질적인 �
 - 박스는 **전부** 내보낸다. 예전 Python 구현이 1개만 낸 이유(C++ 우선순위 판정이
   검출기 클래스를 다시 보게 됨)가 사라졌고, 좌회전 화살표는 초록 원과 같이 켜지는
   경우가 많아 여러 박스를 한꺼번에 봐야 한다.
-- **`object_node` 의 `light_net_`/`classifyLight()` 는 남겨 뒀다.** `class_id` 가
+- **당시 `object_node`의 C++ crop fallback을 남겨 뒀다.** `class_id` 가
   0~3 밖이면(= Python 쪽이 분류기를 못 띄웠으면) 예전처럼 여기서 직접 자르는 폴백으로
   간다. 폴백은 위 프레임 어긋남 한계를 그대로 갖는다.
 - 우선순위(좌회전>직진>정지)·디바운스·확신도 게이트는 계속 `object_node` 가 한다.
@@ -506,8 +516,8 @@ YOLOv8 ONNX를 `forward()`할 때 shape assertion으로 죽는** 고질적인 �
 재학습이 1순위로 올라간다.** 재학습 데이터는 이미 있다 — 이 bag 의 lag 크롭(램프 없는
 하우징)과 위 임의 크롭이 그대로 hard negative 후보라 새로 촬영할 필요는 없다.
 
-**폴백 상태 감지 (2026-08-19)**: `class_id` 가 -1(Python 쪽 `light_cls.onnx` 미로드)로
-와서 `object_node` 가 `classifyLight()` 폴백을 타면, `/object_yolo`·`/traffic_boxes` 는
+**폴백 상태 감지 (2026-08-19)**: `class_id` 가 -1(Python 쪽 crop model 미로드)로
+와서 `object_node` 가 C++ crop fallback을 타면, `/object_yolo`·`/traffic_boxes` 는
 계속 정상 발행되기 때문에 겉보기엔 시스템이 멀쩡해 보인다 — 위 프레임 어긋남 버그가
 소리 없이 되살아나 있는 상태를 아무도 못 알아채는 게 진짜 위험이다. 그래서 이 상태를
 계속 알리는 장치를 넣었다:
@@ -515,11 +525,11 @@ YOLOv8 ONNX를 `forward()`할 때 shape assertion으로 죽는** 고질적인 �
   로그 한 줄은 스크롤로 사라지므로, 나중에 붙어서 로그를 보는 사람도 알 수 있어야 한다).
   크롭·추론 자체가 매 프레임 실패하는 경우의 에러 로그도 5초로 묶었다(`throttle_duration_sec`).
 - `object_node`(C++): `onTrafficBoxes()`가 폴백을 탈 때마다 5초 묶음
-  `RCLCPP_WARN_THROTTLE`을 낸다. 폴백조차 안 되면(`light_ok_=false`, 신호등 인식이
+  `RCLCPP_WARN_THROTTLE`을 냈다. 폴백조차 안 되면(모델 미로드, 신호등 인식이
   완전히 죽은 상태) `RCLCPP_ERROR_THROTTLE`로 더 크게 알린다.
 
-**모델 클래스 변천**: `train-3`(7클래스, `4-traffic` 몸체 포함) → `train-4`(같은
-7클래스, 재학습) → `train-5`(6클래스, `4-traffic` 제거 — **현재 배포**). 클래스가
+**과거 모델 클래스 변천**: `train-3`(7클래스, `4-traffic` 몸체 포함) → `train-4`(같은
+7클래스, 재학습) → `train-5`(6클래스, `4-traffic` 제거 — 당시 배포). 클래스가
 바뀔 때마다 `object_yolo_node.py`/`traffic_node.py`/`object_detection.cpp` 세
 곳의 클래스 ID 상수를 같이 맞춰야 했다. 상세 지표는 위 "통합 YOLO 모델" 절 참고.
 

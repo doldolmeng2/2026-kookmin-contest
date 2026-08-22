@@ -5,34 +5,15 @@
 //
 // 구독:
 //   /scan              (sensor_msgs/LaserScan)           - LiDAR 거리 데이터 (디버그 표시용)
-//   /resized_image     (sensor_msgs/Image, BGR8)          - 디버그 영상 + 크롭 분류 폴백 원본
+//   /resized_image     (sensor_msgs/Image, BGR8)          - 디버그 영상 + legacy 내부 YOLO 입력
 //   /object_yolo       (std_msgs/Float32MultiArray)       - ONNX Runtime 차량 검출(가장 가까운 1개)
-//   /traffic_boxes     (std_msgs/Float32MultiArray)       - 신호등 박스 + 크롭 분류 결과(전부)
+//   /traffic_boxes     (std_msgs/Float32MultiArray)       - detector가 직접 분류한 신호등 박스(전부)
 //   /lane_fit          (std_msgs/Float32MultiArray [m,b]) - 차선 회귀 결과
 //
-// 신호등 인식은 traffic_node 를 거치지 않는다. /traffic_boxes 의
-// class_id/confidence 자리에는 object_yolo_node.py 가 **검출에 쓴 바로 그
-// 프레임에서** 박스를 잘라 light_cls.onnx 로 분류한 결과(0=green 1=left_green
-// 2=orange 3=red)와 그 확신도가 실려 온다. 이 노드는 그걸 모아 우선순위
-// (좌회전 > 직진 > 정지) 판정 + 디바운스(debounce_frames 연속)를 계산한다.
-//
-// 크롭·분류를 이 노드에서 하다가 Python 으로 되돌린 이유: 여기서 자를 때
-// 쓰는 last_raw_img_ 는 "가장 최근에 도착한 프레임"이지 그 박스를 만든
-// 프레임이 아니다. 검출기 forward 가 CPU 에서 70ms 대(30fps 기준 2~3프레임)라
-// 신호등에 근접할수록 크롭이 램프 줄을 통째로 비껴갔고, 램프가 안 잡힌
-// 크롭을 분류기가 orange 로 0.99 이상 확신해서 초록불 바로 아래에서 정지(1)
-// 판정이 나왔다. 같은 bag 재현: 같은 프레임이면 orange 최대 0.61(게이트에
-// 걸려 보류), 3프레임 밀리면 0.989, 8프레임이면 0.999.
-//
-// 그래도 classifyLight() 와 light_net_ 은 남겨 뒀다 — class_id 가 음수로
-// 오면(= Python 쪽이 분류기를 못 띄웠으면) 예전처럼 여기서 직접 자른다.
-// 폴백은 프레임이 어긋날 수 있다는 위 한계를 그대로 갖는다.
-//
-// 검출기의 신호등 클래스 판정은 거리에 따라 뒤집혀 신뢰할 수 없었다
-// (홀드아웃 클래스 정확도 86.9% -> 크롭 분류 98.3%). 분류 확신도가 낮은
-// 박스는 증거로 안 쓴다(light_min_confidence_, 기본 0.90). 잘려서 모양이
-// 무너진 박스는 확신도로 못 걸러서 기하 게이트로 따로 자른다
-// (light_max_aspect_, light_edge_min_h_) — 자세한 배경은 README 참고.
+// 신호등 인식은 traffic_node 를 거치지 않는다. /traffic_boxes 는 Python
+// detector가 직접 매핑한 [signal_index, detector_confidence, x, y, w, h]를
+// 반복해서 싣는다(0=green, 1=left_green, 2=orange, 3=red). 이 노드는 두 번째
+// 모델 없이 우선순위(좌회전 > 직진 > 정지)와 기존 디바운스를 계산한다.
 //
 // 발행:
 //   /object_info (std_msgs/Int32MultiArray, 3개 필드) — FSM 이 구독하는
@@ -152,38 +133,6 @@ public:
         // (예전 traffic_node 의 debounce_frames 기본값과 동일)
         debounce_n_ = this->declare_parameter<int>("debounce_frames", 3);
         if (debounce_n_ < 1) debounce_n_ = 1;
-        // ── 신호등 크롭 분류기 파라미터 ─────────────────────────────────
-        // 빈 문자열이면 share 디렉터리(model/light_cls.onnx)를 탐색한다.
-        // best.onnx 가 실제로 로드되는 경로(Python object_yolo_node.py 의
-        // share 디렉터리 기본값 + model_path 오버라이드)와 같은 패턴이다.
-        // 아래 resolveModelPath() 의 하드코딩된 개발PC/실차 경로 후보는 예전
-        // xycar_ws 워크스페이스를 가리키는 죽은 코드(use_external_yolo_ 기본
-        // true 라 실제로는 안 쓰인다)라 새로 참조하지 않았다.
-        light_classifier_path_ = this->declare_parameter<std::string>("light_classifier_path", "");
-        light_crop_margin_     = this->declare_parameter<double>("light_crop_margin", 0.15);
-        light_input_size_      = this->declare_parameter<int>("light_input_size", 64);
-        // 이 값 아래면 "판단 보류"(증거로 안 씀)로 처리한다. traffic2~5 bag
-        // 검증에서 오답과 정답이 확신도로 거의 완전히 갈렸다(정답 25%분위
-        // 0.998, 오답 최대 0.889). 자세한 배경은 README 참고.
-        light_min_confidence_  = this->declare_parameter<double>("light_min_confidence", 0.90);
-        // ── 신호등 박스 기하 게이트 ─────────────────────────────────────
-        // 신호등에 근접하면 하우징이 화면 위로 빠져나가고, 검출기는 보이는
-        // 띠만 잡는다. 종횡비가 4:1 -> 15:1 까지 무너진 박스를 64x64 정사각
-        // 으로 늘리면 학습 크롭 분포(약 4:1 하우징) 밖이라, 램프도 없는 띠를
-        // 보고 아무 클래스나 고른다. 확신도로는 못 거른다 — 프레임이 어긋난
-        // 크롭에서 나온 오답이 0.99 를 넘겼다.
-        //
-        // bag rosbag2_2026_08_13-13_33_23 의 신호등 검출 391개로 확인:
-        // 이 두 게이트가 걸러낸 박스는 전부 이미 light_min_confidence_ 아래라,
-        // 증거로 쓰이던 박스 343개는 하나도 잃지 않았다. 예전에 기각했던
-        // 종횡비 게이트(2~8:1)는 하한 때문에 정답을 버렸는데 여기는 상한만 둔다.
-        light_max_aspect_      = this->declare_parameter<double>("light_max_aspect", 8.0);
-        // 화면 최상단(y<=1)에 붙은 박스에만 적용하는 최소 높이. 멀리 있는
-        // 신호등은 h 가 10px 대여도 정상이라(같은 bag 에서 h<12 인 24개가 전부
-        // 정답) 높이 단독으로는 자르지 않는다.
-        light_edge_min_h_      = this->declare_parameter<int>("light_edge_min_h", 20);
-
-
         // QoS 프로파일
         // - qos_fast: 수치 토픽용 Best Effort + Volatile
         auto qos_fast = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
@@ -252,49 +201,6 @@ public:
             }
         }
 
-        // ── 신호등 크롭 분류기 초기화 ────────────────────────────────────
-        // 이전에는 object_yolo_node.py 가 onnxruntime 으로 이 모델을 불러와
-        // 크롭·분류까지 했다. YOLOv8 검출기와 달리 이건 텐서 1개짜리 단순
-        // 분류 헤드라 cv::dnn 이 문제없이 돌린다 — 실차와 같은 OpenCV 4.5.4로
-        // 직접 확인했다(출력 합 1.0, softmax 내장). 위 YOLO 검출기가 cv::dnn
-        // 을 피해 Python 으로 간 이유(shape assertion)는 검출 후처리 특유의
-        // 문제라 여기엔 해당하지 않는다.
-        {
-            std::string light_path = light_classifier_path_;
-            if (light_path.empty()) {
-                try {
-                    light_path = ament_index_cpp::get_package_share_directory("object_detection")
-                               + "/model/light_cls.onnx";
-                } catch (const std::exception& e) {
-                    RCLCPP_ERROR(this->get_logger(),
-                                 "object_detection share 디렉터리를 찾지 못했습니다: %s", e.what());
-                }
-            }
-            std::ifstream lf(light_path, std::ios::binary);
-            if (!light_path.empty() && lf.good()) {
-                try {
-                    light_net_ = cv::dnn::readNet(light_path);
-                    light_net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-                    light_net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
-                    light_ok_ = true;
-                    RCLCPP_INFO(this->get_logger(),
-                                "신호등 크롭 분류기 로드 완료: %s (min_conf=%.2f)",
-                                light_path.c_str(), light_min_confidence_);
-                } catch (const cv::Exception& e) {
-                    RCLCPP_ERROR(this->get_logger(), "신호등 분류기 로드 실패: %s", e.what());
-                    light_ok_ = false;
-                }
-            } else {
-                // 모델이 없어도 차량 경로는 그대로 돈다 — 파이프라인 절반이
-                // 빠졌다고 전체가 죽는 것보다 낫다. 이 경우 신호등 상태는
-                // 항상 0(인식x)으로 나간다.
-                RCLCPP_WARN(this->get_logger(),
-                            "신호등 분류기 모델이 없어 신호등 인식을 하지 않습니다: %s",
-                            light_path.c_str());
-                light_ok_ = false;
-            }
-        }
-
         // 재학습 모델(빨간 고정 방해차량) 기준. 검증용 bag에서 이 값이 검출
         // 가능한 프레임의 99%를 잡고, 차가 없는 프레임의 오검출은 0이었다.
         // 이전 0.83은 옛 모델 최고 conf가 0.82라 사실상 전부 버리고 있었다.
@@ -331,7 +237,7 @@ private:
     // YOLO 모델 경로 결정
     //
     // 1) model_path 파라미터가 지정되면 그대로 사용
-    // 2) 없으면 package share의 legacy best.onnx를 사용한다.
+    // 2) 없으면 package share의 canonical train-10 detector를 사용한다.
     // 읽을 수 있는 파일이 없으면 빈 문자열을 반환한다. 임시 override:
     //   ros2 run object_detection object_node --ros-args -p model_path:=<경로>
     // ─────────────────────────────────────────────────────────────────────
@@ -353,7 +259,7 @@ private:
         std::string package_model;
         try {
             package_model = ament_index_cpp::get_package_share_directory(
-                "object_detection") + "/model/best.onnx";
+                "object_detection") + "/model/train10_detector_best.onnx";
         } catch (const ament_index_cpp::PackageNotFoundError& e) {
             RCLCPP_ERROR(this->get_logger(),
                          "object_detection package share를 찾지 못했습니다: %s",
@@ -361,7 +267,7 @@ private:
             return "";
         }
         if (readable(package_model)) return package_model;
-        RCLCPP_ERROR(this->get_logger(), "legacy 모델 없음: %s",
+        RCLCPP_ERROR(this->get_logger(), "canonical detector 모델 없음: %s",
                      package_model.c_str());
         return "";
     }
@@ -461,83 +367,14 @@ private:
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // 신호등 박스 하나를 잘라(ROI 크롭) 분류기에 넣는다.
-    //
-    // 예전 object_detection/light_classifier.py 의 crop_with_margin() +
-    // classify_crop() 을 그대로 옮긴 것. 전처리(정사각 stretch, INTER_CUBIC,
-    // BGR->RGB, /255, CHW)가 학습 크롭 생성과 반드시 같아야 하므로 순서를
-    // 그대로 지켰다.
-    //
-    // NAMES 순서(0=green 1=left_green 2=orange 3=red)는 학습 시 폴더명 정렬
-    // 순서 = onnx 출력 인덱스다. 재학습해서 순서가 바뀌면 아래 스위치문(호출
-    // 쪽)도 같이 고쳐야 한다.
-    // ─────────────────────────────────────────────────────────────────────
-    bool classifyLight(const cv::Rect& box, int& out_index, float& out_score) {
-        if (!light_ok_) return false;
-
-        cv::Mat frame;
-        {
-            std::lock_guard<std::mutex> lk(mtx_raw_img_);
-            if (last_raw_img_.empty()) return false;
-            frame = last_raw_img_;  // 얕은 복사: 아래에서 읽기만 한다
-        }
-
-        const double grow_x = box.width  * light_crop_margin_ * 0.5;
-        const double grow_y = box.height * light_crop_margin_ * 0.5;
-        int x1 = static_cast<int>(std::lround(box.x - grow_x));
-        int y1 = static_cast<int>(std::lround(box.y - grow_y));
-        int x2 = static_cast<int>(std::lround(box.x + box.width  + grow_x));
-        int y2 = static_cast<int>(std::lround(box.y + box.height + grow_y));
-        x1 = std::max(0, std::min(x1, frame.cols - 1));
-        y1 = std::max(0, std::min(y1, frame.rows - 1));
-        x2 = std::max(x1 + 1, std::min(x2, frame.cols));
-        y2 = std::max(y1 + 1, std::min(y2, frame.rows));
-        cv::Mat crop = frame(cv::Rect(x1, y1, x2 - x1, y2 - y1));
-
-        cv::Mat resized;
-        cv::resize(crop, resized, cv::Size(light_input_size_, light_input_size_),
-                   0, 0, cv::INTER_CUBIC);
-        cv::Mat blob = cv::dnn::blobFromImage(
-            resized, 1.0 / 255.0, cv::Size(light_input_size_, light_input_size_),
-            cv::Scalar(0, 0, 0), /*swapRB=*/true, /*crop=*/false);
-
-        cv::Mat out;
-        try {
-            light_net_.setInput(blob);
-            out = light_net_.forward();
-        } catch (const cv::Exception& e) {
-            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                  "신호등 분류 추론 실패: %s", e.what());
-            return false;
-        }
-
-        double max_val;
-        cv::Point max_loc;
-        cv::minMaxLoc(out.reshape(1, 1), nullptr, &max_val, nullptr, &max_loc);
-        out_index = max_loc.x;
-        out_score = static_cast<float>(max_val);
-        return out_index >= 0 && out_index < 4;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
     // 신호등 박스 수신 콜백. 표시용 저장(enable_gui 일 때만) + 상태 계산을
     // 여기서 한다 — traffic_node 는 거치지 않는다.
     //
-    // 메시지 형식: 6개씩 반복 [class_id, confidence, x, y, w, h]. class_id 와
-    // confidence 는 object_yolo_node.py 가 **검출에 쓴 그 프레임에서** 박스를
-    // 잘라 분류한 결과다(0=green 1=left_green 2=orange 3=red). 검출기가 매긴
-    // 클래스가 아니다 — 그건 거리에 따라 뒤집혀 못 쓴다(홀드아웃 86.9%).
-    // class_id 가 이 범위를 벗어나면 Python 쪽 분류기가 안 떠 있다는 뜻이라,
-    // 예전처럼 여기서 classifyLight() 로 직접 자른다(폴백).
-    //
-    // 게이트 두 단계:
-    //  1) 기하 — 잘려서 모양이 무너진 박스는 분류 결과를 아예 안 본다.
-    //     분류기에 background 클래스가 없어서 램프가 안 잡힌 크롭도 4개 중
-    //     하나를 뱉어야 하고, 그 fallback 이 orange 다(평평한 패치를 넣어도
-    //     orange 가 argmax). orange -> raw=1(정지) 라 초록불 아래에서 선다.
-    //  2) 확신도 — light_min_confidence_ 아래면 증거로 안 쓴다(raw=0 = 보류).
-    //     traffic2~5 bag 검증에서 이 게이트 하나로 오답 26 -> 0 이었고 첫
-    //     정답 시점은 전혀 늦어지지 않았다 — 자세한 배경은 README 참고.
+    // 메시지 형식: 6개씩 반복 [signal_index, detector_confidence, x, y, w, h].
+    // object_yolo_node.py가 detector class 1/2/3/5를 각각 signal index
+    // 0/1/2/3으로 직접 매핑한다. generic detector class 6은 발행하지 않는다.
+    // 범위를 벗어난 index, non-finite 값, 비양수 geometry는 그냥 무시하며
+    // crop classifier나 다른 모델로 fallback하지 않는다.
     //
     // 상태 판정 우선순위: 좌회전(3) > 직진(2) > 정지(1) > 없음(0).
     // 좌회전 화살표는 초록 원과 함께 켜지는 경우가 많아, left 를 먼저 봐야
@@ -549,56 +386,23 @@ private:
         bool tl_green = false, tl_left = false, tl_red = false, tl_orange = false;
 
         for (size_t i = 0; i + 6 <= msg->data.size(); i += 6) {
+            const float raw_index = msg->data[i + 0];
+            const float score = msg->data[i + 1];
             const float x = msg->data[i + 2];
             const float y = msg->data[i + 3];
             const float w = msg->data[i + 4];
             const float h = msg->data[i + 5];
-            if (!std::isfinite(x) || !std::isfinite(y) ||
+            if (!std::isfinite(raw_index) || !std::isfinite(score) ||
+                !std::isfinite(x) || !std::isfinite(y) ||
                 !std::isfinite(w) || !std::isfinite(h)) continue;
             if (w <= 0.f || h <= 0.f) continue;
 
+            if (raw_index < 0.f || raw_index > 3.f) continue;
+            const int index = static_cast<int>(raw_index);
+            if (raw_index != static_cast<float>(index)) continue;
+
             cv::Rect box(static_cast<int>(std::lround(x)), static_cast<int>(std::lround(y)),
                          static_cast<int>(std::lround(w)), static_cast<int>(std::lround(h)));
-
-            // (1) 기하 게이트. 발행 쪽(object_yolo_node.py)에서도 같은 판정을
-            // 하지만, 폴백 경로와 예전 발행자를 위해 여기서도 본다.
-            if (box.height <= 0) continue;
-            const double aspect = static_cast<double>(box.width) /
-                                  static_cast<double>(box.height);
-            if (aspect > light_max_aspect_) continue;
-            if (box.y <= 1 && box.height < light_edge_min_h_) continue;
-
-            // (2) 색 판정. 정상 경로는 이미 분류된 값이 실려 온다.
-            int index; float score;
-            const float pre_index = msg->data[i + 0];
-            const float pre_score = msg->data[i + 1];
-            if (std::isfinite(pre_index) && std::isfinite(pre_score) &&
-                pre_index >= 0.f && pre_index <= 3.f) {
-                index = static_cast<int>(std::lround(pre_index));
-                score = pre_score;
-            } else {
-                // Python 쪽 분류기가 안 떠 있다는 뜻이다. 조용히 넘어가면
-                // "동작은 하는데 원래 lag 버그로 조용히 퇴행했다"는 상태를
-                // 아무도 못 알아챈다 — /object_yolo, /traffic_boxes 는 계속
-                // 정상 발행되므로 겉보기엔 시스템이 멀쩡해 보인다.
-                RCLCPP_WARN_THROTTLE(
-                    this->get_logger(), *this->get_clock(), 5000,
-                    "신호등 폴백 크롭 분류 사용 중 (Python light_cls.onnx 미로드) "
-                    "— 최신 프레임에서 재크롭이라 프레임 어긋남에 취약합니다.");
-                if (!classifyLight(box, index, score)) {
-                    // 폴백조차 안 되면(light_ok_=false) 신호등 인식이 완전히
-                    // 죽은 것이다 — 이 프레임이 아니라 매 실행마다 계속되는
-                    // 상태이므로 더 크게 알린다.
-                    RCLCPP_ERROR_THROTTLE(
-                        this->get_logger(), *this->get_clock(), 5000,
-                        "신호등 분류기가 Python·C++ 양쪽 다 없어 신호등을 "
-                        "전혀 인식하지 못하고 있습니다 (traffic_state 항상 0).");
-                    continue;
-                }
-            }
-
-            // (3) 확신도 게이트.
-            if (score < static_cast<float>(light_min_confidence_)) continue;
 
             results.push_back({box, index, score});
             switch (index) {
@@ -913,9 +717,7 @@ private:
     //   2 = 오른쪽 (2차선)
     // ─────────────────────────────────────────────────────────────────────
     void onImage(const sensor_msgs::msg::Image::SharedPtr msg) {
-        // light_ok_ 가 추가된 뒤로는 GUI/내부 YOLO 가 둘 다 꺼져 있어도(=실차
-        // 기본 운용) 신호등 분류를 위해 프레임을 받아야 한다.
-        if (!enable_gui_ && !yolo_ok_ && !light_ok_) return;
+        if (!enable_gui_ && !yolo_ok_) return;
 
         cv::Mat img;
         try {
@@ -925,13 +727,6 @@ private:
             return;
         }
         if (img.empty()) return;
-
-        // 신호등 크롭 분류용 원본 사본. last_img_ 는 GUI 가 박스/선을 직접
-        // 그려 넣어 크롭 소스로 못 쓰므로 따로 둔다.
-        if (light_ok_) {
-            std::lock_guard<std::mutex> lk(mtx_raw_img_);
-            last_raw_img_ = img.clone();
-        }
 
         if (enable_gui_) {
             std::lock_guard<std::mutex> lk(mtx_img_);
@@ -1235,9 +1030,9 @@ private:
                 }
             }
 
-            // 신호등 박스 (여러 개일 수 있음, 오래되면 안 그림)
-            // 색·라벨은 크롭 분류 결과(index) 기준 — 검출기의 raw class_id
-            // 가 아니다. 신뢰도(score)도 분류기 확신도다.
+            // 신호등 박스 (여러 개일 수 있음, 오래되면 안 그림).
+            // index는 detector class에서 direct-mapped한 signal index이고,
+            // score는 detector confidence다.
             {
                 static const std::vector<std::string> kLightNames = {
                     "green", "left_green", "orange", "red"};
@@ -1289,12 +1084,6 @@ private:
     bool   use_external_yolo_;
     std::string model_path_;
     int    debounce_n_ = 3;   // 신호등 디바운스 프레임 수
-    std::string light_classifier_path_;
-    double light_crop_margin_    = 0.15;
-    double light_max_aspect_     = 8.0;
-    int    light_edge_min_h_     = 20;
-    int    light_input_size_     = 64;
-    double light_min_confidence_ = 0.90;
 
     // ── ROS 통신 객체 ───────────────────────────────────────────────────
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr       sub_scan_;
@@ -1320,12 +1109,6 @@ private:
     std::mutex mtx_img_;
     cv::Mat    last_img_;
 
-    // ── 신호등 분류용 원본 프레임 (뮤텍스: mtx_raw_img_) ────────────────
-    // last_img_ 와 별개다 — GUI 오버레이용은 박스/선이 그려져 크롭 소스로
-    // 못 쓴다.
-    std::mutex mtx_raw_img_;
-    cv::Mat    last_raw_img_;
-
     // ── YOLO 모델 ───────────────────────────────────────────────────────
     cv::dnn::Net net_;
     bool  yolo_ok_         = false;
@@ -1334,11 +1117,7 @@ private:
     int   min_w_pix_       = 0;
     int   min_h_pix_       = 0;
 
-    // ── 신호등 크롭 분류기 ───────────────────────────────────────────────
-    cv::dnn::Net light_net_;
-    bool  light_ok_ = false;
-
-    // classifyLight() 결과 하나(박스 + 분류 인덱스 + 확신도). GUI 오버레이용.
+    // Detector-mapped result 하나(박스 + signal index + confidence). GUI용.
     struct TrafficBoxResult { cv::Rect box; int index; float score; };
 
     // ── YOLO 박스 공유 변수 (뮤텍스: mtx_box_) ─────────────────────────

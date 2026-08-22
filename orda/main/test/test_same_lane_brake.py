@@ -7,7 +7,9 @@ import pytest
 from main.same_lane_brake import (
     SameLaneBrake,
     SameLaneBrakeConfig,
+    effective_ego_lane,
 )
+from main.mission_types import LaneTarget
 
 
 CFG = SameLaneBrakeConfig()
@@ -88,13 +90,69 @@ def test_both_lane_values_are_honoured(lane):
     ).speed_limit == 0.0
 
 
-def test_center_ego_lane_still_counts_as_evidence():
-    """자차가 중앙(0)이고 장애물이 1차선이면 같은 차선이 아니다."""
-
+@pytest.mark.parametrize("car_lane", [0, 1, 2])
+def test_center_valid_vehicle_box_activates_same_path_brake(car_lane):
     g = guard()
+    decision = g.update(
+        now=1.0,
+        car_lane=car_lane,
+        ego_lane=LaneTarget.CENTER.value,
+        box_px=NEAR_BOX,
+    )
+    assert decision.same_lane is True
+    assert decision.speed_limit == 0.0
 
-    decision = g.update(now=1.0, car_lane=1, ego_lane=0, box_px=NEAR_BOX)
 
+def test_unknown_measured_lane_falls_back_to_center_target():
+    lane = effective_ego_lane(
+        measured_lane=-1,
+        measured_received_at=None,
+        lane_target=LaneTarget.CENTER,
+        now=2.0,
+        max_age_s=1.0,
+    )
+    assert lane == LaneTarget.CENTER.value
+    assert guard().update(
+        now=2.0,
+        car_lane=1,
+        ego_lane=lane,
+        box_px=NEAR_BOX,
+    ).same_lane is True
+
+
+def test_stale_measured_lane_falls_back_to_context_target():
+    assert effective_ego_lane(
+        measured_lane=LaneTarget.LANE_ONE.value,
+        measured_received_at=1.0,
+        lane_target=LaneTarget.CENTER,
+        now=2.1,
+        max_age_s=1.0,
+    ) == LaneTarget.CENTER.value
+
+
+@pytest.mark.parametrize(
+    ("ego_lane", "car_lane"),
+    [(LaneTarget.LANE_ONE.value, 2), (LaneTarget.LANE_TWO.value, 1)],
+)
+def test_opposite_lane_valid_box_releases_immediately(ego_lane, car_lane):
+    g = guard()
+    g.update(now=1.0, car_lane=ego_lane, ego_lane=ego_lane, box_px=NEAR_BOX)
+    decision = g.update(
+        now=1.1,
+        car_lane=car_lane,
+        ego_lane=ego_lane,
+        box_px=NEAR_BOX,
+    )
+    assert decision.same_lane is False
+
+
+def test_no_bbox_cannot_create_a_new_brake_latch():
+    decision = guard().update(
+        now=1.0,
+        car_lane=1,
+        ego_lane=LaneTarget.CENTER.value,
+        box_px=0.0,
+    )
     assert decision.same_lane is False
 
 

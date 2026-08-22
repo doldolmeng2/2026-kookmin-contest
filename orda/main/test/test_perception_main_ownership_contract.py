@@ -22,7 +22,9 @@ from main.mission_types import (
     RouteTrafficSignal,
 )
 from main.overtake import OvertakeGuard
+from main.object_mission_episode import ObjectMissionEpisodeGate
 from main.relative_x_fallback import RelativeXObstacleLaneFallback
+from main.traffic_encounter import TrafficEncounterGate
 from main.race_context import RaceContext
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import OBJECT_MAX_AGE_S, RaceRuntimeAdapter
@@ -60,7 +62,7 @@ class _MainMethodHarness:
         )
         self.warnings = []
         self._logger = _Logger()
-        self._traffic_encounter_active = False
+        self.traffic_encounter = TrafficEncounterGate(1.0)
         self.fixed_vehicle_lane = 0
         self.moving_vehicle_lane = 0
         self.traffic_signal = 0
@@ -84,6 +86,9 @@ class _MainMethodHarness:
         self.overtake = OvertakeGuard()
         self.relative_x_fallback = RelativeXObstacleLaneFallback(
             encounter_timeout_s=RELATIVE_X_ENCOUNTER_TIMEOUT_S,
+        )
+        self.object_mission_episode = ObjectMissionEpisodeGate(
+            RELATIVE_X_ENCOUNTER_TIMEOUT_S,
         )
         self.side_left = math.inf
         self.side_right = math.inf

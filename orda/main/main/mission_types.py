@@ -34,6 +34,13 @@ class RouteTrafficSignal(IntEnum):
     LEFT = 3
 
 
+class PendingRouteAction(str, Enum):
+    """Deferred route action committed after an active mission exits."""
+
+    SHORTCUT = "SHORTCUT"
+    FINISH = "FINISH"
+
+
 class ObjectType(IntEnum):
     """Semantic class carried by ``/object_info_raw`` field 11."""
 

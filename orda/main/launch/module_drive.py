@@ -220,16 +220,6 @@ def generate_launch_description():
         ),
     )
     detector_model_path = LaunchConfiguration('detector_model_path')
-    traffic_classifier_model_path_arg = DeclareLaunchArgument(
-        'traffic_classifier_model_path',
-        default_value='',
-        description=(
-            'light1_classifier_best.onnx override (empty uses package share)'
-        ),
-    )
-    traffic_classifier_model_path = LaunchConfiguration(
-        'traffic_classifier_model_path'
-    )
     perception_camera_topic_arg = DeclareLaunchArgument(
         'perception_camera_topic',
         default_value='/resized_image',
@@ -311,6 +301,12 @@ def generate_launch_description():
             'device': 'auto',
         }],
     )
+    road_surface_node = Node(
+        package='road_surface',
+        executable='road_surface_node',
+        name='road_surface_node',
+        output='screen',
+    )
     lane_node = Node(
         package='lane_detection',
         executable='lane_node',
@@ -333,7 +329,6 @@ def generate_launch_description():
         output='screen',
         parameters=[object_detection_config, {
             'detector_model_path': detector_model_path,
-            'traffic_classifier_model_path': traffic_classifier_model_path,
             'camera_topic': perception_camera_topic,
         }],
     )
@@ -412,7 +407,6 @@ def generate_launch_description():
         rubbercone_enable_gui_arg,
         object_enable_gui_arg,
         detector_model_path_arg,
-        traffic_classifier_model_path_arg,
         perception_camera_topic_arg,
         motor_output_topic_arg,
         lidar_port_arg,
@@ -422,6 +416,7 @@ def generate_launch_description():
         rubbercone_node,
         resize_node,
         pidnet_node,
+        road_surface_node,
         lane_node,
         object_yolo_node,
         object_node,

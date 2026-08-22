@@ -52,6 +52,36 @@ from dataclasses import dataclass
 import math
 from typing import Optional
 
+from main.mission_types import LaneTarget
+
+
+def effective_ego_lane(
+    *,
+    measured_lane: int,
+    measured_received_at: Optional[float],
+    lane_target: LaneTarget | int,
+    now: float,
+    max_age_s: float,
+) -> int:
+    """Prefer a fresh measured lane and otherwise use the commanded target."""
+
+    measured_is_fresh = (
+        measured_lane in (0, 1, 2)
+        and not isinstance(measured_received_at, bool)
+        and isinstance(measured_received_at, (int, float))
+        and math.isfinite(measured_received_at)
+        and not isinstance(now, bool)
+        and isinstance(now, (int, float))
+        and math.isfinite(now)
+        and 0.0 <= now - measured_received_at <= max_age_s
+    )
+    if measured_is_fresh:
+        return measured_lane
+    try:
+        return LaneTarget(lane_target).value
+    except (TypeError, ValueError):
+        return LaneTarget.CENTER.value
+
 
 @dataclass(frozen=True)
 class SameLaneBrakeConfig:
@@ -146,11 +176,11 @@ class SameLaneBrake:
         """카메라 신호로 속도 상한을 정한다.
 
         ``car_lane``  : 장애물이 있는 차선 (/object_info_raw 의 lane_label)
-        ``ego_lane``  : 자차 실측 차선 (/lane_position)
+        ``ego_lane``  : fresh 실측 차선 또는 RaceContext lane target
         ``box_px``    : YOLO 박스 면적. 0 이면 이번 프레임에 박스가 없다.
 
-        둘 다 1/2 로 확정된 프레임에서만 판정을 갱신하고, 그 밖에는 hold 를
-        따른다. 반대 증거(서로 다른 차선으로 확정)가 오면 즉시 해제한다.
+        CENTER에서는 유효 bbox 자체를 same-path 증거로 본다. LEFT/RIGHT에서는
+        양쪽 차선이 확정된 프레임만 갱신하며 반대 증거는 즉시 해제한다.
         """
 
         if not self._valid_number(now):
@@ -164,10 +194,21 @@ class SameLaneBrake:
         if box > 0.0:
             self.last_box_px = box
 
-        determined = car_lane in (1, 2) and ego_lane in (0, 1, 2)
+        valid_box = box > 0.0
+        center_path_evidence = valid_box and ego_lane == LaneTarget.CENTER.value
+        determined = (
+            valid_box
+            and car_lane in (1, 2)
+            and ego_lane in (LaneTarget.LANE_ONE.value, LaneTarget.LANE_TWO.value)
+        )
         holding = False
 
-        if determined:
+        if center_path_evidence:
+            # CENTER is the shared approach path. Until a direct/fallback
+            # LEFT/RIGHT lane decision exists, any valid vehicle box can
+            # overlap it, including an UNKNOWN semantic lane.
+            self.same_lane_until = now + self.config.hold_s
+        elif determined:
             if car_lane == ego_lane:
                 # 새 증거로 확정. hold 시계를 다시 감는다.
                 self.same_lane_until = now + self.config.hold_s

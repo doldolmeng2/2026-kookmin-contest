@@ -244,12 +244,9 @@ def test_object_class_mapping_is_loaded_from_installed_yaml():
     assert "object_yolo_node:" in config
     assert "fixed_class_ids: [0]" in config
     assert "moving_class_ids: [1]" in config
-    assert "traffic_classifier_model_path" in config
     assert "install(DIRECTORY config" in cmake
     assert "parameters=[object_detection_config, {" in production
     assert "parameters=[object_detection_config, {" in bag_test
-    assert "'traffic_classifier_model_path': traffic_classifier_model_path" in production
-    assert "'traffic_classifier_model_path': traffic_classifier_model_path" in bag_test
 
 
 @pytest.mark.skip(reason="main 이 두 브랜치를 합치기 전 확인한 옛 object_detection 설계를 검사한다 (traffic_light 패키지, /traffic_detection 토픽, config/object_detection.yaml, fixed/moving 2슬롯 + lane_stabilizer). 2026-08-19 병합에서 HEAD(신호등 크롭·분류 재작업 + 기존 1슬롯 포맷)를 유지하고 main 의 개선안은 별도 PR로 미뤘다 — 그 PR에서 이 테스트들을 되살려야 한다.")

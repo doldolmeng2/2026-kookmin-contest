@@ -26,6 +26,7 @@ class SurfaceThresholds:
     roi_bottom: float = 1.0
     roi_left: float = 0.0
     roi_right: float = 1.0
+    roi_top_width_ratio: float = 1.0
 
     def __post_init__(self) -> None:
         for name in ("road_min_ratio", "shortcut_min_ratio"):
@@ -41,6 +42,8 @@ class SurfaceThresholds:
             and 0.0 <= self.roi_left < self.roi_right <= 1.0
         ):
             raise ValueError("ROI fractions must define a non-empty image region")
+        if not 0.0 < self.roi_top_width_ratio <= 1.0:
+            raise ValueError("roi_top_width_ratio must be in (0, 1]")
 
 
 @dataclass(frozen=True)
@@ -103,11 +106,31 @@ def surface_evidence(
     roi = class_map[top:bottom, left:right]
     if roi.size == 0:
         raise ValueError("ROI is empty")
-    road_mask = roi == 4
-    shortcut_mask = roi == 5
+    selection = np.ones(roi.shape, dtype=np.uint8)
+    if thresholds.roi_top_width_ratio < 1.0:
+        selection.fill(0)
+        roi_height, roi_width = roi.shape
+        inset = (1.0 - thresholds.roi_top_width_ratio) * roi_width / 2.0
+        cv2.fillConvexPoly(
+            selection,
+            np.array(
+                [
+                    [int(math.floor(inset)), 0],
+                    [int(math.ceil(roi_width - inset)) - 1, 0],
+                    [roi_width - 1, roi_height - 1],
+                    [0, roi_height - 1],
+                ],
+                dtype=np.int32,
+            ),
+            1,
+        )
+    selected = selection.astype(bool)
+    selected_pixels = int(np.count_nonzero(selected))
+    road_mask = (roi == 4) & selected
+    shortcut_mask = (roi == 5) & selected
     return SurfaceEvidence(
-        road_ratio=float(np.count_nonzero(road_mask) / roi.size),
-        shortcut_ratio=float(np.count_nonzero(shortcut_mask) / roi.size),
+        road_ratio=float(np.count_nonzero(road_mask) / selected_pixels),
+        shortcut_ratio=float(np.count_nonzero(shortcut_mask) / selected_pixels),
         road_largest_component_px=_largest_component(road_mask),
         shortcut_largest_component_px=_largest_component(shortcut_mask),
     )

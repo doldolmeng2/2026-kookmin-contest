@@ -59,6 +59,24 @@ def test_roi_excludes_labels_outside_configured_region():
     assert surface is RoadSurface.UNKNOWN
 
 
+def test_noise_outside_drivable_trapezoid_does_not_change_result():
+    class_map = np.full((10, 10), 5, dtype=np.uint8)
+    class_map[5:, :] = 4
+    class_map[5, :2] = 5
+    class_map[5, 8:] = 5
+    config = SurfaceThresholds(
+        road_min_ratio=0.90,
+        shortcut_min_ratio=0.30,
+        road_min_component_px=30,
+        shortcut_min_component_px=10,
+        roi_top=0.5,
+        roi_top_width_ratio=0.5,
+    )
+    surface, evidence = classify_surface(class_map, config)
+    assert surface is RoadSurface.NORMAL_ROAD
+    assert evidence.shortcut_ratio == 0.0
+
+
 def test_ros_image_decoder_honors_step_padding():
     message = SimpleNamespace(
         height=2,

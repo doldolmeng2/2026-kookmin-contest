@@ -38,13 +38,23 @@ from main.mode_info import (
     lane_info_value,
 )
 from main.overtake import OvertakeGuard
+from main.object_mission_episode import ObjectMissionEpisodeGate
 from main.relative_x_fallback import (
     RelativeXObstacleLaneFallback,
     effective_object_lane,
     object_mission_entry_allowed,
 )
-from main.same_lane_brake import SameLaneBrake, SameLaneBrakeDecision
+from main.runtime_diagnostics import (
+    RuntimeDiagnosticReporter,
+    RuntimeDiagnosticSnapshot,
+)
+from main.same_lane_brake import (
+    SameLaneBrake,
+    SameLaneBrakeDecision,
+    effective_ego_lane,
+)
 from main.shortcut_exit import ShortcutExitGuard
+from main.traffic_encounter import TrafficEncounterGate
 from main.race_fsm import Mode, RaceFSM
 from main.runtime_adapter import (
     SIDE_CLEARANCE_MAX_AGE_S,
@@ -100,6 +110,11 @@ FIXED_ENTRY_BOX_PX = 1900.0
 # 반복 regression에서 entry 전 동일 물체 independent YOLO 최대 gap은 1.800초였다.
 # perception freshness(0.6초)와 encounter grouping을 분리하고 0.10초 margin만 둔다.
 RELATIVE_X_ENCOUNTER_TIMEOUT_S = 1.90
+# Baseline 70 s fixture had a 0.041 s UNKNOWN display pulse (0.545 s from
+# the last YOLO evidence to the redisplayed green), while the next physical
+# fixture was 62.8 s later. One continuous neutral second separates episodes
+# without approaching the inter-fixture interval.
+TRAFFIC_ENCOUNTER_RELEASE_S = 1.0
 
 # 추월 완료 판정 임계값은 main.overtake.OvertakeConfig가 갖는다.
 
@@ -231,9 +246,14 @@ class MainNode(Node):
         self.relative_x_fallback = RelativeXObstacleLaneFallback(
             encounter_timeout_s=RELATIVE_X_ENCOUNTER_TIMEOUT_S,
         )
+        self.object_mission_episode = ObjectMissionEpisodeGate(
+            release_after_s=RELATIVE_X_ENCOUNTER_TIMEOUT_S,
+        )
         self.last_same_lane_brake = SameLaneBrakeDecision(
             speed_limit=float("inf"), same_lane=False, reason="not evaluated yet"
         )
+        self.runtime_diagnostic_reporter = RuntimeDiagnosticReporter()
+        self.last_runtime_diagnostic: Optional[RuntimeDiagnosticSnapshot] = None
         self._zone_state: Optional[Mode] = None   # 직전 사이클의 FSM 상태
         self._zone_exit_sent = False              # 현재 구간의 종료 엣지를 이미 냈는지
         self._fixed_entry_sent = False            # 이번 LANE_DRIVE 세션에서 진입 엣지를 냈는지
@@ -244,7 +264,9 @@ class MainNode(Node):
         self.now_angle = 0.0
         self.last_debug_time: Optional[float] = None
         self._warning_times: dict[str, float] = {}
-        self._traffic_encounter_active = False
+        self.traffic_encounter = TrafficEncounterGate(
+            release_after_s=TRAFFIC_ENCOUNTER_RELEASE_S,
+        )
 
         qos_fast = sensor_event_qos()
         qos_command = QoSProfile(
@@ -442,17 +464,11 @@ class MainNode(Node):
         )
         self.runtime.record_traffic(is_green, received_at)
 
-        # One lap encounter edge per visible traffic-light episode.
-        # RED_AMBER does not start an encounter. UNKNOWN rearms the edge.
-        encounter_started = False
-        if signal is RouteTrafficSignal.UNKNOWN:
-            self._traffic_encounter_active = False
-        elif signal in (
-            RouteTrafficSignal.STRAIGHT,
-            RouteTrafficSignal.LEFT,
-        ):
-            encounter_started = not self._traffic_encounter_active
-            self._traffic_encounter_active = True
+        # Stable display state and physical fixture ownership are separate.
+        # The WAIT_GREEN fixture starts the race but is never a completed lap.
+        encounter_started = self.traffic_encounter.update(signal, received_at)
+        if self.runtime.fsm.state is Mode.WAIT_GREEN:
+            encounter_started = False
 
         result = self.runtime.record_route_traffic(
             signal,
@@ -580,6 +596,12 @@ class MainNode(Node):
         self.object_confidence = (
             snapshot.confidence if snapshot is not None else 0.0
         )
+        if (
+            snapshot is not None
+            and snapshot.box_px > 0.0
+            and snapshot.object_type in (ObjectType.FIXED, ObjectType.MOVING)
+        ):
+            self.object_mission_episode.observe_valid_detection(received_at)
         # Object mission을 이미 commit한 뒤에는 entry lane을 다시 분류하지
         # 않는다. CONE_DRIVE 중에는 edge를 만들지 않지만, 같은 카메라
         # encounter의 초기 YOLO 상태는 보존해야 LANE_DRIVE 복귀 직후 판단할
@@ -627,10 +649,17 @@ class MainNode(Node):
 
         self._drive_mission_zones(now)
         # 같은 차선 감속 판정은 제어값을 만들기 전에 갱신한다.
+        brake_ego_lane = effective_ego_lane(
+            measured_lane=self.detected_lane,
+            measured_received_at=self.runtime.measured_lane_received_at,
+            lane_target=self.runtime.context.lane_target,
+            now=now,
+            max_age_s=self.runtime.lane_position_max_age_s,
+        )
         self.last_same_lane_brake = self.same_lane_brake.update(
             now=now,
             car_lane=self.car_lane,
-            ego_lane=self.detected_lane,
+            ego_lane=brake_ego_lane,
             box_px=self.box_size,
         )
         lane_candidate, cone_candidate = self._command_candidates()
@@ -645,6 +674,8 @@ class MainNode(Node):
                 f"FSM {cycle.transition.source.value} -> "
                 f"{cycle.transition.target.value}: {cycle.transition.reason}"
             )
+        self._commit_object_mission_episode(cycle)
+        self._emit_runtime_diagnostic(cycle, now)
 
         if cycle.cone_session_active_command is not None:
             try:
@@ -657,11 +688,19 @@ class MainNode(Node):
                     f"rubbercone session-state publish failed: {exc}"
                 )
 
-        angle, speed = self._shape_selected_control(
-            cycle.control.source,
-            cycle.control.command,
-            now,
-        )
+        # FINISH is a committed terminal state, not a transient safety HOLD.
+        # Bypass the shared HOLD deceleration ramp so the very first terminal
+        # command and its shaping history are both exactly zero.
+        if self.runtime.fsm.state is Mode.FINISH:
+            self.now_angle = 0.0
+            self.now_speed = 0.0
+            angle, speed = 0.0, 0.0
+        else:
+            angle, speed = self._shape_selected_control(
+                cycle.control.source,
+                cycle.control.command,
+                now,
+            )
         motor_msg = Float32MultiArray()
         motor_msg.data = [float(angle), float(speed)]
         self.motor_pub.publish(motor_msg)
@@ -845,9 +884,13 @@ class MainNode(Node):
         self.overtake.reset()
         self.same_lane_brake.reset()
         self.relative_x_fallback.reset()
+        self.object_mission_episode.reset()
+        self.traffic_encounter.reset()
         self.last_same_lane_brake = SameLaneBrakeDecision(
             speed_limit=float("inf"), same_lane=False, reason="reset"
         )
+        self.runtime_diagnostic_reporter.reset()
+        self.last_runtime_diagnostic = None
         self._zone_state = None
         self._zone_exit_sent = False
         self.shortcut_exit.reset()
@@ -885,24 +928,24 @@ class MainNode(Node):
         """
 
         state = self.runtime.fsm.state
-        previous_state = self._zone_state
         entered = state is not self._zone_state
         self._zone_state = state
+
+        if self.object_mission_episode.expire(now):
+            # Episode ownership and Relative-X evidence share the existing
+            # evidence-backed 1.90 s encounter boundary.
+            self.relative_x_fallback.reset()
 
         if state is Mode.LANE_DRIVE:
             if entered:
                 self._fixed_entry_sent = False
-                # 초기 세션, bag loop, object mission 복귀는 새 encounter다.
-                # CONE_DRIVE는 object edge를 만들지 않는 일시적 mission이므로
-                # 그 동안 수집한 fresh fallback latch를 같은 encounter로 잇는다.
-                if previous_state is not Mode.CONE_DRIVE:
-                    self.relative_x_fallback.reset()
             self.relative_x_fallback.expire(now)
             entered_at = self.runtime.context.state_entered_at
             snapshot = self.runtime.latest_object_snapshot
             # 엣지는 state_entered_at 보다 "뒤"여야 수락되고 한 번만 소비된다.
             if (
                 not self._fixed_entry_sent
+                and self.object_mission_episode.entry_allowed
                 and snapshot is not None
                 and entered_at is not None
                 and snapshot.received_at > entered_at
@@ -940,10 +983,8 @@ class MainNode(Node):
                     return
                 if snapshot.object_type is ObjectType.MOVING:
                     expected_state = Mode.OVERTAKE
-                    label = "방해차량"
                 else:
                     expected_state = Mode.FIXED_AVOID
-                    label = "고정장애물"
                 result = self.runtime.record_object_mission_entry(
                     expected_state,
                     snapshot,
@@ -952,9 +993,10 @@ class MainNode(Node):
                 )
                 if not result.accepted:
                     return
+                # Prevent duplicate queueing before this control cycle runs.
+                # If safety rejects the edge, _commit_object_mission_episode()
+                # rearms this one-shot without consuming detector ownership.
                 self._fixed_entry_sent = True
-                self.get_logger().info(
-                    f"{label} 검출 ({snapshot.box_px:.0f}px^2) -> 미션 구간 진입")
             return
 
         if state is Mode.FIXED_AVOID:
@@ -1107,6 +1149,67 @@ class MainNode(Node):
             self._warning_times[key] = now
             self.get_logger().warning(message)
 
+    def _runtime_diagnostic_snapshot(
+        self,
+        cycle,
+        now: float,
+    ) -> RuntimeDiagnosticSnapshot:
+        state = self.runtime.fsm.state
+        # On the exact transition cycle _drive_mission_zones() still belongs
+        # to the source state. Do not display the previous zone's timer as the
+        # newly entered mission's elapsed time.
+        zone_active = (
+            state in (Mode.FIXED_AVOID, Mode.OVERTAKE)
+            and self._zone_state is state
+        )
+        zone_elapsed = self.overtake.zone_elapsed(now) if zone_active else None
+        clear_elapsed = None
+        if zone_active and self.overtake.clear_started_at is not None:
+            clear_elapsed = now - self.overtake.clear_started_at
+        action = self.runtime.lane_action
+        return RuntimeDiagnosticSnapshot(
+            mode=state.value,
+            control_source=cycle.control.source.value,
+            control_reason=cycle.control.reason,
+            safety_reason=cycle.safety.reason,
+            missing_inputs=cycle.safety.missing_inputs,
+            stale_inputs=cycle.safety.stale_inputs,
+            traffic_stop_override=self.runtime.traffic_stop_override,
+            lane_action_safe_to_drive=action.safe_to_drive,
+            lane_action_pending=action.pending,
+            lane_action_completed=action.completed,
+            zone_elapsed_s=zone_elapsed,
+            side_obstacle_seen=self.overtake.side_seen_at is not None,
+            clear_timer_elapsed_s=clear_elapsed,
+            same_lane_brake_reason=self.last_same_lane_brake.reason,
+        )
+
+    def _commit_object_mission_episode(self, cycle) -> None:
+        """Consume object ownership only after the FSM accepts the entry."""
+
+        transition = cycle.transition
+        if (
+            not transition.changed
+            or transition.source is not Mode.LANE_DRIVE
+            or transition.target not in (Mode.FIXED_AVOID, Mode.OVERTAKE)
+        ):
+            if self.runtime.fsm.state is Mode.LANE_DRIVE:
+                self._fixed_entry_sent = False
+            return
+        self.object_mission_episode.consume()
+        self._fixed_entry_sent = True
+        label = "고정장애물" if transition.target is Mode.FIXED_AVOID else "방해차량"
+        self.get_logger().info(
+            f"{label} 미션 entry commit -> detector episode consumed"
+        )
+
+    def _emit_runtime_diagnostic(self, cycle, now: float) -> None:
+        snapshot = self._runtime_diagnostic_snapshot(cycle, now)
+        self.last_runtime_diagnostic = snapshot
+        message = self.runtime_diagnostic_reporter.update(snapshot, now)
+        if message is not None:
+            self.get_logger().info(message)
+
     def _update_debug_window(
         self,
         now: float,
@@ -1146,6 +1249,30 @@ class MainNode(Node):
             f"Lane cmd: {self._lane_command_text()}",
             f"Same-lane brake: {self._same_lane_brake_text()}",
         ]
+        diagnostic = self.last_runtime_diagnostic
+        if diagnostic is not None:
+            lines.extend(
+                [
+                    "Control: "
+                    f"{diagnostic.control_source} ({diagnostic.control_reason})",
+                    f"Safety: {diagnostic.safety_reason or 'ready'}",
+                    "Missing: "
+                    f"{', '.join(diagnostic.missing_inputs) or 'none'}",
+                    f"Stale: {', '.join(diagnostic.stale_inputs) or 'none'}",
+                    "Traffic hold: "
+                    f"{diagnostic.traffic_stop_override}",
+                    "Lane action: "
+                    f"safe={diagnostic.lane_action_safe_to_drive} "
+                    f"pending={diagnostic.lane_action_pending} "
+                    f"complete={diagnostic.lane_action_completed}",
+                    "Zone: "
+                    f"elapsed={diagnostic.zone_elapsed_s} "
+                    f"side_seen={diagnostic.side_obstacle_seen} "
+                    f"clear={diagnostic.clear_timer_elapsed_s}",
+                    "Brake reason: "
+                    f"{diagnostic.same_lane_brake_reason}",
+                ]
+            )
         # 줄 수에 맞춰 캔버스를 잡는다. 높이를 고정해 두면 줄을 추가했을 때
         # 마지막 줄이 조용히 화면 밖으로 밀려난다.
         image = np.zeros((30 + len(lines) * 32, 640, 3), dtype=np.uint8)

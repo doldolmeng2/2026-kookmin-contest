@@ -264,6 +264,32 @@ def runtime_safety_monitor() -> SafetyMonitor:
             Mode.CONE_DRIVE: (
                 InputRequirement(InputCategory.SENSOR, "scan", 0.5),
             ),
+            Mode.FIXED_AVOID: (
+                InputRequirement(
+                    InputCategory.PERCEPTION,
+                    "lane_offset",
+                    LANE_OFFSET_MAX_AGE_S,
+                ),
+                InputRequirement(InputCategory.SENSOR, "scan", SCAN_MAX_AGE_S),
+                InputRequirement(
+                    InputCategory.PERCEPTION,
+                    "side_clearance",
+                    SIDE_CLEARANCE_MAX_AGE_S,
+                ),
+            ),
+            Mode.OVERTAKE: (
+                InputRequirement(
+                    InputCategory.PERCEPTION,
+                    "lane_offset",
+                    LANE_OFFSET_MAX_AGE_S,
+                ),
+                InputRequirement(InputCategory.SENSOR, "scan", SCAN_MAX_AGE_S),
+                InputRequirement(
+                    InputCategory.PERCEPTION,
+                    "side_clearance",
+                    SIDE_CLEARANCE_MAX_AGE_S,
+                ),
+            ),
         },
     )
 
@@ -317,6 +343,7 @@ class RaceRuntimeAdapter:
         self._traffic_events: Deque[TrafficMessageEvent] = deque()
         self._lane_change_events: Deque[LaneChangeStateEvent] = deque()
         self._route_traffic_events: Deque[RouteTrafficEvent] = deque()
+        self._approved_route_encounters: Deque[RouteTrafficEvent] = deque()
         self._mission_events: dict[str, Deque[MissionEdgeEvent]] = {
             "fixed_zone_entry": deque(),
             "fixed_zone_exit": deque(),
@@ -388,6 +415,7 @@ class RaceRuntimeAdapter:
         self._traffic_events.clear()
         self._lane_change_events.clear()
         self._route_traffic_events.clear()
+        self._approved_route_encounters.clear()
         for queue in self._mission_events.values():
             queue.clear()
         self._last_internal_event_at.clear()
@@ -721,8 +749,14 @@ class RaceRuntimeAdapter:
         if len(self._route_traffic_events) == self.cone_queue_capacity:
             self._route_traffic_events.popleft()
         self._route_traffic_events.append(
-            RouteTrafficEvent(typed_signal, encounter_started, received_at)
+            RouteTrafficEvent(typed_signal, False, received_at)
         )
+        if encounter_started:
+            if len(self._approved_route_encounters) == self.cone_queue_capacity:
+                self._approved_route_encounters.popleft()
+            self._approved_route_encounters.append(
+                RouteTrafficEvent(typed_signal, True, received_at)
+            )
         return InputRecordResult(True)
 
     def record_fixed_zone_entry(self, received_at: float) -> InputRecordResult:
@@ -923,6 +957,11 @@ class RaceRuntimeAdapter:
             if self._route_traffic_events
             else None
         )
+        approved_route_encounter = (
+            self._approved_route_encounters[0]
+            if self._approved_route_encounters
+            else None
+        )
         mission_events = {
             name: queue.popleft() if queue else None
             for name, queue in self._mission_events.items()
@@ -1053,26 +1092,28 @@ class RaceRuntimeAdapter:
                 else None
             ),
             route_traffic_signal=(
-                route_traffic_event.signal
+                approved_route_encounter.signal
+                if approved_route_encounter is not None
+                else route_traffic_event.signal
                 if route_traffic_event is not None
                 else RouteTrafficSignal.UNKNOWN
             ),
             route_traffic_received_at=(
-                route_traffic_event.received_at
+                approved_route_encounter.received_at
+                if approved_route_encounter is not None
+                else route_traffic_event.received_at
                 if route_traffic_event is not None
                 else None
             ),
             traffic_encounter_started=(
-                route_traffic_event.encounter_started
-                if route_traffic_event is not None
-                else False
+                approved_route_encounter is not None
             ),
             traffic_encounter_received_at=(
-                route_traffic_event.received_at
-                if route_traffic_event is not None
-                and route_traffic_event.encounter_started
+                approved_route_encounter.received_at
+                if approved_route_encounter is not None
                 else None
             ),
+            traffic_encounter_approved=approved_route_encounter is not None,
         )
         safety = self.safety_monitor.evaluate(
             self.fsm.state,
@@ -1082,6 +1123,8 @@ class RaceRuntimeAdapter:
             fault_reason=fault_reason,
         )
         transition = self.fsm.step(observation, self.context, safety)
+        if not safety.must_stop and approved_route_encounter is not None:
+            self._approved_route_encounters.popleft()
         self._update_lane_action(observation, transition)
         control = self.selector.select(
             self.fsm.state,

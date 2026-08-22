@@ -16,12 +16,11 @@ used by production launch files.
 | Model | Package-share-relative path | SHA-256 |
 |---|---|---|
 | PIDNet-S | `segmentation_tools/model/pidnet_s_best.pt` | `8a83aa8993aa629d0931c3a5d44506186624ea79d1cfc54261c8408ad7f67b7b` |
-| train-10 detector | `object_detection/model/train10_detector_best.onnx` | `dee9eb2ff5a53d752676862c376c9eb5da0aaac891069c553e1da7fde7fbe24a` |
-| light1 classifier | `object_detection/model/light1_classifier_best.onnx` | `53ff7de6e374ae2f43017abbbf686f923c2ac9701393a1a2832dd01362053a46` |
+| train-10 detector | `object_detection/model/train10_detector_best.onnx` | `0733b3d1f18058a0d03b918aefd288f3972cb5ea1240cf943ecad191a3deb0b6` |
 
-PIDNet needs PyTorch. Detector and classifier use ONNX Runtime. The laptop
-verification provider was `CPUExecutionProvider`; PIDNet runtime was deferred
-because torch is intentionally not installed in this environment.
+PIDNet needs PyTorch. The single object/traffic detector uses ONNX Runtime. The
+laptop verification provider was `CPUExecutionProvider`; PIDNet runtime was
+deferred because torch is intentionally not installed in this environment.
 
 ## ROS contracts
 
@@ -44,7 +43,7 @@ The perception flow is:
 /resized_image
   -> PIDNet -> /lane_segmentation_mask, /pidnet_class_map
   -> lane_node -> /lane_offset, /lane_valid
-  -> train-10 detector -> same-frame light1 crop classifier
+  -> train-10 detector -> direct vehicle/traffic class mapping
   -> object semantic producer -> /object_info and related contracts
   -> Main/FSM -> motor topic
 ```
@@ -79,7 +78,6 @@ cd /home/bene15/xycar_ws
 source install/setup.bash
 sha256sum install/segmentation_tools/share/segmentation_tools/model/pidnet_s_best.pt
 sha256sum install/object_detection/share/object_detection/model/train10_detector_best.onnx
-sha256sum install/object_detection/share/object_detection/model/light1_classifier_best.onnx
 ros2 launch main module_drive_bag_test.py --show-args
 ```
 

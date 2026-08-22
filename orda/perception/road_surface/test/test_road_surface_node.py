@@ -2,7 +2,11 @@ from types import SimpleNamespace
 
 from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
 
-from road_surface.road_surface_node import RoadSurfaceNode, sensor_qos
+from road_surface.road_surface_node import (
+    FULL_LAP_THRESHOLDS,
+    RoadSurfaceNode,
+    sensor_qos,
+)
 from road_surface.surface_classifier import SurfaceThresholds
 
 
@@ -53,6 +57,13 @@ def test_sensor_qos_is_best_effort_volatile_depth_one():
     assert qos.depth == 1
     assert qos.reliability is ReliabilityPolicy.BEST_EFFORT
     assert qos.durability is DurabilityPolicy.VOLATILE
+
+
+def test_full_lap_threshold_contract_is_evidence_backed_trapezoid():
+    assert FULL_LAP_THRESHOLDS.roi_top == 0.60
+    assert FULL_LAP_THRESHOLDS.roi_top_width_ratio == 0.50
+    assert FULL_LAP_THRESHOLDS.road_min_ratio == 0.90
+    assert FULL_LAP_THRESHOLDS.shortcut_min_ratio == 0.30
 
 
 def test_valid_camera_frame_publishes_at_most_once():

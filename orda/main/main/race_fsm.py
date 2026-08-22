@@ -7,7 +7,7 @@ from typing import Optional
 
 from .cone_entry import ConeEntryConfig, ConeEntryDebouncer, ConeEntryDecision
 from .mission_observation import MissionObservation
-from .mission_types import RouteTrafficSignal
+from .mission_types import PendingRouteAction, RouteTrafficSignal
 from .race_context import RaceContext
 from .safety_monitor import SafetyDecision
 
@@ -111,6 +111,13 @@ class RaceFSM:
 
         context.stop_reason = None
 
+        # Physical route encounters belong to the race, not to the currently
+        # active mission. RuntimeAdapter retains an approved edge through a
+        # safety HOLD, so lap ownership remains here without interrupting the
+        # mission or losing the edge.
+        if self.state is not Mode.WAIT_GREEN:
+            self._record_traffic_encounter(observation, context)
+
         if self.state is Mode.WAIT_GREEN:
             if not safety.inputs_ready:
                 return self._stay("waiting for required inputs")
@@ -133,9 +140,9 @@ class RaceFSM:
             return self._stay("waiting for stable green")
 
         if self.state is Mode.LANE_DRIVE:
-            route_transition = self._handle_traffic_encounter(
-                observation,
+            route_transition = self._commit_pending_route_action(
                 context,
+                observation.now,
             )
             if route_transition is not None:
                 return route_transition
@@ -306,35 +313,30 @@ class RaceFSM:
 
         return self._stay("transition not implemented in this phase")
 
-    def _handle_traffic_encounter(
+    def _record_traffic_encounter(
         self,
         observation: MissionObservation,
         context: RaceContext,
-    ) -> Optional[Transition]:
-        """Commit one typed route encounter and its deterministic branch."""
+    ) -> None:
+        """Own lap counting once, deferring route actions across missions."""
 
         if observation.traffic_encounter_started is not True:
-            return None
+            return
         if observation.route_traffic_signal not in (
             RouteTrafficSignal.STRAIGHT,
             RouteTrafficSignal.LEFT,
         ):
-            return None
+            return
         timestamp = observation.traffic_encounter_received_at
-        if not self._accept_mission_edge(
-            "traffic_encounter",
-            timestamp,
-            observation,
-            context,
-        ):
-            return None
+        if not self._accept_route_encounter(timestamp, observation):
+            return
         if timestamp is None:
-            return None
+            return
         if (
             context.last_traffic_encounter_at is not None
             and timestamp <= context.last_traffic_encounter_at
         ):
-            return None
+            return
 
         context.last_traffic_encounter_at = timestamp
         context.completed_laps = min(
@@ -343,12 +345,8 @@ class RaceFSM:
         )
         if context.completed_laps >= context.TOTAL_LAPS:
             self._cone_entry.deactivate()
-            return self._change(
-                Mode.FINISH,
-                "three traffic encounters completed",
-                context,
-                observation.now,
-            )
+            context.pending_route_action = PendingRouteAction.FINISH
+            return
 
         if (
             observation.route_traffic_signal is RouteTrafficSignal.LEFT
@@ -357,13 +355,55 @@ class RaceFSM:
         ):
             context.shortcut_lap = context.current_lap
             self._cone_entry.deactivate()
+            if context.pending_route_action is not PendingRouteAction.FINISH:
+                context.pending_route_action = PendingRouteAction.SHORTCUT
+
+    def _commit_pending_route_action(
+        self,
+        context: RaceContext,
+        now: float,
+    ) -> Optional[Transition]:
+        action = context.pending_route_action
+        if action is PendingRouteAction.FINISH:
+            context.pending_route_action = None
+            return self._change(
+                Mode.FINISH,
+                "three traffic encounters completed",
+                context,
+                now,
+            )
+        if action is PendingRouteAction.SHORTCUT:
+            context.pending_route_action = None
             return self._change(
                 Mode.SHORTCUT,
                 "left route selected for shortcut lap",
                 context,
-                observation.now,
+                now,
             )
         return None
+
+    def _accept_route_encounter(
+        self,
+        timestamp: Optional[float],
+        observation: MissionObservation,
+    ) -> bool:
+        """Accept one route edge, preserving gate-approved edges across HOLD."""
+
+        if not self._valid_timestamp(timestamp):
+            return False
+        previous = self._last_mission_message_at.get("traffic_encounter")
+        if previous is not None and timestamp <= previous:
+            return False
+        if not self._valid_timestamp(observation.now):
+            return False
+        age_s = observation.now - timestamp
+        if age_s < -_TIMESTAMP_EPSILON_S:
+            return False
+        if not observation.traffic_encounter_approved:
+            if age_s - self.mission_event_max_age_s > _TIMESTAMP_EPSILON_S:
+                return False
+        self._last_mission_message_at["traffic_encounter"] = timestamp
+        return True
 
     def _accept_mission_edge(
         self,
