@@ -13,9 +13,8 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 # cv_bridge(4.5.4 기준 빌드)와 ABI 가 다른 /usr/local 의 OpenCV 4.11 이 잡히지
-# 않도록 버전을 고정한다. classifyLight() 의 cv::dnn::readNet(light_cls.onnx) 는
-# 4.5.4 에서 문제없이 검증됐다(object_detection.cpp 참고) — 4.11 이 필요했던 건
-# best.onnx YOLO 검출기 쪽인데 그건 use_external_yolo_=true 로 이미 꺼져 있다.
+# 않도록 버전을 고정한다. 이 노드는 cv::dnn 추론을 하지 않고(추론은 Python
+# onnxruntime 노드가 전담) cv_bridge/이미지 표시에만 OpenCV 를 쓴다.
 # 자세한 이유는 image_resize/CMakeLists.txt 참고.
 # 경로에 아키텍처를 박으면 실차(J4012, aarch64)에서 깨진다. 그 머신에는
 # /usr/lib/x86_64-linux-gnu 가 없고 OpenCV config 가 /usr/lib/cmake/opencv4 에
@@ -47,11 +46,12 @@ install(PROGRAMS
   scripts/object_yolo_node.py
   DESTINATION lib/${PROJECT_NAME})
 
+# best.onnx 는 runs/detect/best_model/weights/best.onnx (train-2, 7클래스
+# 차량+신호등 통합 모델)와 동일한 파일이다. object_yolo_node.py 의 기본
+# model_path 가 이 설치 경로를 가리킨다.
 install(FILES
   best.onnx
   model/train10_detector_best.onnx
-  model/light1_classifier_best.onnx
-  light_cls.onnx
   DESTINATION share/${PROJECT_NAME}/model)
 
 install(DIRECTORY config
@@ -69,8 +69,6 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_yolo_runtime test/test_yolo_runtime.py)
   ament_add_pytest_test(
     test_object_yolo_contract test/test_object_yolo_contract.py)
-  ament_add_pytest_test(
-    test_traffic_classifier test/test_traffic_classifier.py)
 endif()
 
 ament_package()

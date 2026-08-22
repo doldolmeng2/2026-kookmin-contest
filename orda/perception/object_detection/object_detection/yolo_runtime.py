@@ -148,3 +148,56 @@ def closest_detection(detections: Iterable[Detection]) -> Optional[Detection]:
     """Choose the largest box, matching the existing closest-object policy."""
 
     return max(detections, key=lambda item: item.area, default=None)
+
+
+def normalize_class_ids(values: Iterable[int]) -> set[int]:
+    """Return a validated, de-duplicated set of non-negative class IDs."""
+
+    try:
+        normalized = {int(value) for value in values}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("class IDs must be integers") from exc
+    if any(value < 0 for value in normalized):
+        raise ValueError("class IDs must be non-negative")
+    return normalized
+
+
+def closest_detection_for_classes(
+    detections: Iterable[Detection], class_ids: Iterable[int]
+) -> Optional[Detection]:
+    """Choose the largest detection whose class belongs to ``class_ids``."""
+
+    allowed = normalize_class_ids(class_ids)
+    return closest_detection(
+        detection for detection in detections if detection.class_id in allowed
+    )
+
+
+def detection_slot(
+    detection: Optional[Detection],
+    semantic_type: int,
+) -> list[float]:
+    """Encode one fixed/moving detection as the canonical ten-field slot.
+
+    미검출 슬롯도 자기 semantic_type 을 그대로 달고 나간다. 소비자(C++)가
+    슬롯 위치와 타입을 함께 검증해서, 두 슬롯이 뒤바뀐 메시지를 조용히
+    받아들이지 않게 하기 위함이다.
+    """
+
+    if semantic_type not in (0, 1):
+        raise ValueError("semantic type must be fixed(0) or moving(1)")
+    if detection is None:
+        return [0.0, float(semantic_type)] + [0.0] * 8
+    center_x, center_y = detection.center
+    return [
+        1.0,
+        float(semantic_type),
+        float(detection.confidence),
+        float(detection.area),
+        float(center_x),
+        float(center_y),
+        float(detection.x),
+        float(detection.y),
+        float(detection.width),
+        float(detection.height),
+    ]

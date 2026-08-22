@@ -21,6 +21,9 @@ from .race_fsm import Mode, RaceFSM, Transition
 from .safety_monitor import SafetyMonitor
 
 
+# /traffic_detection 은 2026-08-22 에 발행자가 사라진 레거시 토픽이다. 그 전에
+# 기록된 bag 에는 그대로 들어 있고 WAIT_GREEN 분석이 이 토픽에 의존하므로,
+# 재생 쪽 읽기 지원은 남긴다. 새로 기록되는 bag 에는 없다.
 READ_TOPICS = (
     "/traffic_detection",
     "/rubbercone_info",

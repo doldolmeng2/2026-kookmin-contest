@@ -178,13 +178,15 @@ main/main/
   object_yolo_node (Python, ONNX Runtime — object_detection 패키지)   [신규 구조, 2026-08-18]
     sub: /resized_image
     pub: /object_yolo                   (std_msgs/Float32MultiArray, 20 필드) [내부]
-         /traffic_detection             (std_msgs/Int32)                  [내부]
          [fixed 10필드 슬롯, moving 10필드 슬롯]
          슬롯: [detected, object_type, confidence, box_size, box_cx, box_cy,
                 box_x, box_y, box_w, box_h]
-    train-10 detector가 같은 프레임의 신호등 candidate crop을 만들고,
-    light1 classifier가 0=green, 1=left, 2=orange, 3=red를 분류한다.
-    최종 mapping은 green→2, left→3, orange/red→1, 없음/불확실/오류→0이다.
+         /traffic_boxes                 (std_msgs/Float32MultiArray, 6개씩 반복) [내부]
+         [class_id, confidence, x, y, w, h] — 신호등 클래스 검출 전부
+    단일 7클래스 통합 모델(train-2, `best.onnx`)이 차량과 신호등을 같이 검출한다.
+    신호등 색은 검출기 클래스 id 그대로다: 1=green_light 2=left_green_light
+    3=orange_light 5=red_light. 몸체 클래스(6=traffic)는 색을 못 정하므로 뺀다.
+    ROI 크롭 + 별도 분류기 2단 경로는 폐지했다 (2026-08-22).
 
   road_surface_node
     sub: /pidnet_class_map              (sensor_msgs/Image)
@@ -201,16 +203,14 @@ main/main/
          방해차량 위치: 0=인식x  1=1차선  2=2차선
 
   ※ traffic_light 패키지(traffic_node)는 더 이상 launch 되지 않는다. 신호등 인식은
-    object_yolo_node(검출 + 크롭 분류) + object_node(우선순위 판정·디바운스)가 전담한다.
+    object_yolo_node(검출) + object_node(우선순위 판정·디바운스)가 전담한다.
     자세한 배경은 [인지 파이프라인 변경 이력](#인지perception-파이프라인-변경-이력) 참고.
 
 [제어]
   main_node
-    sub: /rubbercone_info, /lane_offset, /lane_change_state, /object_info,
-         /road_surface, /scan, /imu, /joy, /xycar_ultrasonic
-         ⚠️ 코드상으로는 여전히 /object_info 를 옛 Float32MultiArray 12필드로,
-         /traffic_detection 을 별도 토픽으로 구독하려 한다 — 위 새 계약과 타입이
-         달라 실제로는 안 이어진다. main_node 미반영 상태 (아래 "미반영 통합" 참고).
+    sub: /rubbercone_info, /rubbercone_offset, /lane_offset, /lane_change_state,
+         /object_info(Int32MultiArray 3필드), /object_info_raw(Float32MultiArray 12필드),
+         /side_clearance, /lane_position, /road_surface, /scan, /joy, /xycar_ultrasonic
     pub: /xycar_motor                   (std_msgs/Float32MultiArray)      [유지]
          [angle, speed]
          /mode_info                     (std_msgs/Int32MultiArray)        [현재 호환]
@@ -232,7 +232,9 @@ PPT 외 보조 인지는 `object_yolo_node`와 `road_surface_node`다. 별도
 | `/mode_info` | `Int16`, 코드 `0..5` | PPT의 모드 인터페이스. `FINISH`/`STOP`은 팀 코드가 정해질 때까지 발행하지 않음 |
 | `/lane_info` | `Int16`, `1=1차선, 2=2차선, 3=중앙` | PPT의 차선 인터페이스 |
 | `/internal/lane_command` | `[legacy_lane_mode, internal_lane]` | 기존 lane detector의 배열 계약을 launch remap으로 격리하여 차선 알고리즘은 수정하지 않음 |
-| `/traffic_detection` | `Int32` 4상태 | same-frame detector crop classifier와 object_node 사이의 내부 결과 |
+| `/traffic_detection` | **폐지 (2026-08-22)** | 크롭 분류기 경로를 없애면서 발행자가 사라졌다. 신호등 상태는 `/object_info[0]` 하나로만 나간다. 옛 bag 에는 남아 있어 `bag_replay.py` 는 계속 읽는다 |
+| `/traffic_boxes` | `Float32MultiArray` 6필드 반복 | 검출기가 본 신호등 박스를 그대로 `object_node` 에 넘겨 우선순위·디바운스를 한 곳에서 하게 한다 |
+| `/side_clearance` | `Float32MultiArray [left_m, right_m]` | 좌우 60~100도 sector 의 1.5 m 이내 최소 거리. 반사가 없으면 1.5 m sentinel |
 | `/object_yolo` | 고정·이동 객체별 10필드 슬롯 | Python ONNX 결과를 C++ 차선 융합 노드로 전달 |
 | `/lane_fit` | `[m, b]` | 객체 박스를 1·2차선으로 분류하는 내부 회귀선 |
 | `/lane_change_state` | `[changing, success]` | FIXED/OVERTAKE 차선 변경 완료 피드백 |
@@ -249,12 +251,20 @@ PPT 외 보조 인지는 `object_yolo_node`와 `road_surface_node`다. 별도
 > `Int32MultiArray` 의 인덱스 의미는 이 문서뿐 아니라 **코드 내 상수로도 정의한다.**
 > 문서에만 존재하는 인덱스 규약은 배선 실수의 주된 원인이 된다.
 
-#### Competition detector/classifier assets
+#### 검출기 자산 (2026-08-22 기준)
 
-Production은 package share의 `model/train-10/best.onnx`와
-`model/classify/light1/weights/best.onnx`를 기본으로 사용하며 launch argument로만
-override한다. 두 파일의 class metadata가 고정 계약과 다르면 fail-fast한다. 저장소의
-기존 단일 클래스 `best.onnx`는 아래 legacy 자산이며 train-10 대체물로 사용하지 않는다.
+`object_yolo_node.py` 는 package share 의 `model/best.onnx` 하나만 로드한다.
+`model_path` launch argument 로만 override 한다. 이 파일은 학습 산출물
+`runs/detect/best_model/weights/best.onnx`(train-2, yolov8n, 100 epoch)와
+md5 까지 동일하며, `model/train10_detector_best.onnx` 와도 같은 파일이다.
+
+클래스는 7개다: `0=green_car 1=green_light 2=left_green_light 3=orange_light
+4=red_car 5=red_light 6=traffic`. 차량 매핑은 `fixed_class_ids: [4]`(red_car),
+`moving_class_ids: [0]`(green_car) 로 노드 파라미터 기본값이 들고 있다.
+
+신호등 크롭 분류기 자산(`light_cls.onnx`, `model/light1_classifier_best.onnx`,
+`object_detection/traffic_classifier.py`)은 삭제했다 — 검출기가 색까지 구분하므로
+2단 경로를 유지할 이유가 없다.
 
 #### Legacy 고정장애물 YOLO 모델 (`best.onnx`)
 
@@ -522,6 +532,29 @@ YOLOv8 ONNX를 `forward()`할 때 shape assertion으로 죽는** 고질적인 �
 7클래스, 재학습) → `train-5`(6클래스, `4-traffic` 제거 — **현재 배포**). 클래스가
 바뀔 때마다 `object_yolo_node.py`/`traffic_node.py`/`object_detection.cpp` 세
 곳의 클래스 ID 상수를 같이 맞춰야 했다. 상세 지표는 위 "통합 YOLO 모델" 절 참고.
+
+#### 크롭 분류기 경로 제거, 단일 검출기로 복귀 (2026-08-22)
+
+`object_detection` 브랜치의 추론 경로를 main 에 올리면서 신호등 판정을 다시
+**검출기 한 번**으로 되돌렸다. 위 두 절(2026-08-19)의 ROI 크롭 + `light_cls.onnx`
+분류 경로는 삭제했다.
+
+- 삭제: `light_cls.onnx`, `model/light1_classifier_best.onnx`,
+  `object_detection/traffic_classifier.py`, `test_traffic_classifier.py`
+- `/traffic_detection` 발행자가 사라졌다. 신호등 상태는 `/object_info[0]` 하나뿐이고,
+  `object_yolo_node` 는 `/traffic_boxes` 만 낸다 (색은 검출기 class_id 그대로).
+- `config/object_detection.yaml` 의 `object_yolo_node` 블록을 없앴다. 그 블록의
+  `traffic_output_topic: "/traffic_detection"` 이 새 노드 기본값(`/traffic_boxes`)을
+  덮어써서, 신호등 박스가 C++ 구독자에 **에러 없이** 안 닿는 상태가 됐다.
+  클래스 매핑은 이제 노드 파라미터 기본값이 들고 있고
+  `test_object_yolo_contract.py` 가 그 조합을 고정한다.
+- `/object_yolo` 는 main 의 20필드(fixed/moving 2슬롯) 계약을 그대로 유지했다.
+  단일 슬롯으로 줄이면 두 종류가 동시에 보이는 프레임에서 `/object_info` 의
+  고정차량/방해차량 위치 중 하나가 항상 0 이 된다. 슬롯별 차선 확정은
+  `LaneStabilizer` 두 개가 따로 한다.
+- `/side_clearance`, `/object_info_raw` 는 그대로 발행한다 — `main_node` 가 구독한다.
+- launch argument `detector_model_path` / `traffic_classifier_model_path` 는
+  노드가 선언하지 않는 이름이라 조용히 무시되고 있었다. `model_path` 하나로 합쳤다.
 
 ### 차량 차선 판정 (`object_node`, 고정장애물/방해차량이 1차선인지 2차선인지)
 

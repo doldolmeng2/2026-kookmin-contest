@@ -196,16 +196,10 @@ def generate_launch_description():
         )
     )
     object_enable_gui = LaunchConfiguration('object_enable_gui')
-    detector_model_path_arg = DeclareLaunchArgument(
-        'detector_model_path', default_value=''
+    model_path_arg = DeclareLaunchArgument(
+        'model_path', default_value=''
     )
-    detector_model_path = LaunchConfiguration('detector_model_path')
-    traffic_classifier_model_path_arg = DeclareLaunchArgument(
-        'traffic_classifier_model_path', default_value=''
-    )
-    traffic_classifier_model_path = LaunchConfiguration(
-        'traffic_classifier_model_path'
-    )
+    model_path = LaunchConfiguration('model_path')
     perception_camera_topic_arg = DeclareLaunchArgument(
         'perception_camera_topic', default_value='/resized_image'
     )
@@ -289,8 +283,7 @@ def generate_launch_description():
         name='object_yolo_node',
         output='screen',
         parameters=[object_detection_config, {
-            'detector_model_path': detector_model_path,
-            'traffic_classifier_model_path': traffic_classifier_model_path,
+            'model_path': model_path,
             'camera_topic': perception_camera_topic,
             'use_sim_time': True,
         }],
@@ -341,8 +334,7 @@ def generate_launch_description():
         rubbercone_enable_gui_arg,
         rubbercone_enabled_arg,
         object_enable_gui_arg,
-        detector_model_path_arg,
-        traffic_classifier_model_path_arg,
+        model_path_arg,
         perception_camera_topic_arg,
         isolated_main_node,
         live_main_node,

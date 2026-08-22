@@ -6,7 +6,7 @@ Float32MultiArray 라, 한쪽 필드 수나 토픽 이름이 바뀌어도 빌드
 
 이 패키지는 train-2 계열 7클래스 통합 모델(차량+신호등)을 단일 검출기로
 쓴다. 신호등 색은 별도 크롭 분류기가 아니라 검출기 클래스 id 로 정해진다
-(traffic_classifier.py 는 남아 있지만 이 경로에서는 쓰이지 않는다).
+(크롭 분류기 경로 traffic_classifier.py / light_cls.onnx 는 삭제했다).
 """
 
 import ast
@@ -53,15 +53,38 @@ def test_publishers_have_one_canonical_message_type_each():
     assert "self.traffic_publisher.publish(traffic_message)" in source
 
 
-def test_cpp_consumes_the_single_slot_object_yolo_payload():
+def test_node_emits_both_slots_every_frame():
+    source = SCRIPT.read_text(encoding="utf-8")
+
+    assert "detection_slot(fixed_detection, FIXED)" in source
+    assert "detection_slot(moving_detection, MOVING)" in source
+
+
+def test_cpp_consumes_both_object_yolo_slots():
     cpp = CPP.read_text(encoding="utf-8")
 
-    # /object_yolo 는 가장 가까운 검출 1개를 10필드로 낸다
-    # ([detected, object_type, confidence, box_area, cx, cy, x, y, w, h]).
-    # 파이썬 쪽 두 분기(미검출 [0,-1]+8×0 / 검출 10필드) 모두 길이 10이다.
-    assert "if (msg->data.size() < 10)" in cpp
+    # 20필드 = fixed 슬롯(offset 0, type 0) + moving 슬롯(offset 10, type 1).
+    # 슬롯 위치마다 타입을 강제해서, 순서가 뒤바뀐 메시지를 조용히 받아들이지
+    # 않는다. 기록된 구형 bag 을 위해 10필드 단일 슬롯도 계속 받는다.
+    assert "msg->data.size() != 10 && msg->data.size() != 20" in cpp
+    assert "parse_slot(0, 0, fixed)" in cpp
+    assert "parse_slot(10, 1, moving)" in cpp
     assert '"/object_yolo", qos_fast' in cpp
     assert '"/traffic_boxes", qos_fast' in cpp
+
+
+def test_cpp_keeps_the_two_lane_labels_independent():
+    """두 슬롯의 차선 확정 상태가 섞이지 않는지 확인한다.
+
+    상태를 공유하면 고정장애물 검출이 방해차량의 확정 차선을 덮어써서
+    /object_info 의 두 위치 필드가 같은 값으로 붙어 나온다.
+    """
+    cpp = CPP.read_text(encoding="utf-8")
+
+    assert "fixed_lane_stabilizer_.update(" in cpp
+    assert "moving_lane_stabilizer_.update(" in cpp
+    assert "last_fixed_lane_label_" in cpp
+    assert "last_moving_lane_label_" in cpp
 
 
 def test_cpp_publishes_the_contracts_main_node_subscribes_to():

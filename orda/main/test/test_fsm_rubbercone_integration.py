@@ -211,21 +211,19 @@ def test_detector_reset_clears_detection_debounce_filter_and_debug_state():
     assert "info_pub_->publish(info_msg);" in publish_body
 
 
-@pytest.mark.skip(reason="main 이 두 브랜치를 합치기 전 확인한 옛 object_detection 설계를 검사한다 (traffic_light 패키지, /traffic_detection 토픽, config/object_detection.yaml, fixed/moving 2슬롯 + lane_stabilizer). 2026-08-19 병합에서 HEAD(신호등 크롭·분류 재작업 + 기존 1슬롯 포맷)를 유지하고 main 의 개선안은 별도 PR로 미뤘다 — 그 PR에서 이 테스트들을 되살려야 한다.")
 def test_object_detector_dual_publishes_official_and_internal_contracts():
     source = OBJECT_SOURCE.read_text(encoding="utf-8")
     publish_body = source.split("void onPublishTick()", 1)[1].split(
         "void onImage", 1
     )[0]
 
-    assert '"/traffic_detection", qos_fast' in source
     assert '"/object_info", qos_fast' in source
     assert '"/object_info_raw", qos_fast' in source
-    assert (
-        "info.data = {traffic_signal, fixed_lane_label, moving_lane_label};"
-        in publish_body
-    )
-    assert "pub_obj_->publish(info);" in publish_body
+    # 신호등은 별도 /traffic_detection 토픽이 아니라 /object_info 의 첫 필드로
+    # 나간다 (크롭 분류기 경로와 함께 2026-08-22 에 정리했다).
+    assert '"/traffic_detection", qos_fast' not in source
+    assert "out.data = { traffic_state," in publish_body
+    assert "pub_obj_->publish(out);" in publish_body
     assert "pub_obj_raw_->publish(raw);" in publish_body
     assert "msg->data.size() != 10 && msg->data.size() != 20" in source
     assert "parse_slot(0, 0, fixed)" in source
@@ -234,7 +232,7 @@ def test_object_detector_dual_publishes_official_and_internal_contracts():
     assert "moving_lane_stabilizer_.update" in source
 
 
-@pytest.mark.skip(reason="main 이 두 브랜치를 합치기 전 확인한 옛 object_detection 설계를 검사한다 (traffic_light 패키지, /traffic_detection 토픽, config/object_detection.yaml, fixed/moving 2슬롯 + lane_stabilizer). 2026-08-19 병합에서 HEAD(신호등 크롭·분류 재작업 + 기존 1슬롯 포맷)를 유지하고 main 의 개선안은 별도 PR로 미뤘다 — 그 PR에서 이 테스트들을 되살려야 한다.")
+@pytest.mark.skip(reason="클래스 id 매핑을 config/object_detection.yaml 의 object_yolo_node 블록에서 읽던 설계를 검사한다. 2026-08-22 통합에서 그 블록을 없앴다 — 옛 블록의 traffic_output_topic 이 /traffic_detection 이라 새 노드에 그대로 먹으면 신호등 박스가 C++ 구독자에 안 닿았다. 지금 매핑은 object_yolo_node.py 의 파라미터 기본값이고 test_object_yolo_contract.py 가 고정한다. yaml 로 다시 옮기면 이 테스트를 되살려야 한다.")
 def test_object_class_mapping_is_loaded_from_installed_yaml():
     config = OBJECT_CONFIG.read_text(encoding="utf-8")
     cmake = OBJECT_CMAKE.read_text(encoding="utf-8")
@@ -252,7 +250,6 @@ def test_object_class_mapping_is_loaded_from_installed_yaml():
     assert "'traffic_classifier_model_path': traffic_classifier_model_path" in bag_test
 
 
-@pytest.mark.skip(reason="main 이 두 브랜치를 합치기 전 확인한 옛 object_detection 설계를 검사한다 (traffic_light 패키지, /traffic_detection 토픽, config/object_detection.yaml, fixed/moving 2슬롯 + lane_stabilizer). 2026-08-19 병합에서 HEAD(신호등 크롭·분류 재작업 + 기존 1슬롯 포맷)를 유지하고 main 의 개선안은 별도 PR로 미뤘다 — 그 PR에서 이 테스트들을 되살려야 한다.")
 def test_bag_launch_isolates_motor_output_and_contains_no_hardware_nodes():
     source = BAG_TEST_LAUNCH.read_text(encoding="utf-8")
     tree = ast.parse(source)

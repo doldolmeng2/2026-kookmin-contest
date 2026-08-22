@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""ONNX Runtime YOLO frontend for the C++ LiDAR/lane fusion node."""
+"""ONNX Runtime YOLO frontend for the C++ LiDAR/lane fusion node.
+
+/object_yolo 는 한 프레임에서 고정장애물(FIXED) 슬롯과 방해차량(MOVING)
+슬롯을 각각 10필드씩, 항상 20필드로 낸다. 가장 가까운 것 하나만 보내면
+두 종류가 동시에 보일 때 한쪽이 통째로 사라져서, C++ 쪽이 /object_info 의
+고정차량 위치와 방해차량 위치를 동시에 채울 수 없다.
+"""
 
 from __future__ import annotations
 
@@ -15,13 +21,13 @@ from std_msgs.msg import Float32MultiArray
 
 from object_detection.image_conversion import imgmsg_to_bgr
 from object_detection.yolo_runtime import (
-    closest_detection,
+    closest_detection_for_classes,
     decode_detections,
+    detection_slot,
     letterbox_blob,
 )
 
 
-UNKNOWN = -1
 FIXED = 0
 MOVING = 1
 
@@ -128,7 +134,12 @@ class ObjectYoloNode(Node):
             detections = decode_detections(
                 allowed_class_ids=self.allowed_ids, **decode_kwargs
             )
-            detection = closest_detection(detections)
+            fixed_detection = closest_detection_for_classes(
+                detections, self.fixed_ids
+            )
+            moving_detection = closest_detection_for_classes(
+                detections, self.moving_ids
+            )
             # 신호등은 위치가 아니라 "보이는가"만 필요하다. 원거리 신호등이
             # 차량용 min_size_px(기본 12px) 필터에 걸려 누락되지 않도록
             # 최소 크기 제한 없이 별도로 디코드한다 (traffic_node 원래 동작과 동일).
@@ -140,25 +151,10 @@ class ObjectYoloNode(Node):
             return
 
         output_message = Float32MultiArray()
-        if detection is None:
-            output_message.data = [0.0, float(UNKNOWN)] + [0.0] * 8
-        else:
-            semantic_type = (
-                FIXED if detection.class_id in self.fixed_ids else MOVING
-            )
-            center_x, center_y = detection.center
-            output_message.data = [
-                1.0,
-                float(semantic_type),
-                float(detection.confidence),
-                float(detection.area),
-                float(center_x),
-                float(center_y),
-                float(detection.x),
-                float(detection.y),
-                float(detection.width),
-                float(detection.height),
-            ]
+        output_message.data = (
+            detection_slot(fixed_detection, FIXED)
+            + detection_slot(moving_detection, MOVING)
+        )
         self.publisher.publish(output_message)
 
         traffic_message = Float32MultiArray()

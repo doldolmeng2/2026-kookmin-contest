@@ -212,24 +212,12 @@ def generate_launch_description():
         )
     )
     object_enable_gui = LaunchConfiguration('object_enable_gui')
-    detector_model_path_arg = DeclareLaunchArgument(
-        'detector_model_path',
+    model_path_arg = DeclareLaunchArgument(
+        'model_path',
         default_value='',
-        description=(
-            'train10_detector_best.onnx override (empty uses package share)'
-        ),
+        description='best.onnx override (empty uses package share)',
     )
-    detector_model_path = LaunchConfiguration('detector_model_path')
-    traffic_classifier_model_path_arg = DeclareLaunchArgument(
-        'traffic_classifier_model_path',
-        default_value='',
-        description=(
-            'light1_classifier_best.onnx override (empty uses package share)'
-        ),
-    )
-    traffic_classifier_model_path = LaunchConfiguration(
-        'traffic_classifier_model_path'
-    )
+    model_path = LaunchConfiguration('model_path')
     perception_camera_topic_arg = DeclareLaunchArgument(
         'perception_camera_topic',
         default_value='/resized_image',
@@ -334,8 +322,7 @@ def generate_launch_description():
         name='object_yolo_node',
         output='screen',
         parameters=[object_detection_config, {
-            'detector_model_path': detector_model_path,
-            'traffic_classifier_model_path': traffic_classifier_model_path,
+            'model_path': model_path,
             'camera_topic': perception_camera_topic,
         }],
     )
@@ -413,8 +400,7 @@ def generate_launch_description():
         rubbercone_offset_limit_arg,
         rubbercone_enable_gui_arg,
         object_enable_gui_arg,
-        detector_model_path_arg,
-        traffic_classifier_model_path_arg,
+        model_path_arg,
         perception_camera_topic_arg,
         motor_output_topic_arg,
         lidar_port_arg,
