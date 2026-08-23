@@ -157,7 +157,7 @@ public:
     // 중심점을 정규화 2차식으로 별도 피팅해 /lane_path_preview로 발행한다.
     // main_node가 기능 플래그를 끄거나 이 신뢰도가 낮으면 기존 제어로 폴백한다.
     path_preview_target_y_ratio_ = static_cast<float>(std::clamp(
-      this->declare_parameter<double>("path_preview_target_y_ratio", 0.25),
+      this->declare_parameter<double>("path_preview_target_y_ratio", 0.7),
       0.0, 1.0));
     path_preview_min_points_ = static_cast<std::size_t>(std::max<int64_t>(
       3, this->declare_parameter<int64_t>("path_preview_min_windows", 7)));
@@ -1733,7 +1733,7 @@ private:
   double guardrail_display_min_trust_px_ = 15.0;
 
   // ── 곡선 경로 미리보기 설정 ─────────────────────────────────────────
-  float path_preview_target_y_ratio_ = 0.25F;
+  float path_preview_target_y_ratio_ = 0.7F;
   std::size_t path_preview_min_points_ = 7U;
   float path_preview_min_span_ratio_ = 0.45F;
   float path_preview_max_rmse_px_ = 25.0F;
