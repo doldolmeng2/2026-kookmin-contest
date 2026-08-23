@@ -105,6 +105,8 @@ struct BoundaryModel {
 struct PathEstimate {
     bool valid{false};
     bool bilateral{false};
+    bool used_left_boundary{false};
+    bool used_right_boundary{false};
     bool entry_geometry_valid{false};
     bool curve_caution{false};
     cv::Point2f target{};
@@ -166,6 +168,8 @@ public:
       curve_target_lookahead_(0.50f),
       min_target_lookahead_(0.35f),
       nominal_half_width_(0.30f),
+      one_side_recovery_margin_(0.08f),
+      one_side_recovery_min_offset_(18.0f),
       adaptive_half_width_(0.30f),
       min_corridor_width_(0.35f),
       max_corridor_width_(1.40f),
@@ -289,6 +293,12 @@ public:
         nominal_half_width_ = clampValue(
             static_cast<float>(declare_parameter<double>("nominal_half_width", 0.30)),
             0.15f, 0.70f);
+        one_side_recovery_margin_ = clampValue(
+            static_cast<float>(declare_parameter<double>("one_side_recovery_margin", 0.08)),
+            0.0f, 0.30f);
+        one_side_recovery_min_offset_ = clampValue(
+            static_cast<float>(declare_parameter<double>("one_side_recovery_min_offset", 18.0)),
+            0.0f, offset_limit_);
         resetSessionState();
 
         // The lifecycle topic is stateful: a restarted detector receives the
@@ -764,13 +774,19 @@ private:
         const float target_x = chooseTargetX(use_left ? boundary : nullptr,
                                               use_left ? nullptr : boundary);
         const float boundary_y = boundary->at(target_x);
+        const float recovery_half_width = clampValue(
+            std::max(adaptive_half_width_, nominal_half_width_) + one_side_recovery_margin_,
+            0.15f,
+            max_corridor_width_ * 0.5f);
         path.valid = true;
         path.bilateral = false;
+        path.used_left_boundary = use_left;
+        path.used_right_boundary = !use_left;
         path.curve_caution = curve_caution;
         path.target = cv::Point2f{
             target_x,
-            use_left ? boundary_y - adaptive_half_width_
-                     : boundary_y + adaptive_half_width_};
+            use_left ? boundary_y - recovery_half_width
+                     : boundary_y + recovery_half_width};
         path.heading_slope = boundarySlopeAt(*boundary, target_x);
         path.curvature = boundary->curvature;
 
@@ -848,6 +864,8 @@ private:
                 const float quality = 0.5f * (boundaryQuality(left) + boundaryQuality(right));
                 path.valid = true;
                 path.bilateral = true;
+                path.used_left_boundary = true;
+                path.used_right_boundary = true;
                 path.entry_geometry_valid = rubbercone::entryGeometryValid(
                     left.count, right.count);
                 path.curve_caution = curve_caution;
@@ -891,6 +909,29 @@ private:
         return filtered_target_y_;
     }
 
+    float applyOneSideRecoveryOffset(const PathEstimate& path, float raw_offset) const
+    {
+        if (path.bilateral ||
+            path.used_left_boundary == path.used_right_boundary ||
+            one_side_recovery_min_offset_ <= 0.0f)
+        {
+            return raw_offset;
+        }
+
+        // 한쪽만 보이는 순간에는 경계 피팅이 직선처럼 보이면서 조향이 0으로
+        // 죽을 수 있다. 보이는 콘 반대쪽으로 최소 조향을 보장해 양쪽 경계가
+        // 다시 잡힐 때까지 복구 방향을 유지한다.
+        if (path.used_left_boundary) {
+            return clampValue(
+                std::max(raw_offset, one_side_recovery_min_offset_),
+                -offset_limit_, offset_limit_);
+        }
+
+        return clampValue(
+            std::min(raw_offset, -one_side_recovery_min_offset_),
+            -offset_limit_, offset_limit_);
+    }
+
     void updateDetectionState(const PathEstimate& path, bool far_cones_visible)
     {
         const int confidence = static_cast<int>(std::round(path.confidence * 100.0f));
@@ -922,9 +963,10 @@ private:
             const float feedforward_offset =
                 -path.heading_slope * slope_gain -
                 path.curvature * curvature_gain;
-            const float raw_offset = clampValue(
+            float raw_offset = clampValue(
                 -target_y * offset_gain_ + feedforward_offset,
                 -offset_limit_, offset_limit_);
+            raw_offset = applyOneSideRecoveryOffset(path, raw_offset);
             if (!has_filtered_offset_) {
                 filtered_offset_ = raw_offset;
                 has_filtered_offset_ = true;
@@ -1154,6 +1196,8 @@ private:
     float curve_target_lookahead_;
     float min_target_lookahead_;
     float nominal_half_width_;
+    float one_side_recovery_margin_;
+    float one_side_recovery_min_offset_;
     float adaptive_half_width_;
     float min_corridor_width_;
     float max_corridor_width_;
