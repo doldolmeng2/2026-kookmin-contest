@@ -149,11 +149,11 @@ def generate_launch_description():
         # ros2 param set 으로는 못 바꾼다 — 여기서 넘겨야 한다.
         #
         # 실차 계측에서 confidence 가 390 프레임 내내 0 이었다. 어느 조건에서
-        # 걸리는지 가르려면 하나씩 풀어 보는 수밖에 없어서 노출한다. 기본값은
-        # lane_detection.cpp 의 declare_parameter 기본값과 같아, 지정하지 않으면
-        # 거동이 지금과 정확히 같다.
+        # 걸리는지 가르려면 하나씩 풀어 보는 수밖에 없어서 노출한다. target_y_ratio
+        # 는 실주행에서 0.7 이 확인돼 기본값을 그리로 올렸다. 나머지 기본값은
+        # lane_detection.cpp 의 declare_parameter 기본값과 같다.
         DeclareLaunchArgument(
-            "path_preview_target_y_ratio", default_value="0.25",
+            "path_preview_target_y_ratio", default_value="0.7",
             description=(
                 "선행 목표점의 BEV y 비율(0=먼쪽 끝, 1=차량쪽). 이 y 를 슬라이딩 "
                 "윈도우 중심이 감싸지 못하면 preview 가 통째로 무효가 된다. "
