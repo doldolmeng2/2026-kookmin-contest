@@ -117,7 +117,7 @@ class PIDNetRunner:
     않는다(7.7ms 와의 차이가 0.7ms 뿐이라 얻는 것도 없다).
     """
 
-    def __init__(self, model_path, device='auto', width=640, height=360, lane_classes=(1, 2, 3),
+    def __init__(self, model_path, device='auto', width=640, height=360,
                  center_lane_support_radius=CENTER_LANE_SUPPORT_RADIUS,
                  center_lane_min_support_ratio=CENTER_LANE_MIN_SUPPORT_RATIO,
                  rail_support_radius=RAIL_SUPPORT_RADIUS,
@@ -126,7 +126,7 @@ class PIDNetRunner:
         path=Path(model_path).expanduser().resolve()
         if not path.is_file(): raise FileNotFoundError(f'PIDNet checkpoint not found: {path}')
         name=('cuda' if torch.cuda.is_available() else 'cpu') if device=='auto' else device
-        self.device=torch.device(name); self.width=int(width); self.height=int(height); self.lane_classes=tuple(int(x) for x in lane_classes)
+        self.device=torch.device(name); self.width=int(width); self.height=int(height)
         self.center_lane_support_radius=int(center_lane_support_radius)
         self.center_lane_min_support_ratio=float(center_lane_min_support_ratio)
         self.rail_support_radius=int(rail_support_radius)
@@ -215,8 +215,7 @@ class PIDNetRunner:
             radius=self.rail_support_radius,
             min_support_ratio=self.rail_min_support_ratio,
         )
-        mask=np.isin(labels,self.lane_classes).astype(np.uint8)*255
-        return labels,mask
+        return labels
 
 
 class PIDNetInferenceNode(Node):
@@ -229,7 +228,6 @@ class PIDNetInferenceNode(Node):
         model_path=self.declare_parameter('model_path',default_model).value
         device=self.declare_parameter('device','auto').value
         input_topic=self.declare_parameter('input_topic','/resized_image').value
-        mask_topic=self.declare_parameter('mask_topic','/lane_segmentation_mask').value
         class_topic=self.declare_parameter('class_topic','/pidnet_class_map').value
         mode_topic=self.declare_parameter('mode_topic','/mode_info').value
         color_topic=self.declare_parameter('color_topic','/pidnet_color_map').value
@@ -237,7 +235,6 @@ class PIDNetInferenceNode(Node):
         self.show_visualization=bool(self.declare_parameter('show_visualization',False).value)
         self.roi_crop_visualization=bool(self.declare_parameter('roi_crop_visualization',True).value)
         width=self.declare_parameter('model_width',640).value; height=self.declare_parameter('model_height',360).value
-        lane_classes=self.declare_parameter('lane_classes',[1, 2, 3]).value
         # 중앙선은 주행면 위에만 존재한다. 트랙 밖 오검출을 지우는 검증 파라미터로,
         # radius<=0 또는 ratio<=0 이면 검증을 끄고 모델 출력을 그대로 내보낸다.
         support_radius=self.declare_parameter(
@@ -253,7 +250,7 @@ class PIDNetInferenceNode(Node):
             'rail_min_support_ratio',RAIL_MIN_SUPPORT_RATIO).value
         warmup_on_start=bool(self.declare_parameter('warmup_on_start',True).value)
         self.runner=PIDNetRunner(
-            model_path,device,width,height,lane_classes,
+            model_path,device,width,height,
             center_lane_support_radius=support_radius,
             center_lane_min_support_ratio=support_ratio,
             rail_support_radius=rail_radius,
@@ -284,7 +281,6 @@ class PIDNetInferenceNode(Node):
         self.rail_removed_px=0
         self.roi_top=label_roi_top(int(height))
         image_qos=latest_frame_qos()
-        self.mask_pub=self.create_publisher(Image,mask_topic,image_qos)
         self.class_pub=self.create_publisher(Image,class_topic,image_qos)
         self.color_pub=self.create_publisher(Image,color_topic,image_qos)
         self.overlay_pub=self.create_publisher(Image,overlay_topic,image_qos)
@@ -298,7 +294,7 @@ class PIDNetInferenceNode(Node):
             self.window_title=title
             cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
             cv2.setWindowTitle(self.window_name, title)
-        self.get_logger().info(f'PIDNet-S loaded: {self.runner.checkpoint} epoch={self.runner.best_epoch} device={self.runner.device} lane_classes={self.runner.lane_classes} center_lane_support_radius={self.runner.center_lane_support_radius} center_lane_min_support_ratio={self.runner.center_lane_min_support_ratio} rail_support_radius={self.runner.rail_support_radius} rail_min_support_ratio={self.runner.rail_min_support_ratio} roi_crop_visualization={self.roi_crop_visualization} roi_top={self.roi_top}')
+        self.get_logger().info(f'PIDNet-S loaded: {self.runner.checkpoint} epoch={self.runner.best_epoch} device={self.runner.device} center_lane_support_radius={self.runner.center_lane_support_radius} center_lane_min_support_ratio={self.runner.center_lane_min_support_ratio} rail_support_radius={self.runner.rail_support_radius} rail_min_support_ratio={self.runner.rail_min_support_ratio} roi_crop_visualization={self.roi_crop_visualization} roi_top={self.roi_top}')
 
     def mode_callback(self,msg):
         surface=PREFERRED_SURFACE_BY_MODE.get(int(msg.data))
@@ -313,10 +309,9 @@ class PIDNetInferenceNode(Node):
         except Exception as error:
             self.get_logger().error(f'cv_bridge input error: {error}'); return
         started=time.perf_counter()
-        try: labels,mask=self.runner.predict(frame)
+        try: labels=self.runner.predict(frame)
         except Exception as error:
             self.get_logger().error(f'PIDNet inference error: {error}'); return
-        mask_msg=self.bridge.cv2_to_imgmsg(mask,encoding='mono8'); mask_msg.header=msg.header; self.mask_pub.publish(mask_msg)
         class_msg=self.bridge.cv2_to_imgmsg(labels,encoding='mono8'); class_msg.header=msg.header; self.class_pub.publish(class_msg)
         # 색상/오버레이는 사람이 보기 위한 것이다. 아무도 구독하지 않는데도
         # 매 프레임 만들면 6.6ms(전체 49ms 중 13%)를 그냥 버린다. 주행 중에는

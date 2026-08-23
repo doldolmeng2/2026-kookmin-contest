@@ -15,7 +15,7 @@ left_green_light -> green_light 로 뒤집혔다.
 크롭·분류를 이 노드에서 하는 이유 (2026-08-19 C++ 로 옮겼다가 되돌림):
 object_node(C++) 는 /traffic_boxes 로 박스를 받은 뒤 자기가 들고 있는 최신
 프레임(last_raw_img_)에서 잘랐는데, 그건 이 박스를 만든 프레임이 아니다.
-검출기 forward 가 CPU 에서 70ms 대(30fps 기준 2~3프레임)라 신호등에 근접할수록
+검출기 forward 가 CPU 에서 수백 ms 대라 신호등에 근접할수록
 크롭이 램프 줄을 통째로 비껴갔고, 램프가 안 잡힌 크롭을 분류기가 orange 로
 0.99 이상 확신해서 초록불 바로 아래에서 정지(1) 판정이 나왔다. bag
 rosbag2_2026_08_13-13_33_23 재현: 같은 프레임이면 orange 최대 확신도 0.61
@@ -26,6 +26,26 @@ rosbag2_2026_08_13-13_33_23 재현: 같은 프레임이면 orange 최대 확신�
 class_id/confidence 자리에는 이제 **분류기** 인덱스(0=green 1=left_green
 2=orange 3=red)와 그 확신도가 들어간다. 분류기를 못 띄웠으면 -1 을 넣어
 보내고, 그때는 object_node 가 예전처럼 직접 잘라 분류한다(폴백).
+
+검출기 백엔드 (2026-08-23)
+-------------------------
+검출기는 TensorRT(GPU) 로 돈다. 실측(실제 카메라 20 프레임, 640x640):
+
+    ONNX Runtime CPU      560.4 ms/frame
+    TensorRT fp16          16.6 ms/frame   (34x, 검출 결과 20/20 일치)
+
+CPU 경로는 8코어를 통째로 먹어서 usb_cam 의 MJPEG 디코드까지 굶겼다. 전체
+주행 파이프라인 실측이 그 증거다:
+
+    ONNX Runtime CPU   /image_raw 14.1Hz  /pidnet_class_map 12.0Hz  max 0.50s
+    TensorRT           /image_raw 23.1Hz  /pidnet_class_map 21.6Hz  max 0.15s
+
+즉 미션 노드를 켜도 차선 주기가 차선주행 단독(21.7Hz)과 같아졌다.
+
+onnxruntime-gpu 는 이 보드에서 못 쓴다 — 자세한 이유는
+object_detection/trt_runtime.py 의 모듈 주석 참고. 엔진 생성:
+
+    ros2 run object_detection build_trt_engine.py
 """
 
 from __future__ import annotations
@@ -45,6 +65,7 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Float32MultiArray, Int32
 
 from object_detection.image_conversion import imgmsg_to_bgr
+from object_detection import trt_runtime
 from object_detection.yolo_runtime import (
     LatestFrameRateLimiter,
     closest_detection_for_classes,
@@ -94,6 +115,22 @@ class ObjectYoloNode(Node):
         self.declare_parameter("nms_threshold", 0.40)
         self.declare_parameter("input_size", 640)
         self.declare_parameter("max_inference_hz", 0.0)
+        # ONNX Runtime CPU 프로바이더의 intra-op 스레드 수.
+        #
+        # 검출기가 TensorRT 로 가면서 ORT 가 도는 것은 신호등 크롭 분류기(64x64)
+        # 뿐이라 이 값의 영향은 작아졌다. 그래도 남겨 둔다 — 엔진이 없어 CPU 로
+        # 내려간 상태에서는 여전히 이 값이 보드를 지킨다. 값을 주지 않으면 ORT 가
+        # 코어 수만큼(이 보드는 8) 스레드를 띄워 검출기 forward 동안 모든 코어를
+        # 가져가고, usb_cam 의 MJPEG 디코드와 pidnet 파이썬 콜백이 함께 굶는다.
+        # 0 이하를 주면 ORT 기본값(전체 코어)으로 정확히 롤백한다.
+        self.declare_parameter("onnx_intra_op_threads", 4)
+        # 검출기 백엔드. 'auto' 는 TensorRT 엔진이 있으면 GPU, 없으면 CPU 로
+        # 내려간다. 'tensorrt' 는 엔진을 못 읽으면 그냥 죽는다 — 실차에서
+        # 조용히 CPU 로 떨어져 8코어를 먹는 쪽이 훨씬 나쁘기 때문이다.
+        self.declare_parameter("detector_backend", "auto")
+        # 빈 문자열이면 ~/.cache/xycar_trt/ 아래 규약 이름을 쓴다.
+        # 엔진 생성: ros2 run object_detection build_trt_engine.py
+        self.declare_parameter("tensorrt_engine_path", "")
         self.declare_parameter("publish_inference_diagnostics", False)
         self.declare_parameter(
             "inference_diagnostics_topic", "/object_yolo/inference_diagnostics"
@@ -175,8 +212,16 @@ class ObjectYoloNode(Node):
         if not self.allowed_ids:
             raise ValueError("at least one obstacle class ID is required")
 
+        self.intra_op_threads = int(
+            self.get_parameter("onnx_intra_op_threads").value
+        )
+        session_options = ort.SessionOptions()
+        if self.intra_op_threads > 0:
+            session_options.intra_op_num_threads = self.intra_op_threads
+
         self.session = ort.InferenceSession(
             detector_model_path,
+            sess_options=session_options,
             providers=["CPUExecutionProvider"],
         )
         detector_names = parse_class_names(
@@ -191,8 +236,43 @@ class ObjectYoloNode(Node):
         self.input_name = self.session.get_inputs()[0].name
         output_shape = self.session.get_outputs()[0].shape
 
+        # ── 검출기 백엔드 선택 ──────────────────────────────────────────
+        # ONNX Runtime 세션은 TensorRT 를 쓰더라도 그대로 들고 있는다. 클래스
+        # 이름 검증(위)이 이 세션의 메타데이터를 읽고, 엔진이 런타임에 실패해도
+        # 즉시 되돌아갈 자리가 되기 때문이다.
+        backend = str(self.get_parameter("detector_backend").value).lower()
+        if backend not in ("auto", "tensorrt", "onnxruntime"):
+            raise ValueError(
+                f"detector_backend must be auto/tensorrt/onnxruntime, got {backend}"
+            )
+        self.trt_detector = None
+        self.detector_backend = "onnxruntime"
+        if backend in ("auto", "tensorrt"):
+            engine_path = str(self.get_parameter("tensorrt_engine_path").value)
+            detector, detail = trt_runtime.try_load(
+                engine_path or None, detector_model_path
+            )
+            if detector is not None:
+                detector.warmup()
+                self.trt_detector = detector
+                self.detector_backend = "tensorrt"
+                self.get_logger().info(f"검출기 백엔드: TensorRT GPU — {detail}")
+            elif backend == "tensorrt":
+                raise RuntimeError(
+                    f"detector_backend:=tensorrt 인데 엔진을 못 씁니다 ({detail}). "
+                    "ros2 run object_detection build_trt_engine.py 로 만드세요"
+                )
+            else:
+                self.get_logger().warn(
+                    f"TensorRT 엔진을 못 써서 ONNX Runtime CPU 로 내려갑니다 ({detail}). "
+                    "CPU 경로는 실측 560ms/프레임이라 8코어를 먹고 카메라까지 "
+                    "굶깁니다 — ros2 run object_detection build_trt_engine.py 로 "
+                    "엔진을 만드세요"
+                )
+
         self.classifier_session = ort.InferenceSession(
             classifier_model_path,
+            sess_options=session_options,
             providers=["CPUExecutionProvider"],
         )
         classifier_names = parse_class_names(
@@ -241,6 +321,7 @@ class ObjectYoloNode(Node):
             try:
                 light_session = ort.InferenceSession(
                     light_path,
+                    sess_options=session_options,
                     providers=["CPUExecutionProvider"],
                 )
                 classifier_names = parse_class_names(
@@ -276,7 +357,10 @@ class ObjectYoloNode(Node):
             f"ONNX Runtime ready: detector={detector_model_path}, "
             f"output={output_shape}, classifier={light_path}, "
             f"fixed={sorted(self.fixed_ids)}, moving={sorted(self.moving_ids)}, "
-            f"traffic={sorted(self.traffic_ids)}"
+            f"traffic={sorted(self.traffic_ids)}, "
+            f"intra_op_threads="
+            f"{self.intra_op_threads if self.intra_op_threads > 0 else 'ORT default(all cores)'}, "
+            f"detector_backend={self.detector_backend}"
         )
 
         # ── 폴백 상태 알림 ────────────────────────────────────────────
@@ -382,15 +466,29 @@ class ObjectYoloNode(Node):
         if selected is not None:
             self._infer_and_publish(*selected)
 
+    def _run_detector(self, blob):
+        """활성 백엔드로 한 프레임 추론한다.
+
+        TensorRT 가 런타임에 죽으면 그 프레임만 버리지 않고 CPU 로 내려간다.
+        주행 중에 검출이 통째로 멎는 것보다 느려도 도는 편이 낫다.
+        """
+        if self.trt_detector is not None:
+            try:
+                return self.trt_detector.run(blob)
+            except Exception as exc:  # noqa: BLE001
+                self.trt_detector = None
+                self.detector_backend = "onnxruntime"
+                self.get_logger().error(
+                    f"TensorRT 추론 실패, ONNX Runtime CPU 로 영구 전환합니다: {exc}"
+                )
+        return self.session.run(None, {self.input_name: blob})[0]
+
     def _infer_and_publish(self, message: Image, received_ns: int) -> None:
         started_ns = time.monotonic_ns()
         try:
             image = imgmsg_to_bgr(message)
             prepared = letterbox_blob(image, self.input_size)
-            output = self.session.run(
-                None,
-                {self.input_name: prepared.blob},
-            )[0]
+            output = self._run_detector(prepared.blob)
             decode_kwargs = dict(
                 output=output,
                 image_shape=image.shape[:2],

@@ -80,6 +80,15 @@ def generate_launch_description():
         description='상태 OpenCV 창 표시 여부'
     )
     show_debug = LaunchConfiguration('show_debug')
+    curve_preview_enabled_arg = DeclareLaunchArgument(
+        'curve_preview_enabled',
+        default_value='true',
+        choices=('false', 'true'),
+        description=(
+            '먼 곡선 목표점 선행조향. false면 기존 offset-only 제어로 A/B 롤백'
+        ),
+    )
+    curve_preview_enabled = LaunchConfiguration('curve_preview_enabled')
     pidnet_model_arg = DeclareLaunchArgument(
         'pidnet_model',
         default_value=os.path.join(
@@ -93,7 +102,7 @@ def generate_launch_description():
         'pidnet_lane_classes',
         default_value='[1]',
         description=(
-            '/lane_segmentation_mask 로 내보낼 PIDNet 클래스 '
+            'lane_node 가 중앙선으로 쓸 PIDNet 클래스 '
             '(1=center_lane, 2=left_solid, 3=right_solid, 4=road, 5=shortcut). '
             'lane_node는 선을 하나만 피팅하고 1/2차선 모드는 기준 x만 옮기므로 '
             '기본값은 중앙선 단독인 [1] 이다.'
@@ -217,6 +226,9 @@ def generate_launch_description():
         'lane_target': lane_target,
         'test_profile': ParameterValue(test_profile, value_type=str),
         'show_debug': show_debug,
+        'curve_preview_enabled': ParameterValue(
+            curve_preview_enabled, value_type=bool
+        ),
         'use_sim_time': True,
     }]
     isolated_main_node = Node(
@@ -270,9 +282,7 @@ def generate_launch_description():
         parameters=[{
             'model_path': pidnet_model,
             'input_topic': '/resized_image',
-            'mask_topic': '/lane_segmentation_mask',
             'class_topic': '/pidnet_class_map',
-            'lane_classes': pidnet_lane_classes,
             'device': 'auto',
         }],
     )
@@ -329,6 +339,7 @@ def generate_launch_description():
         live_drive_arg,
         udp_motor_bridge_arg,
         show_debug_arg,
+        curve_preview_enabled_arg,
         pidnet_model_arg,
         pidnet_lane_classes_arg,
         rubbercone_offset_filter_alpha_arg,

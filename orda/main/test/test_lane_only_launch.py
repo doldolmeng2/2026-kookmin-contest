@@ -52,6 +52,19 @@ def test_lane_only_source_is_installed_and_isolated_by_default():
     ] == [("xycar_motor", "/kmu_main_offline/xycar_motor")]
 
 
+def test_lane_only_exposes_curve_preview_rollback_switch_enabled_by_default():
+    launch = description()
+    curve_preview_arg = next(
+        entity
+        for entity in launch.entities
+        if isinstance(entity, DeclareLaunchArgument)
+        and entity.name == "curve_preview_enabled"
+    )
+
+    assert text(curve_preview_arg.default_value) == "true"
+    assert tuple(curve_preview_arg.choices) == ("false", "true")
+
+
 def test_lane_only_live_profile_supplies_camera_and_scan_drivers():
     includes = [
         entity

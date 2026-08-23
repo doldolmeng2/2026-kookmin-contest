@@ -91,10 +91,14 @@ def generate_launch_description():
     udp_motor_bridge = LaunchConfiguration('udp_motor_bridge')
     mode = LaunchConfiguration('mode')
     show_debug = LaunchConfiguration('show_debug')
+    curve_preview_enabled = LaunchConfiguration('curve_preview_enabled')
     main_parameters = [{
         'mode': mode,
         'test_profile': ParameterValue(test_profile, value_type=str),
         'show_debug': show_debug,
+        'curve_preview_enabled': ParameterValue(
+            curve_preview_enabled, value_type=bool
+        ),
     }]
 
     isolated_main_node = Node(

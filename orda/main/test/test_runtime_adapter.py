@@ -403,6 +403,51 @@ def test_lane_guardrail_accepts_unobserved_rails():
     assert adapter.latest_lane_guardrail == (-1.0, -1.0)
 
 
+def test_lane_path_preview_validates_and_rejects_regressed_receipts():
+    adapter = runtime(Mode.LANE_DRIVE)
+
+    assert adapter.record_lane_path_preview(
+        80.0, 0.25, 0.8, 0.25, 12.0, 1.0
+    )
+    assert not adapter.record_lane_path_preview(
+        90.0, 0.30, 0.9, 0.25, 13.0, 1.0
+    )
+    assert not adapter.record_lane_path_preview(
+        90.0, 0.30, 0.9, 0.25, 13.0, 0.9
+    )
+    assert not adapter.record_lane_path_preview(
+        float("nan"), 0.30, 0.9, 0.25, 13.0, 1.1
+    )
+    assert not adapter.record_lane_path_preview(
+        90.0, 0.30, 1.1, 0.25, 13.0, 1.1
+    )
+    assert not adapter.record_lane_path_preview(
+        90.0, 0.30, 0.9, -0.1, 13.0, 1.1
+    )
+    assert not adapter.record_lane_path_preview(
+        90.0, 0.30, 0.9, 0.25, float("nan"), 1.1
+    )
+    assert adapter.latest_lane_path_preview == (
+        80.0, 0.25, 0.8, 0.25, 12.0
+    )
+    assert adapter.lane_path_preview_received_at == 1.0
+    assert adapter.perception_received_at["lane_path_preview"] == 1.0
+
+
+def test_zero_confidence_lane_path_preview_explicitly_invalidates_old_curve():
+    adapter = runtime(Mode.LANE_DRIVE)
+
+    assert adapter.record_lane_path_preview(
+        80.0, 0.25, 0.8, 0.25, 12.0, 1.0
+    )
+    assert adapter.record_lane_path_preview(
+        0.0, 0.0, 0.0, 0.25, 12.0, 1.1
+    )
+    assert adapter.latest_lane_path_preview == (
+        0.0, 0.0, 0.0, 0.25, 12.0
+    )
+
+
 def test_lane_change_in_progress_only_while_fresh_and_changing():
     adapter = runtime(Mode.LANE_DRIVE)
     max_age = adapter.lane_change_max_age_s

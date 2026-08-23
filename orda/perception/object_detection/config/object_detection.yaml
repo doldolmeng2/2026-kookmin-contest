@@ -7,10 +7,28 @@ object_yolo_node:
     moving_class_ids: [0]
     traffic_class_ids: [1, 2, 3, 5, 6]
     classifier_confidence_threshold: 0.60
+
     traffic_output_topic: "/traffic_detection"
     traffic_boxes_topic: "/traffic_boxes"
-    max_inference_hz: 0.0
+    # 검출기가 TensorRT(16.6ms/frame)로 가면서 여유가 생겨 5.0 -> 10.0 으로 올렸다.
+    # 10Hz 는 주기 100ms 라 듀티가 17% 밖에 안 된다. CPU(560ms) 시절에는 5Hz 도
+    # 이미 상시 포화였다. 0 이하로 두면 제한 없이 카메라 속도를 따라간다.
+    max_inference_hz: 10.0
     publish_inference_diagnostics: false
+
+    # ONNX Runtime CPU intra-op 스레드 수. 0 이하면 ORT 기본값(전체 코어).
+    # 기본값을 주지 않으면 검출기 forward(70ms) 동안 8코어를 전부 가져가
+    # pidnet_inference 의 파이썬 콜백이 굶는다. 자세한 근거는
+    # scripts/object_yolo_node.py 의 선언부 주석 참고.
+    onnx_intra_op_threads: 4
+
+    # 검출기 백엔드. auto = TensorRT 엔진이 있으면 GPU, 없으면 ONNX Runtime CPU.
+    # tensorrt 로 두면 엔진을 못 읽을 때 기동에 실패한다 — 실차에서는 조용히
+    # CPU 로 떨어져 8코어를 먹는 쪽이 훨씬 나쁘므로 그쪽이 안전하다.
+    # 엔진 생성: ros2 run object_detection build_trt_engine.py  (7~8분)
+    detector_backend: "auto"
+    # 빈 문자열이면 ~/.cache/xycar_trt/ 아래 sm/TRT버전이 박힌 규약 이름을 쓴다.
+    tensorrt_engine_path: ""
 
 object_detector_node:
   ros__parameters:

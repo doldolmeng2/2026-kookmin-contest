@@ -80,7 +80,7 @@ PURE_PURSUIT_PARAMS = {
     'offset_lpf_tau_s':     0.0,
     'speed_angle_slew_per_s': 0.0,
     'offset_median_frames':   3,
-    'lookahead_corner_px':  315.0,
+    'lookahead_corner_px':  0.0,
     'adaptive_offset_start_px': 100.0,
     'adaptive_offset_end_px':   250.0,
 }
@@ -368,16 +368,16 @@ SPEED_PARAMS = {
 # 좁은 속도 범위로 유지한다. 다만 큰 조향에서는 물리적인 언더스티어를 막기 위해
 # 소폭만 감속하고, 경로를 실제로 잃었을 때 충분히 감속한다.
 RUBBERCONE_SPEED_PARAMS = {
-    'min_speed':              13.5,  # 경로 상실 시 하한 (최종 6.75)
-    'cautious_speed':         18.0,  # 큰 조향·한쪽 경계 보수 상태 (최종 9.0)
-    'cruise_speed':           22.0,  # 정상 추정 상태 (최종 11.0)
+    'min_speed':              8.0,  # 경로 상실 시 하한 (최종 6.75)
+    'cautious_speed':         9.0,  # 큰 조향·한쪽 경계 보수 상태 (최종 9.0)
+    'cruise_speed':           10.0,  # 정상 추정 상태 (최종 11.0)
     'cautious_confidence':    35.0,  # 이 신뢰도부터 9.0까지 회복
     'full_speed_confidence':  85.0,  # 이 신뢰도부터 11.0 허용
     'turn_start_angle':       15.0,  # 이 조향각부터만 완만하게 감속
     # bag(cone_11) 측정: 조향 40°에서도 속도가 9.9로 거의 안 줄어 코너에서
     # 밀려났다. 기울기를 올리고, cautious_speed와 별개인 코너 전용 하한을 둔다.
     'turn_slowdown':          0.20,  # 큰 조향 시 감속 기울기 (40°에서 최종 8.5)
-    'turn_min_speed':         14.0,  # 코너 감속 하한 (최종 7.0)
+    'turn_min_speed':         6.0,  # 코너 감속 하한 (최종 7.0)
     'max_steering_angle':     45.0,  # 라바콘 구간 안전 조향 한계
 }
 
@@ -407,6 +407,7 @@ class Controller:
         self.offset_filtered: Optional[float] = None
         # offset 중앙값 필터 창. maxlen 은 파라미터가 바뀔 수 있어 고정하지 않는다.
         self.offset_history: deque = deque()
+        self._last_lane_sample_id: Optional[int] = None
         # 속도 계산용 조향각(슬루 제한된 값). 서보로 나가는 self.angle 과 다르다.
         self.speed_angle: Optional[float] = None
 
@@ -448,7 +449,8 @@ class Controller:
                guardrail: Optional[tuple[float, float]] = None,
                lane_path_preview: Optional[
                    tuple[float, float, float]
-               ] = None):
+               ] = None,
+               lane_sample_id: Optional[int] = None):
         """
         메인 업데이트: 모드에 따라 조향각과 속도를 계산한다.
         모드가 바뀌면 내부 상태를 리셋한다.
@@ -480,7 +482,7 @@ class Controller:
             # 상태가 없어 _compute_steering_pure_pursuit 안에 두었고, 그래서
             # preview 목표점도 같은 기준을 지난다.
             lane_offset = self._filter_lane_offset(
-                self._median_lane_offset(offset))
+                self._median_lane_offset(offset, lane_sample_id))
             pursuit_angle = self._compute_steering_pure_pursuit(lane_offset)
             pursuit_angle, accepted_preview = self._blend_lane_path_preview(
                 pursuit_angle, lane_offset, lane_path_preview)
@@ -542,21 +544,34 @@ class Controller:
         effective_kp = params.kp * (1.0 + params.alpha * abs(error))
         return effective_kp * error + params.kd * diff
 
-    def _median_lane_offset(self, offset: float) -> float:
-        """최근 N 프레임의 중앙값을 낸다 (N<=1 이면 그대로 통과).
-
-        후행 창이라 인과적이다. 지연은 (N-1)/2 프레임 — 3 이면 1프레임(약 42ms).
-        저역통과와 달리 지속되는 변화는 그 지연만 지나면 원래 크기로 통과하고,
-        한두 프레임 튀었다 돌아오는 값만 사라진다.
-        """
-        frames = int(self.pure_pursuit_params.get('offset_median_frames', 1))
+    def _median_lane_offset(
+        self,
+        offset: float,
+        lane_sample_id: Optional[int] = None,) -> float:
+        """서로 다른 /lane_offset 센서 메시지 N개의 중앙값을 계산한다."""
+        frames = int(
+            self.pure_pursuit_params.get('offset_median_frames', 1)
+        )
         value = float(offset)
+
         if frames <= 1:
             self.offset_history.clear()
+            self._last_lane_sample_id = lane_sample_id
             return value
-        self.offset_history.append(value)
+
+        is_new_sample = (
+            not self.offset_history
+            or lane_sample_id is None
+            or lane_sample_id != self._last_lane_sample_id
+        )
+
+        if is_new_sample:
+            self.offset_history.append(value)
+            self._last_lane_sample_id = lane_sample_id
+
         while len(self.offset_history) > frames:
             self.offset_history.popleft()
+
         ordered = sorted(self.offset_history)
         return ordered[len(ordered) // 2]
 
@@ -889,6 +904,7 @@ class Controller:
         self.offset_filtered = None
         self.speed_angle = None
         self.offset_history.clear()
+        self._last_lane_sameple_id = None
         self.guardrail_angle = 0.0
         self.guardrail_missing_frames = 0
 

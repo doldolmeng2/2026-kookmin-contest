@@ -98,6 +98,12 @@ if(BUILD_TESTING)
   target_include_directories(test_class_map_extraction PRIVATE
     include ${OpenCV_INCLUDE_DIRS})
   target_link_libraries(test_class_map_extraction ${OpenCV_LIBS})
+
+  ament_add_gtest(test_path_preview
+    test/test_path_preview.cpp)
+  target_include_directories(test_path_preview PRIVATE
+    include ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(test_path_preview ${OpenCV_LIBS})
 endif()
 
 install(DIRECTORY include/ DESTINATION include)

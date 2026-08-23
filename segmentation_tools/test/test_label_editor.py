@@ -175,12 +175,12 @@ class LabelEditorTest(unittest.TestCase):
         self.assertEqual(int((mask > 0).sum()) / mask.size, 0.4)
 
     def test_label_roi_covers_lane_detection_roi(self):
-        # 라벨링 범위가 런타임 ROI 를 덮어야 한다. 런타임 ROI 를 여기보다 위로 올리면
-        # 라벨 없는 영역을 쓰게 되므로 이 테스트가 먼저 깨진다.
+        # 런타임 ROI 는 라벨링 범위와 같은 행에서 시작해야 한다.
+        # 더 위면 라벨 없는 영역을 쓰고, 더 아래면 학습된 전방 시야를 버린다.
         polygon = lane_detection_roi_polygon((360, 640))
         self.assertEqual([list(point) for point in polygon],
-                         [[32, 251], [608, 251], [960, 360], [-320, 360]])
-        self.assertGreaterEqual(int(polygon[:, 1].min()), label_roi_top(360))
+                         [[151, 216], [489, 216], [960, 360], [-320, 360]])
+        self.assertEqual(int(polygon[:, 1].min()), label_roi_top(360))
 
     def test_clear_outside_roi_keeps_inside_and_reports_count(self):
         label = np.full((360, 640), 1, dtype=np.uint8)

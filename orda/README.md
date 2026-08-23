@@ -172,6 +172,9 @@ main/main/
     sub: /resized_image, /mode_info
     pub: /lane_offset                   (std_msgs/Int16, 픽셀 오프셋)     [유지]
          /lane_fit                      (std_msgs/Float32MultiArray, [m, b]) [유지]
+         /lane_path_preview             (std_msgs/Float32MultiArray)      [신규]
+         [먼 목표 offset(px), 정규화 2차 미분, 신뢰도(0~1), 목표 BEV y 비율,
+          같은 프레임의 lane_offset(px)]
          /lane_change_state             (std_msgs/Int32MultiArray)        [유지]
          [변경중, 성공여부]
 
@@ -206,7 +209,8 @@ main/main/
 
 [제어]
   main_node
-    sub: /rubbercone_info, /lane_offset, /lane_change_state, /object_info,
+    sub: /rubbercone_info, /lane_offset, /lane_path_preview,
+         /lane_change_state, /object_info,
          /road_surface, /scan, /imu, /joy, /xycar_ultrasonic
          ⚠️ 코드상으로는 여전히 /object_info 를 옛 Float32MultiArray 12필드로,
          /traffic_detection 을 별도 토픽으로 구독하려 한다 — 위 새 계약과 타입이
@@ -215,6 +219,32 @@ main/main/
          [angle, speed]
          /mode_info                     (std_msgs/Int32MultiArray)        [현재 호환]
          [legacy_mode_code, lane]
+```
+
+### 곡선 미리보기 조향과 롤백
+
+`lane_node`는 기존 `/lane_offset`을 그대로 발행하면서 슬라이딩 윈도우 중심을
+정규화 2차식으로 별도 피팅한다. BEV 상단 25% 지점의 먼 목표 offset을
+`/lane_path_preview`로 보내며, `main_node`는 이 목표의 Pure Pursuit 조향을 기존
+조향에 신뢰도 비례로 최대 45%만 혼합한다. 목표 변화는 현재 offset 대비 90px로
+제한하고, 실제로 더하는 조향 보정도 최대 8로 제한한다. 곡률과 먼 목표 변화가
+크면 기존 조향각 감속에 더해 최대 8만큼 속도 상한을 낮추되, 차선 주행 최소
+속도 아래로는 내리지 않는다.
+
+신뢰도 0.55 미만, `/lane_offset`과 수신 시각 차이 0.03초 초과, 메시지에 함께
+실린 source offset 불일치, 차선 변경 중, 잘못된 메시지는 모두 기존 offset-only
+제어로 자동 폴백한다. 실차에서 거동이 이상하면 노드를 재시작하지 않고 즉시
+끌 수 있다.
+
+```bash
+# 실행 중: 다음 제어 주기부터 기존 /lane_offset 단독 제어로 롤백
+ros2 param set /main_node curve_preview_enabled false
+
+# 다시 켜기
+ros2 param set /main_node curve_preview_enabled true
+
+# 시작부터 비활성화해 A/B 비교
+ros2 launch main module_drive.py curve_preview_enabled:=false
 ```
 
 PPT 외 보조 인지는 `object_yolo_node`와 `road_surface_node`다. 별도

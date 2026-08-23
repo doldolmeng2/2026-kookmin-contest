@@ -75,9 +75,7 @@ def generate_launch_description():
         parameters=[{
             'model_path': pidnet_model,
             'input_topic': '/resized_image',
-            'mask_topic': '/lane_segmentation_mask',
             'class_topic': '/pidnet_class_map',
-            'lane_classes': [1, 2, 3],
             'device': 'auto',
             'show_visualization': True,
             'roi_crop_visualization': roi_crop_visualization,

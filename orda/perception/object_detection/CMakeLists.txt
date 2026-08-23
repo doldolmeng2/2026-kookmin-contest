@@ -45,6 +45,7 @@ ament_python_install_package(${PROJECT_NAME})
 
 install(PROGRAMS
   scripts/object_yolo_node.py
+  scripts/build_trt_engine.py
   DESTINATION lib/${PROJECT_NAME})
 
 install(FILES

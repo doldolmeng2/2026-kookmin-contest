@@ -64,6 +64,6 @@ def test_config_matches_the_seven_class_production_detector():
     assert params["fixed_class_ids"] == [4]
     assert params["moving_class_ids"] == [0]
     assert params["traffic_class_ids"] == [1, 2, 3, 5, 6]
-    assert params["max_inference_hz"] == 0.0
+    assert params["max_inference_hz"] == 10.0
     assert params["traffic_output_topic"] == "/traffic_detection"
     assert params["traffic_boxes_topic"] == "/traffic_boxes"

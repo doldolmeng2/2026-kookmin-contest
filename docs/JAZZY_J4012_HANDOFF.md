@@ -42,7 +42,7 @@ The perception flow is:
 
 ```text
 /resized_image
-  -> PIDNet -> /lane_segmentation_mask, /pidnet_class_map
+  -> PIDNet -> /pidnet_class_map
   -> lane_node -> /lane_offset, /lane_valid
   -> train-10 detector -> same-frame light1 crop classifier
   -> object semantic producer -> /object_info and related contracts

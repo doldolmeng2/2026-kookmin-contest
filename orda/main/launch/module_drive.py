@@ -36,7 +36,14 @@
 #   rubbercone_offset_limit (기본값: 45) - LiDAR 오프셋 안전 한계
 #   rubbercone_enable_gui (기본값: true) - 라바콘 LiDAR 인식 디버그 창 표시
 #   object_enable_gui (기본값: true) - 장애물 검출 디버그 창 표시
+#   lane_guardrail (기본값: true) - 바깥 실선 반발항 on/off
+#   curve_preview_enabled (기본값: true) - 먼 곡선 목표점 선행조향 on/off
+#   guardrail_* - 반발항 이득 (기본값은 main.control.GUARDRAIL_PARAMS).
+#     주행 중 ros2 param set /main_node guardrail_gain_deg 20.0 으로도 바뀐다.
 #     (성능에 영향. 기록 주행 시 object_enable_gui:=false 권장)
+#   onnx_intra_op_threads (기본값: 4) - YOLO 의 ONNX Runtime CPU 스레드 수.
+#     0 이하면 ORT 기본값(전체 코어)으로 롤백. 차선 주기와의 트레이드오프는
+#     object_detection/scripts/object_yolo_node.py 선언부 주석 참고.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -52,6 +59,41 @@ from launch.launch_description_sources import (
 )
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+
+from main.control import (
+    GUARDRAIL_PARAM_HELP,
+    GUARDRAIL_PARAMS,
+    GUARDRAIL_TUNABLES,
+)
+
+# ── 가드레일 이득 런치 인수 ──────────────────────────────────────────────────
+# 이름/기본값/설명을 전부 main.control 에서 읽는다. 런치 파일에 기본값을 복사해
+# 두면 소스 쪽만 고쳤을 때 조용히 갈라지기 때문이다.
+#
+# 여기서 지정하지 않아도 main_node 는 같은 기본값으로 뜨고, 주행 중에도 바꿀 수
+# 있다 — 재빌드는 물론 재실행도 필요 없다:
+#     ros2 param set /main_node guardrail_gain_deg 20.0
+#     ros2 param get /main_node guardrail_gain_deg
+def guardrail_launch_arguments():
+    return [
+        DeclareLaunchArgument(
+            f'guardrail_{name}',
+            default_value=str(GUARDRAIL_PARAMS[name]),
+            description=GUARDRAIL_PARAM_HELP[name],
+        )
+        for name in GUARDRAIL_TUNABLES
+    ]
+
+
+def guardrail_node_parameters():
+    return {
+        f'guardrail_{name}': ParameterValue(
+            LaunchConfiguration(f'guardrail_{name}'),
+            value_type=type(GUARDRAIL_PARAMS[name]),
+        )
+        for name in GUARDRAIL_TUNABLES
+    }
+
 from ament_index_python.packages import get_package_share_directory
 
 
@@ -97,6 +139,16 @@ def generate_launch_description():
         )
     )
     lane_guardrail = LaunchConfiguration('lane_guardrail')
+    curve_preview_enabled_arg = DeclareLaunchArgument(
+        'curve_preview_enabled',
+        default_value='true',
+        choices=('false', 'true'),
+        description=(
+            'lane_node의 먼 곡선 목표점을 Pure Pursuit에 혼합한다. false면 '
+            '기존 /lane_offset 단독 제어와 정확히 같은 롤백 경로를 사용한다.'
+        ),
+    )
+    curve_preview_enabled = LaunchConfiguration('curve_preview_enabled')
     lane_debug_arg = DeclareLaunchArgument(
         'lane_debug',
         default_value='false',
@@ -128,17 +180,15 @@ def generate_launch_description():
         'pidnet_lane_classes',
         default_value='[1]',
         description=(
-            '/lane_segmentation_mask 로 내보낼 PIDNet 클래스 '
+            'lane_node 가 중앙선으로 쓸 PIDNet 클래스 '
             '(1=center_lane, 2=left_solid, 3=right_solid, 4=road, 5=shortcut). '
             'lane_node는 선을 하나만 피팅하고 1/2차선 모드는 기준 x만 옮기므로 '
             '기본값은 중앙선 단독인 [1] 이다. 경계선을 섞으면 트래커가 '
             '중앙선 대신 경계선에 붙어 오프셋이 한 차선 폭만큼 어긋날 수 있다. '
-            '(/pidnet_class_map 은 이 값과 무관하게 전체 라벨을 내보내므로 '
-            'road_surface 노드는 영향받지 않는다.)'
+            '(pidnet 은 /pidnet_class_map 으로 전체 라벨을 내보내고, 이 값은 '
+            'lane_node 의 center_classes 로만 들어간다. road_surface 노드는 '
+            '영향받지 않는다.)'
         )
-    )
-    pidnet_lane_classes = ParameterValue(
-        LaunchConfiguration('pidnet_lane_classes'), value_type=List[int]
     )
     pidnet_center_lane_support_radius_arg = DeclareLaunchArgument(
         'pidnet_center_lane_support_radius',
@@ -248,6 +298,33 @@ def generate_launch_description():
         )
     )
     object_enable_gui = LaunchConfiguration('object_enable_gui')
+    onnx_intra_op_threads_arg = DeclareLaunchArgument(
+        'onnx_intra_op_threads',
+        default_value='4',
+        description=(
+            'object_yolo_node 의 ONNX Runtime CPU intra-op 스레드 수. '
+            '이 노드는 CPU 로만 돌고(설치된 onnxruntime 에 CUDA 프로바이더가 '
+            '없다) 값을 주지 않으면 ORT 가 8코어를 전부 쓴다. 그동안 '
+            'pidnet_inference 의 파이썬 콜백이 굶어 /pidnet_class_map 이 '
+            '평균 8Hz / 최대 간격 0.8s 로 떨어진다(차선주행 단독은 ~20Hz). '
+            '0 이하를 주면 ORT 기본값으로 정확히 롤백한다. '
+            '값을 훑을 때: onnx_intra_op_threads:=2 처럼 넘기고 '
+            'ros2 topic hz /pidnet_class_map 으로 잰다'
+        ),
+    )
+    onnx_intra_op_threads = LaunchConfiguration('onnx_intra_op_threads')
+    max_inference_hz_arg = DeclareLaunchArgument(
+        'max_inference_hz',
+        default_value='10.0',
+        description=(
+            'object_yolo_node 의 검출 상한 주기. 0 이하면 제한 없이 카메라를 '
+            '따라간다. 검출 자체는 TensorRT 로 16.6ms 지만 콜백에는 letterbox / '
+            'NMS / 신호등 크롭 분류가 함께 들어 있어, 올리면 그만큼 CPU 를 더 '
+            '쓰고 차선 주기가 깎인다. 값을 훑을 때: max_inference_hz:=5.0 처럼 '
+            '넘기고 ros2 topic hz /pidnet_class_map 으로 잰다'
+        ),
+    )
+    max_inference_hz = LaunchConfiguration('max_inference_hz')
     detector_model_path_arg = DeclareLaunchArgument(
         'detector_model_path',
         default_value='',
@@ -302,6 +379,10 @@ def generate_launch_description():
             'lane_guardrail': ParameterValue(
                 lane_guardrail, value_type=bool
             ),
+            'curve_preview_enabled': ParameterValue(
+                curve_preview_enabled, value_type=bool
+            ),
+            **guardrail_node_parameters(),
         }],
         remappings=[('xycar_motor', motor_output_topic)],
     )
@@ -344,10 +425,8 @@ def generate_launch_description():
         parameters=[{
             'model_path': pidnet_model,
             'input_topic': '/resized_image',
-            'mask_topic': '/lane_segmentation_mask',
             'class_topic': '/pidnet_class_map',
             'mode_topic': '/mode_info',
-            'lane_classes': pidnet_lane_classes,
             'center_lane_support_radius': pidnet_center_lane_support_radius,
             'center_lane_min_support_ratio': pidnet_center_lane_min_support_ratio,
             'device': 'auto',
@@ -384,6 +463,12 @@ def generate_launch_description():
             'detector_model_path': detector_model_path,
             'traffic_classifier_model_path': traffic_classifier_model_path,
             'camera_topic': perception_camera_topic,
+            'onnx_intra_op_threads': ParameterValue(
+                onnx_intra_op_threads, value_type=int
+            ),
+            'max_inference_hz': ParameterValue(
+                max_inference_hz, value_type=float
+            ),
         }],
     )
     object_node = Node(
@@ -444,6 +529,8 @@ def generate_launch_description():
         lane_target_arg,
         show_debug_arg,
         lane_guardrail_arg,
+        curve_preview_enabled_arg,
+        *guardrail_launch_arguments(),
         lane_debug_arg,
         lane_debug_detail_arg,
         pidnet_model_arg,
@@ -463,6 +550,8 @@ def generate_launch_description():
         rubbercone_offset_limit_arg,
         rubbercone_enable_gui_arg,
         object_enable_gui_arg,
+        onnx_intra_op_threads_arg,
+        max_inference_hz_arg,
         detector_model_path_arg,
         traffic_classifier_model_path_arg,
         perception_camera_topic_arg,

@@ -283,6 +283,7 @@ class MainNode(Node):
             )
         self.lane_controller = Controller()
         self.cone_controller = Controller()
+        self._lane_offset_sample_id = 0
         self._apply_guardrail_params()
         self._apply_steering_filter_params()
         self.add_on_set_parameters_callback(self._on_set_parameters)
@@ -574,12 +575,19 @@ class MainNode(Node):
 
     def lane_offset_callback(self, msg: Int16) -> None:
         received_at = self._now_seconds()
-        if not self.runtime.record_lane_offset(msg.data, received_at):
+        accepted = self.runtime.record_lane_offset(
+            msg.data, received_at
+        )
+
+        if not accepted:
             self._warn_throttled(
                 "malformed_lane",
                 "invalid lane_offset message ignored",
                 received_at,
             )
+            return
+
+        self._lane_offset_sample_id += 1
 
     def lane_path_preview_callback(self, msg: Float32MultiArray) -> None:
         """Validate the optional far-path preview published beside lane_offset."""
@@ -1045,6 +1053,8 @@ class MainNode(Node):
             safety_monitor=runtime_safety_monitor(),
         )
         self.runtime.context.lane_target = self._initial_lane_target
+        # rosbag loop가 시작되면 lane sample 번호도 처음부터 다시 시작된다.
+        self._lane_offset_sample_id = 0
         self.lane_controller = Controller()
         self.cone_controller = Controller()
         self._apply_guardrail_params()
@@ -1399,11 +1409,11 @@ class MainNode(Node):
                 control_mode,
                 lane_offset,
                 self.object_dist,
-                100,
-                self._guardrail_for(control_mode, lane_received_at),
-                self._curve_preview_for(
-                    control_mode, lane_received_at, lane_offset
-                ),
+                rubbercone_confidence=100,
+                guardrail = self._guardrail_for(control_mode, lane_received_at,),
+                lane_path_preview = self._curve_preview_for(control_mode, lane_received_at, lane_offset,),
+                lane_sample_id = self._lane_offset_sample_id,
+
             )
             speed = float(self.lane_controller.get_speed()) #/2.0 속도 절반
             # 고정장애물이 우리 차선에 있으면 접근할수록 속도를 낮춘다.

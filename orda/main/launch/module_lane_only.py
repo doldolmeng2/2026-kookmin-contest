@@ -1,6 +1,6 @@
 """Safety-preserving lane-only profile with isolated output by default.
 
-lane_node는 /lane_segmentation_mask (PIDNet-S 출력)를 구독하므로 이 프로파일도
+lane_node는 /pidnet_class_map (PIDNet-S 출력)을 구독하므로 이 프로파일도
 pidnet_inference를 함께 띄운다. 없으면 /lane_offset이 아예 나오지 않아
 preflight가 FAIL 한다.
 """
@@ -140,7 +140,7 @@ def generate_launch_description():
             "pidnet_lane_classes",
             default_value="[1]",
             description=(
-                "/lane_segmentation_mask 로 내보낼 PIDNet 클래스 "
+                "lane_node 가 중앙선으로 쓸 PIDNet 클래스 "
                 "(1=center_lane, 2=left_solid, 3=right_solid). lane_node는 선을 "
                 "하나만 피팅하므로 기본값은 중앙선 단독인 [1] 이다."
             ),
@@ -302,11 +302,7 @@ def generate_launch_description():
         parameters=[{
             "model_path": LaunchConfiguration("pidnet_model"),
             "input_topic": "/resized_image",
-            "mask_topic": "/lane_segmentation_mask",
             "class_topic": "/pidnet_class_map",
-            "lane_classes": ParameterValue(
-                LaunchConfiguration("pidnet_lane_classes"), value_type=List[int]
-            ),
             "device": "auto",
             "rail_support_radius": ParameterValue(
                 LaunchConfiguration("rail_support_radius"), value_type=int

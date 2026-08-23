@@ -22,6 +22,7 @@ from std_msgs.msg import Bool, Float32MultiArray, Int16, Int32MultiArray
 from main.main import (
     LANE_COMMAND_TOPIC,
     LANE_CHANGE_STATE_TOPIC,
+    LANE_PATH_PREVIEW_TOPIC,
     MainNode,
     OBJECT_INFO_RAW_TOPIC,
     OBJECT_INFO_TOPIC,
@@ -831,6 +832,20 @@ def test_generated_ros_entities_have_exact_topic_type_and_qos():
         assert side_sub.qos_profile.reliability is ReliabilityPolicy.BEST_EFFORT
         assert side_sub.qos_profile.durability is DurabilityPolicy.VOLATILE
 
+        path_preview_sub = node.lane_path_preview_sub
+        assert path_preview_sub.topic_name == LANE_PATH_PREVIEW_TOPIC
+        assert path_preview_sub.msg_type is Float32MultiArray
+        assert path_preview_sub.qos_profile.history is HistoryPolicy.KEEP_LAST
+        assert path_preview_sub.qos_profile.depth == 1
+        assert (
+            path_preview_sub.qos_profile.reliability
+            is ReliabilityPolicy.BEST_EFFORT
+        )
+        assert (
+            path_preview_sub.qos_profile.durability
+            is DurabilityPolicy.VOLATILE
+        )
+
         session_pub = node.rubbercone_session_active_pub
         assert session_pub.topic_name == RUBBERCONE_SESSION_ACTIVE_TOPIC
         assert session_pub.msg_type is Bool
@@ -1277,3 +1292,199 @@ def test_object_info_maps_signal_codes_to_green(code, green):
     assert harness.traffic_signal == code
     assert cycle.observation.green_detected is green
     assert cycle.observation.traffic_message_received_at == 7.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 가드레일 이득 ROS 파라미터
+#
+# 실차에서 이득을 찾는 동안 재빌드/재실행을 없애려고 연 통로다. 파라미터가
+# 컨트롤러까지 실제로 닿는지, 잘못된 값이 거절되는지, bag --loop 되감기로
+# 컨트롤러가 새로 만들어져도 살아남는지를 확인한다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_guardrail_parameters_reach_the_controller_at_launch():
+    from rclpy.parameter import Parameter
+    from main.main import MainNode
+
+    rclpy.init()
+    try:
+        node = MainNode()
+        node.set_parameters([Parameter('guardrail_gain_deg', value=12.5)])
+        assert node.lane_controller.guardrail_params['gain_deg'] == 12.5
+        assert node.cone_controller.guardrail_params['gain_deg'] == 12.5
+    finally:
+        rclpy.shutdown()
+
+
+def test_guardrail_parameter_launch_override_is_applied():
+    from main.main import MainNode
+
+    rclpy.init(args=['--ros-args', '-p', 'guardrail_gain_deg:=7.0'])
+    try:
+        node = MainNode()
+        assert node.lane_controller.guardrail_params['gain_deg'] == 7.0
+    finally:
+        rclpy.shutdown()
+
+
+def test_guardrail_parameter_rejects_bad_value_and_keeps_the_old_one():
+    from rclpy.parameter import Parameter
+    from main.main import MainNode
+
+    rclpy.init()
+    try:
+        node = MainNode()
+        before = node.lane_controller.guardrail_params['gain_deg']
+        result = node.set_parameters([Parameter('guardrail_gain_deg', value=-5.0)])[0]
+        assert not result.successful
+        assert 'gain_deg' in result.reason
+        assert node.lane_controller.guardrail_params['gain_deg'] == before
+    finally:
+        rclpy.shutdown()
+
+
+def test_guardrail_atomic_set_is_all_or_nothing():
+    """한 콜백에 여러 항목이 같이 오면, 하나가 거절될 때 나머지도 적용되면 안 된다.
+
+    set_parameters(비원자)는 항목마다 콜백을 따로 부르므로 요청끼리 독립이다
+    (ros2 param set 도 한 번에 하나다). 원자 경로에서만 이 계약이 의미가 있다.
+    """
+    from rclpy.parameter import Parameter
+    from main.main import MainNode
+
+    rclpy.init()
+    try:
+        node = MainNode()
+        before = dict(node.lane_controller.guardrail_params)
+        result = node.set_parameters_atomically([
+            Parameter('guardrail_gain_deg', value=11.0),
+            Parameter('guardrail_rate_deg', value=-1.0),
+        ])
+        assert not result.successful
+        assert node.lane_controller.guardrail_params == before
+    finally:
+        rclpy.shutdown()
+
+
+def test_lane_guardrail_toggle_takes_effect_at_runtime():
+    from rclpy.parameter import Parameter
+    from main.main import MainNode
+
+    rclpy.init()
+    try:
+        node = MainNode()
+        assert node.lane_guardrail_enabled
+        node.set_parameters([Parameter('lane_guardrail', value=False)])
+        assert not node.lane_guardrail_enabled
+    finally:
+        rclpy.shutdown()
+
+
+def test_curve_preview_toggle_rolls_back_at_runtime():
+    from rclpy.parameter import Parameter
+    from main.main import MainNode
+
+    rclpy.init()
+    try:
+        node = MainNode()
+        now = node._now_seconds()
+        assert node.runtime.record_lane_path_preview(
+            80.0, 0.2, 0.9, 0.25, 10.0, now
+        )
+        preview = node._curve_preview_for(Mode.LANE_DRIVE, now, 10.0)
+        assert preview[:2] == (80.0, 0.2)
+        assert preview[2] == pytest.approx(
+            (0.9 - node.curve_preview_min_confidence)
+            / (1.0 - node.curve_preview_min_confidence)
+        )
+
+        result = node.set_parameters([
+            Parameter('curve_preview_enabled', value=False)
+        ])[0]
+        assert result.successful
+        assert not node.curve_preview_enabled
+        assert node._curve_preview_for(Mode.LANE_DRIVE, now, 10.0) is None
+    finally:
+        rclpy.shutdown()
+
+
+def test_curve_preview_automatically_falls_back_on_low_confidence_or_skew():
+    from main.main import LANE_PATH_PREVIEW_MAX_SKEW_S, MainNode
+
+    rclpy.init()
+    try:
+        node = MainNode()
+        now = node._now_seconds()
+        low = node.curve_preview_min_confidence - 0.01
+        assert node.runtime.record_lane_path_preview(
+            80.0, 0.2, low, 0.25, 10.0, now
+        )
+        assert node._curve_preview_for(Mode.LANE_DRIVE, now, 10.0) is None
+
+        later = now + 1.0
+        assert node.runtime.record_lane_path_preview(
+            80.0, 0.2, 0.9, 0.25, 10.0, later
+        )
+        old_lane_receipt = later - LANE_PATH_PREVIEW_MAX_SKEW_S - 0.01
+        assert node._curve_preview_for(
+            Mode.LANE_DRIVE, old_lane_receipt, 10.0
+        ) is None
+        assert node._curve_preview_for(
+            Mode.LANE_DRIVE, later, 11.0
+        ) is None
+        assert node._curve_preview_for(
+            Mode.FIXED_AVOID, later, 10.0
+        ) is None
+    finally:
+        rclpy.shutdown()
+
+
+def test_curve_preview_is_disabled_by_authoritative_lane_action_pending():
+    from main.main import MainNode
+
+    rclpy.init()
+    try:
+        node = MainNode()
+        now = node._now_seconds()
+        assert node.runtime.record_lane_path_preview(
+            80.0, 0.2, 0.9, 0.25, 10.0, now
+        )
+        node.runtime.lane_action.pending = True
+
+        assert node._curve_preview_for(
+            Mode.LANE_DRIVE, now, 10.0
+        ) is None
+    finally:
+        rclpy.shutdown()
+
+
+def test_curve_preview_confidence_parameter_rejects_out_of_range_value():
+    from rclpy.parameter import Parameter
+    from main.main import MainNode
+
+    rclpy.init()
+    try:
+        node = MainNode()
+        before = node.curve_preview_min_confidence
+        result = node.set_parameters([
+            Parameter('curve_preview_min_confidence', value=1.5)
+        ])[0]
+        assert not result.successful
+        assert node.curve_preview_min_confidence == before
+    finally:
+        rclpy.shutdown()
+
+
+def test_guardrail_parameters_survive_runtime_reset():
+    """bag --loop 되감기는 Controller를 새로 만든다. 맞춰 둔 이득이 날아가면 안 된다."""
+    from rclpy.parameter import Parameter
+    from main.main import MainNode
+
+    rclpy.init()
+    try:
+        node = MainNode()
+        node.set_parameters([Parameter('guardrail_gain_deg', value=9.0)])
+        node._reset_for_bag_loop()
+        assert node.lane_controller.guardrail_params['gain_deg'] == 9.0
+    finally:
+        rclpy.shutdown()

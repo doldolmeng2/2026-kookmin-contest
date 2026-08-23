@@ -78,10 +78,7 @@ def generate_launch_description():
         parameters=[{
             'model_path': pidnet_model,
             'input_topic': '/resized_image',
-            'mask_topic': '/lane_segmentation_mask',
             'class_topic': '/pidnet_class_map',
-            # lane_node는 중앙선 하나만 피팅하므로 중앙선 단독([1])만 내보낸다.
-            'lane_classes': [1],
             'device': 'auto',
         }],
     )
@@ -95,8 +92,7 @@ def generate_launch_description():
             'debug_view': True,
             'debug_lane_view': lane_debug_detail,
             'camera_topic': '/resized_image',
-            # 위 pidnet_node 의 lane_classes 와 같은 값이어야 한다. lane_node 가
-            # /pidnet_class_map 에서 직접 중앙선을 뽑기 때문이다.
+            # lane_node 가 /pidnet_class_map 에서 직접 중앙선을 뽑는다.
             'center_classes': [1],
         }],
         remappings=[('/mode_info', '/internal/lane_command')],
