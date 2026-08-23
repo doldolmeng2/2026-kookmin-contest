@@ -24,18 +24,18 @@
 #   mode (기본값: 0) - main_node 초기 주행 모드
 #   show_debug (기본값: false) - 제어 지연을 피하기 위한 상태 창 비활성화
 #   rubbercone_offset_filter_alpha (기본값: 0.80) - 라바콘 오프셋 EMA 계수
-#   rubbercone_end_missing_frames (기본값: 3) - 라바콘 종료 판정 누락 프레임 수
+#   rubbercone_end_missing_frames (기본값: 4) - 라바콘 종료 판정 누락 프레임 수
 #   rubbercone_scan_max_range (기본값: 1.10m) - 라바콘 경계 탐색 최대 거리
 #   rubbercone_scan_max_angle (기본값: 85deg) - 탐색 좌우 최대 각도
-#   rubbercone_max_lateral_distance (기본값: 0.70m) - 탐색 좌우 최대 편차
+#   rubbercone_max_lateral_distance (기본값: 0.85m) - 탐색 좌우 최대 편차
 #   rubbercone_max_cone_centers (기본값: 6) - 사용할 콘 개수 (가까운 순)
-#   rubbercone_boundary_points (기본값: 3) - 경계 직선 피팅에 쓸 콘 개수
-#   rubbercone_target_lookahead (기본값: 0.70m) - 경로 목표점 전방 거리
+#   rubbercone_boundary_points (기본값: 4) - 경계 곡선 피팅에 쓸 콘 개수
+#   rubbercone_target_lookahead (기본값: 0.55m) - 경로 목표점 전방 거리
 #   rubbercone_nominal_half_width (기본값: 0.30m) - 한쪽 경계만 보일 때의 초기 반폭
-#   rubbercone_offset_gain (기본값: 150) - 목표점(m)→조향 오프셋 변환 이득
+#   rubbercone_offset_gain (기본값: 220) - 목표점(m)→조향 오프셋 변환 이득
 #   rubbercone_offset_limit (기본값: 45) - LiDAR 오프셋 안전 한계
-#   rubbercone_enable_gui (기본값: true) - 라바콘 LiDAR 인식 디버그 창 표시
-#   object_enable_gui (기본값: true) - 장애물 검출 디버그 창 표시
+#   rubbercone_enable_gui (기본값: false) - 라바콘 LiDAR 인식 디버그 창 표시
+#   object_enable_gui (기본값: false) - 장애물 검출 디버그 창 표시
 #     (성능에 영향. 기록 주행 시 object_enable_gui:=false 권장)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -172,7 +172,7 @@ def generate_launch_description():
     rubbercone_offset_filter_alpha = LaunchConfiguration('rubbercone_offset_filter_alpha')
     rubbercone_end_missing_frames_arg = DeclareLaunchArgument(
         'rubbercone_end_missing_frames',
-        default_value='3',
+        default_value='4',
         description='라바콘 종료 전 연속 누락 스캔 수'
     )
     rubbercone_end_missing_frames = LaunchConfiguration('rubbercone_end_missing_frames')
@@ -190,7 +190,7 @@ def generate_launch_description():
     rubbercone_scan_max_angle = LaunchConfiguration('rubbercone_scan_max_angle')
     rubbercone_max_lateral_distance_arg = DeclareLaunchArgument(
         'rubbercone_max_lateral_distance',
-        default_value='0.70',
+        default_value='0.85',
         description='라바콘 탐색 좌우 최대 편차 (m, 벽/옆 코스 제거)'
     )
     rubbercone_max_lateral_distance = LaunchConfiguration('rubbercone_max_lateral_distance')
@@ -202,16 +202,24 @@ def generate_launch_description():
     rubbercone_max_cone_centers = LaunchConfiguration('rubbercone_max_cone_centers')
     rubbercone_boundary_points_arg = DeclareLaunchArgument(
         'rubbercone_boundary_points',
-        default_value='3',
-        description='한쪽 경계 직선 피팅에 사용할 콘 개수'
+        default_value='4',
+        description='한쪽 경계 곡선 피팅에 사용할 콘 개수'
     )
     rubbercone_boundary_points = LaunchConfiguration('rubbercone_boundary_points')
     rubbercone_target_lookahead_arg = DeclareLaunchArgument(
         'rubbercone_target_lookahead',
-        default_value='0.70',
+        default_value='0.55',
         description='라바콘 경로 목표점 전방 거리 (m)'
     )
     rubbercone_target_lookahead = LaunchConfiguration('rubbercone_target_lookahead')
+    rubbercone_curve_target_lookahead_arg = DeclareLaunchArgument(
+        'rubbercone_curve_target_lookahead',
+        default_value='0.40',
+        description='커브 판단 시 라바콘 목표점 전방 거리 (m)'
+    )
+    rubbercone_curve_target_lookahead = LaunchConfiguration(
+        'rubbercone_curve_target_lookahead'
+    )
     rubbercone_nominal_half_width_arg = DeclareLaunchArgument(
         'rubbercone_nominal_half_width',
         default_value='0.30',
@@ -220,7 +228,7 @@ def generate_launch_description():
     rubbercone_nominal_half_width = LaunchConfiguration('rubbercone_nominal_half_width')
     rubbercone_offset_gain_arg = DeclareLaunchArgument(
         'rubbercone_offset_gain',
-        default_value='150.0',
+        default_value='220.0',
         description='라바콘 목표점(m)에서 조향 오프셋으로 변환하는 이득'
     )
     rubbercone_offset_gain = LaunchConfiguration('rubbercone_offset_gain')
@@ -236,6 +244,14 @@ def generate_launch_description():
         description='라바콘 LiDAR 인식 디버그 창 표시 여부 (기록 주행 시 false 권장)'
     )
     rubbercone_enable_gui = LaunchConfiguration('rubbercone_enable_gui')
+    rubbercone_enable_far_curve_hint_arg = DeclareLaunchArgument(
+        'rubbercone_enable_far_curve_hint',
+        default_value='false',
+        description='먼 라바콘 기반 커브 힌트 사용 여부'
+    )
+    rubbercone_enable_far_curve_hint = LaunchConfiguration(
+        'rubbercone_enable_far_curve_hint'
+    )
     object_enable_gui_arg = DeclareLaunchArgument(
         'object_enable_gui',
         default_value='false',
@@ -314,9 +330,23 @@ def generate_launch_description():
             'max_cone_centers': rubbercone_max_cone_centers,
             'boundary_points': rubbercone_boundary_points,
             'target_lookahead': rubbercone_target_lookahead,
+            'curve_target_lookahead': rubbercone_curve_target_lookahead,
             'nominal_half_width': rubbercone_nominal_half_width,
             'offset_gain': rubbercone_offset_gain,
             'offset_limit': rubbercone_offset_limit,
+            'enable_far_curve_hint': rubbercone_enable_far_curve_hint,
+            'far_scan_max_range': 1.80,
+            'min_far_curve_cones': 3,
+            'far_curve_min_x_span': 0.35,
+            'max_boundary_curvature': 2.50,
+            'curve_slope_threshold': 0.22,
+            'curve_curvature_threshold': 0.65,
+            'slope_feedforward_gain': 8.0,
+            'curvature_feedforward_gain': 3.0,
+            'one_side_slope_feedforward_gain': 10.0,
+            'one_side_curvature_feedforward_gain': 3.5,
+            'max_offset_step': 20.0,
+            'curve_max_offset_step': 26.0,
             'enable_gui': rubbercone_enable_gui,
         }],
     )
@@ -453,10 +483,12 @@ def generate_launch_description():
         rubbercone_max_cone_centers_arg,
         rubbercone_boundary_points_arg,
         rubbercone_target_lookahead_arg,
+        rubbercone_curve_target_lookahead_arg,
         rubbercone_nominal_half_width_arg,
         rubbercone_offset_gain_arg,
         rubbercone_offset_limit_arg,
         rubbercone_enable_gui_arg,
+        rubbercone_enable_far_curve_hint_arg,
         object_enable_gui_arg,
         detector_model_path_arg,
         perception_camera_topic_arg,

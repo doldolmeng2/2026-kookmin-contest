@@ -74,9 +74,22 @@ float pointRange(const cv::Point2f& point)
     return std::hypot(point.x, point.y);
 }
 
+enum class CurveDirection {
+    UNKNOWN,
+    LEFT,
+    RIGHT,
+};
+
+struct CurveHint {
+    CurveDirection direction{CurveDirection::UNKNOWN};
+    float strength{0.0f};
+};
+
 struct BoundaryModel {
     bool valid{false};
     int count{0};
+    bool quadratic{false};
+    float curvature{0.0f};
     float slope{0.0f};
     float intercept{0.0f};
     float min_x{0.0f};
@@ -85,7 +98,7 @@ struct BoundaryModel {
 
     float at(float x) const
     {
-        return slope * x + intercept;
+        return curvature * x * x + slope * x + intercept;
     }
 };
 
@@ -93,7 +106,10 @@ struct PathEstimate {
     bool valid{false};
     bool bilateral{false};
     bool entry_geometry_valid{false};
+    bool curve_caution{false};
     cv::Point2f target{};
+    float heading_slope{0.0f};
+    float curvature{0.0f};
     float confidence{0.0f};
 };
 
@@ -101,6 +117,7 @@ struct PathEstimate {
 struct DebugSnapshot {
     std::vector<cv::Point2f> raw_points;    // 필터를 통과한 원본 반사점
     std::vector<cv::Point2f> cone_centers;  // 클러스터링으로 뽑은 콘 대표점
+    std::vector<cv::Point2f> far_cone_centers;  // 커브 힌트 전용 먼 콘
     std::vector<cv::Point2f> left_points;   // 좌 경계로 분류된 콘
     std::vector<cv::Point2f> right_points;  // 우 경계로 분류된 콘
     BoundaryModel left;
@@ -126,6 +143,10 @@ public:
       offset_gain_(230.0f),
       scan_min_range_(0.18f),
       scan_max_range_(1.10f),
+      far_scan_max_range_(1.80f),
+      enable_far_curve_hint_(false),
+      min_far_curve_cones_(3),
+      far_curve_min_x_span_(0.35f),
       scan_max_angle_(85.0f * kPi / 180.0f),
       max_lateral_distance_(0.70f),
       front_ignore_angle_(13.0f * kPi / 180.0f),
@@ -138,8 +159,11 @@ public:
       max_cone_centers_(6),
       max_boundary_points_(3),
       max_boundary_slope_(1.20f),
+      max_boundary_curvature_(2.50f),
       fit_residual_limit_(0.18f),
       target_lookahead_(0.70f),
+      active_target_lookahead_(0.70f),
+      curve_target_lookahead_(0.50f),
       min_target_lookahead_(0.35f),
       nominal_half_width_(0.30f),
       adaptive_half_width_(0.30f),
@@ -147,6 +171,13 @@ public:
       max_corridor_width_(1.40f),
       offset_limit_(40.0f),
       max_offset_step_(20.0f),
+      curve_max_offset_step_(24.0f),
+      curve_slope_threshold_(0.28f),
+      curve_curvature_threshold_(0.75f),
+      slope_feedforward_gain_(8.0f),
+      curvature_feedforward_gain_(3.0f),
+      one_side_slope_feedforward_gain_(10.0f),
+      one_side_curvature_feedforward_gain_(3.5f),
       filtered_target_y_(0.0f),
       has_filtered_target_y_(false),
       filtered_offset_(0.0f),
@@ -202,6 +233,15 @@ public:
         scan_max_range_ = clampValue(
             static_cast<float>(declare_parameter<double>("scan_max_range", 1.10)),
             0.50f, 3.00f);
+        far_scan_max_range_ = clampValue(
+            static_cast<float>(declare_parameter<double>("far_scan_max_range", 1.80)),
+            scan_max_range_, 3.00f);
+        enable_far_curve_hint_ = declare_parameter<bool>("enable_far_curve_hint", false);
+        min_far_curve_cones_ = std::max(
+            2, static_cast<int>(declare_parameter<int>("min_far_curve_cones", 3)));
+        far_curve_min_x_span_ = clampValue(
+            static_cast<float>(declare_parameter<double>("far_curve_min_x_span", 0.35)),
+            0.10f, 1.20f);
         scan_max_angle_ = clampValue(
             static_cast<float>(declare_parameter<double>("scan_max_angle", 85.0)),
             30.0f, 90.0f) * kPi / 180.0f;
@@ -212,10 +252,40 @@ public:
             2, static_cast<int>(declare_parameter<int>("max_cone_centers", 6)));
         max_boundary_points_ = clampValue(
             static_cast<int>(declare_parameter<int>("boundary_points", 3)), 2, 6);
+        max_boundary_curvature_ = clampValue(
+            static_cast<float>(declare_parameter<double>("max_boundary_curvature", 2.50)),
+            0.25f, 8.00f);
 
         target_lookahead_ = clampValue(
             static_cast<float>(declare_parameter<double>("target_lookahead", 0.70)),
             min_target_lookahead_, scan_max_range_);
+        curve_target_lookahead_ = clampValue(
+            static_cast<float>(declare_parameter<double>("curve_target_lookahead", 0.50)),
+            min_target_lookahead_, target_lookahead_);
+        curve_slope_threshold_ = clampValue(
+            static_cast<float>(declare_parameter<double>("curve_slope_threshold", 0.28)),
+            0.05f, 1.00f);
+        curve_curvature_threshold_ = clampValue(
+            static_cast<float>(declare_parameter<double>("curve_curvature_threshold", 0.75)),
+            0.10f, 5.00f);
+        slope_feedforward_gain_ = clampValue(
+            static_cast<float>(declare_parameter<double>("slope_feedforward_gain", 8.0)),
+            0.0f, 30.0f);
+        curvature_feedforward_gain_ = clampValue(
+            static_cast<float>(declare_parameter<double>("curvature_feedforward_gain", 3.0)),
+            0.0f, 20.0f);
+        one_side_slope_feedforward_gain_ = clampValue(
+            static_cast<float>(declare_parameter<double>("one_side_slope_feedforward_gain", 10.0)),
+            0.0f, 35.0f);
+        one_side_curvature_feedforward_gain_ = clampValue(
+            static_cast<float>(declare_parameter<double>("one_side_curvature_feedforward_gain", 3.5)),
+            0.0f, 25.0f);
+        max_offset_step_ = clampValue(
+            static_cast<float>(declare_parameter<double>("max_offset_step", 20.0)),
+            4.0f, 45.0f);
+        curve_max_offset_step_ = clampValue(
+            static_cast<float>(declare_parameter<double>("curve_max_offset_step", 24.0)),
+            max_offset_step_, 45.0f);
         nominal_half_width_ = clampValue(
             static_cast<float>(declare_parameter<double>("nominal_half_width", 0.30)),
             0.15f, 0.70f);
@@ -282,6 +352,7 @@ private:
         rubber_end_value_ = 0;
         rubber_confidence_value_ = 0;
         rubber_entry_ready_value_ = 0;
+        active_target_lookahead_ = target_lookahead_;
 
         // The GUI is diagnostic state, but clearing it here prevents an old
         // latched end/debounce display from being mistaken for the new session.
@@ -331,8 +402,11 @@ private:
 
     // 연속한 LaserScan 반사점 중 실제 콘 하나에 해당하는 대표점을 추출한다.
     // raw_points가 주어지면 필터를 통과한 원본 반사점도 함께 돌려준다(디버그 창용).
-    std::vector<cv::Point2f> extractConeCenters(const sensor_msgs::msg::LaserScan& scan,
-                                                std::vector<cv::Point2f>* raw_points = nullptr) const
+    std::vector<cv::Point2f> extractConeCenters(
+        const sensor_msgs::msg::LaserScan& scan,
+        float min_range,
+        float max_range,
+        std::vector<cv::Point2f>* raw_points = nullptr) const
     {
         std::vector<cv::Point2f> centers;
         std::vector<cv::Point2f> cluster;
@@ -363,7 +437,7 @@ private:
         for (const float range : scan.ranges) {
             const bool in_search_area =
                 std::isfinite(range) &&
-                range >= scan_min_range_ && range <= scan_max_range_ &&
+                range >= min_range && range <= max_range &&
                 std::abs(angle) <= scan_max_angle_;
 
             // 가까운 전방 반사는 차체/센서 마운트일 가능성이 높다. 멀리 있는
@@ -453,6 +527,81 @@ private:
         intercept = (sum_y - slope * sum_x) / sum_w;
     }
 
+    bool fitWeightedQuadratic(
+        const std::vector<cv::Point2f>& points,
+        float& curvature,
+        float& slope,
+        float& intercept) const
+    {
+        if (points.size() < 3) {
+            return false;
+        }
+
+        float s0 = 0.0f;
+        float s1 = 0.0f;
+        float s2 = 0.0f;
+        float s3 = 0.0f;
+        float s4 = 0.0f;
+        float t0 = 0.0f;
+        float t1 = 0.0f;
+        float t2 = 0.0f;
+
+        for (const auto& point : points) {
+            const float weight = 1.0f / (0.15f + pointRange(point));
+            const float x = point.x;
+            const float x2 = x * x;
+            s0 += weight;
+            s1 += weight * x;
+            s2 += weight * x2;
+            s3 += weight * x2 * x;
+            s4 += weight * x2 * x2;
+            t0 += weight * point.y;
+            t1 += weight * x * point.y;
+            t2 += weight * x2 * point.y;
+        }
+
+        float a[3][4] = {
+            {s4, s3, s2, t2},
+            {s3, s2, s1, t1},
+            {s2, s1, s0, t0},
+        };
+
+        for (int col = 0; col < 3; ++col) {
+            int pivot = col;
+            for (int row = col + 1; row < 3; ++row) {
+                if (std::abs(a[row][col]) > std::abs(a[pivot][col])) {
+                    pivot = row;
+                }
+            }
+            if (std::abs(a[pivot][col]) < 1e-5f) {
+                return false;
+            }
+            if (pivot != col) {
+                for (int k = col; k < 4; ++k) {
+                    std::swap(a[col][k], a[pivot][k]);
+                }
+            }
+            const float divisor = a[col][col];
+            for (int k = col; k < 4; ++k) {
+                a[col][k] /= divisor;
+            }
+            for (int row = 0; row < 3; ++row) {
+                if (row == col) {
+                    continue;
+                }
+                const float factor = a[row][col];
+                for (int k = col; k < 4; ++k) {
+                    a[row][k] -= factor * a[col][k];
+                }
+            }
+        }
+
+        curvature = clampValue(a[0][3], -max_boundary_curvature_, max_boundary_curvature_);
+        slope = clampValue(a[1][3], -max_boundary_slope_, max_boundary_slope_);
+        intercept = a[2][3];
+        return true;
+    }
+
     BoundaryModel fitBoundary(std::vector<cv::Point2f> points) const
     {
         BoundaryModel model;
@@ -468,33 +617,41 @@ private:
             points.resize(static_cast<std::size_t>(max_boundary_points_));
         }
 
+        float curvature = 0.0f;
         float slope = 0.0f;
         float intercept = 0.0f;
         fitWeightedLine(points, slope, intercept);
+        bool quadratic = fitWeightedQuadratic(points, curvature, slope, intercept);
 
         // 첫 추정에서 크게 벗어난 점은 인접 코스/잡음일 가능성이 높으므로 한 번 제거한다.
         std::vector<cv::Point2f> inliers;
         for (const auto& point : points) {
-            if (std::abs(point.y - (slope * point.x + intercept)) <= fit_residual_limit_) {
+            const float predicted = curvature * point.x * point.x + slope * point.x + intercept;
+            if (std::abs(point.y - predicted) <= fit_residual_limit_) {
                 inliers.push_back(point);
             }
         }
         if (inliers.size() >= 2 && inliers.size() < points.size()) {
             points = inliers;
+            curvature = 0.0f;
             fitWeightedLine(points, slope, intercept);
+            quadratic = fitWeightedQuadratic(points, curvature, slope, intercept);
         }
 
         float residual_sum = 0.0f;
         float min_x = std::numeric_limits<float>::max();
         float max_x = std::numeric_limits<float>::lowest();
         for (const auto& point : points) {
-            residual_sum += std::abs(point.y - (slope * point.x + intercept));
+            const float predicted = curvature * point.x * point.x + slope * point.x + intercept;
+            residual_sum += std::abs(point.y - predicted);
             min_x = std::min(min_x, point.x);
             max_x = std::max(max_x, point.x);
         }
 
         model.valid = true;
         model.count = static_cast<int>(points.size());
+        model.quadratic = quadratic;
+        model.curvature = quadratic ? curvature : 0.0f;
         model.slope = slope;
         model.intercept = intercept;
         model.min_x = min_x;
@@ -505,7 +662,7 @@ private:
 
     float chooseTargetX(const BoundaryModel* left, const BoundaryModel* right) const
     {
-        float available_x = target_lookahead_;
+        float available_x = active_target_lookahead_;
         if (left != nullptr && right != nullptr) {
             available_x = std::min(left->max_x, right->max_x);
         } else if (left != nullptr) {
@@ -514,8 +671,8 @@ private:
             available_x = right->max_x;
         }
 
-        return clampValue(std::min(target_lookahead_, available_x),
-                          min_target_lookahead_, target_lookahead_);
+        return clampValue(std::min(active_target_lookahead_, available_x),
+                          min_target_lookahead_, active_target_lookahead_);
     }
 
     float boundaryQuality(const BoundaryModel& boundary) const
@@ -525,11 +682,111 @@ private:
         const float residual_score = 1.0f - clampValue(
             boundary.mean_residual / fit_residual_limit_, 0.0f, 1.0f);
         const float coverage_score = clampValue(
-            boundary.max_x / target_lookahead_, 0.0f, 1.0f);
+            boundary.max_x / active_target_lookahead_, 0.0f, 1.0f);
         return 0.50f * count_score + 0.25f * residual_score + 0.25f * coverage_score;
     }
 
-    PathEstimate estimatePath(const std::vector<cv::Point2f>& centers)
+    CurveHint estimateCurveHint(std::vector<cv::Point2f> far_centers) const
+    {
+        if (!enable_far_curve_hint_ ||
+            static_cast<int>(far_centers.size()) < min_far_curve_cones_)
+        {
+            return {};
+        }
+
+        std::sort(far_centers.begin(), far_centers.end(),
+                  [](const cv::Point2f& a, const cv::Point2f& b) {
+                      return a.x < b.x;
+                  });
+        const float x_span = far_centers.back().x - far_centers.front().x;
+        if (x_span < far_curve_min_x_span_) {
+            return {};
+        }
+
+        float sum_x = 0.0f;
+        float sum_y = 0.0f;
+        float sum_xx = 0.0f;
+        float sum_xy = 0.0f;
+        for (const auto& point : far_centers) {
+            sum_x += point.x;
+            sum_y += point.y;
+            sum_xx += point.x * point.x;
+            sum_xy += point.x * point.y;
+        }
+
+        const float n = static_cast<float>(far_centers.size());
+        const float denominator = n * sum_xx - sum_x * sum_x;
+        if (std::abs(denominator) < 1e-5f) {
+            return {};
+        }
+
+        const float slope = (n * sum_xy - sum_x * sum_y) / denominator;
+        const float strength = clampValue(
+            std::abs(slope) / std::max(curve_slope_threshold_, 1e-5f),
+            0.0f, 1.0f);
+        if (strength < 1.0f) {
+            return {};
+        }
+
+        return CurveHint{
+            slope > 0.0f ? CurveDirection::LEFT : CurveDirection::RIGHT,
+            strength,
+        };
+    }
+
+    static float boundarySlopeAt(const BoundaryModel& boundary, float x)
+    {
+        return 2.0f * boundary.curvature * x + boundary.slope;
+    }
+
+    bool isCurveBoundary(const BoundaryModel& boundary, float x) const
+    {
+        if (!boundary.valid) {
+            return false;
+        }
+        return std::abs(boundarySlopeAt(boundary, x)) >= curve_slope_threshold_ ||
+               std::abs(boundary.curvature) >= curve_curvature_threshold_;
+    }
+
+    PathEstimate makeOneSidePath(
+        const BoundaryModel& left,
+        const BoundaryModel& right,
+        bool curve_caution) const
+    {
+        PathEstimate path;
+        const bool use_left = left.valid &&
+            (!right.valid || boundaryQuality(left) >= boundaryQuality(right));
+        const BoundaryModel* boundary = use_left ? &left : (right.valid ? &right : nullptr);
+        if (boundary == nullptr) {
+            return path;
+        }
+
+        const float target_x = chooseTargetX(use_left ? boundary : nullptr,
+                                              use_left ? nullptr : boundary);
+        const float boundary_y = boundary->at(target_x);
+        path.valid = true;
+        path.bilateral = false;
+        path.curve_caution = curve_caution;
+        path.target = cv::Point2f{
+            target_x,
+            use_left ? boundary_y - adaptive_half_width_
+                     : boundary_y + adaptive_half_width_};
+        path.heading_slope = boundarySlopeAt(*boundary, target_x);
+        path.curvature = boundary->curvature;
+
+        const float quality = boundaryQuality(*boundary);
+        const float base = 0.32f;
+        const float span = 0.46f;
+        path.confidence = clampValue(base + span * quality, 0.0f, 0.72f);
+        if (curve_caution) {
+            path.confidence = std::min(path.confidence, 0.68f);
+        }
+        return path;
+    }
+
+    PathEstimate estimatePath(
+        const std::vector<cv::Point2f>& centers,
+        const CurveHint& curve_hint)
     {
         std::vector<cv::Point2f> left_points;
         std::vector<cv::Point2f> right_points;
@@ -550,6 +807,15 @@ private:
         const BoundaryModel left = fitBoundary(left_points);
         const BoundaryModel right = fitBoundary(right_points);
         PathEstimate path;
+        const bool boundary_curve_caution =
+            isCurveBoundary(left, target_lookahead_) ||
+            isCurveBoundary(right, target_lookahead_);
+        const bool curve_caution =
+            curve_hint.direction != CurveDirection::UNKNOWN ||
+            boundary_curve_caution;
+        active_target_lookahead_ = curve_caution
+            ? curve_target_lookahead_
+            : target_lookahead_;
 
         if (enable_gui_) {
             std::lock_guard<std::mutex> lock(debug_mutex_);
@@ -584,33 +850,22 @@ private:
                 path.bilateral = true;
                 path.entry_geometry_valid = rubbercone::entryGeometryValid(
                     left.count, right.count);
+                path.curve_caution = curve_caution;
                 path.target = cv::Point2f{target_x, 0.5f * (left_y + right_y)};
+                path.heading_slope = 0.5f * (
+                    boundarySlopeAt(left, target_x) + boundarySlopeAt(right, target_x));
+                path.curvature = 0.5f * (left.curvature + right.curvature);
                 path.confidence = clampValue(0.65f + 0.35f * quality, 0.0f, 1.0f);
+                if (path.curve_caution) {
+                    path.confidence = std::min(path.confidence, 0.88f);
+                }
                 return path;
             }
         }
 
         // 한쪽 경계가 가려지거나 시작 위치가 치우친 경우에는 최근에 학습한 통로 폭으로
         // 반대편 경계를 추정한다. 이 상태는 유효하지만 신뢰도를 낮춰 속도를 제한한다.
-        const bool use_left = left.valid &&
-            (!right.valid || boundaryQuality(left) >= boundaryQuality(right));
-        const BoundaryModel* boundary = use_left ? &left : (right.valid ? &right : nullptr);
-        if (boundary == nullptr) {
-            return path;
-        }
-
-        const float target_x = chooseTargetX(use_left ? boundary : nullptr,
-                                              use_left ? nullptr : boundary);
-        const float boundary_y = boundary->at(target_x);
-        path.valid = true;
-        path.bilateral = false;
-        path.target = cv::Point2f{
-            target_x,
-            use_left ? boundary_y - adaptive_half_width_
-                     : boundary_y + adaptive_half_width_};
-        path.confidence = clampValue(
-            0.32f + 0.46f * boundaryQuality(*boundary), 0.0f, 0.78f);
-        return path;
+        return makeOneSidePath(left, right, curve_caution);
     }
 
     float smoothTargetY(const PathEstimate& path)
@@ -636,13 +891,14 @@ private:
         return filtered_target_y_;
     }
 
-    void updateDetectionState(const PathEstimate& path)
+    void updateDetectionState(const PathEstimate& path, bool far_cones_visible)
     {
         const int confidence = static_cast<int>(std::round(path.confidence * 100.0f));
         const bool lifecycle_path_valid = rubbercone::lifecyclePathValid(
             session_lifecycle_.active(), path.valid, path.entry_geometry_valid);
+        const bool session_path_present = lifecycle_path_valid || far_cones_visible;
         const auto session = session_lifecycle_.update(
-            lifecycle_path_valid, path.confidence, now().seconds());
+            session_path_present, path.confidence, now().seconds());
         rubber_entry_ready_value_ = session.entry_ready ? 1 : 0;
         rubber_end_value_ = session.end_latched ? 1 : 0;
         if (session.armed_this_sample) {
@@ -657,8 +913,18 @@ private:
 
         if (path.valid) {
             const float target_y = smoothTargetY(path);
+            const float slope_gain = path.bilateral
+                ? slope_feedforward_gain_
+                : one_side_slope_feedforward_gain_;
+            const float curvature_gain = path.bilateral
+                ? curvature_feedforward_gain_
+                : one_side_curvature_feedforward_gain_;
+            const float feedforward_offset =
+                -path.heading_slope * slope_gain -
+                path.curvature * curvature_gain;
             const float raw_offset = clampValue(
-                -target_y * offset_gain_, -offset_limit_, offset_limit_);
+                -target_y * offset_gain_ + feedforward_offset,
+                -offset_limit_, offset_limit_);
             if (!has_filtered_offset_) {
                 filtered_offset_ = raw_offset;
                 has_filtered_offset_ = true;
@@ -668,8 +934,11 @@ private:
                 const float alpha = path.bilateral
                     ? offset_filter_alpha_
                     : std::min(one_side_target_filter_alpha_, offset_filter_alpha_);
+                const float step_limit = path.curve_caution
+                    ? curve_max_offset_step_
+                    : max_offset_step_;
                 const float bounded_delta = clampValue(
-                    raw_offset - filtered_offset_, -max_offset_step_, max_offset_step_);
+                    raw_offset - filtered_offset_, -step_limit, step_limit);
                 filtered_offset_ += alpha * bounded_delta;
             }
 
@@ -679,8 +948,11 @@ private:
         }
 
         // 짧은 스캔 누락에서는 마지막 조향값을 유지하되, 메인 노드가 감속할 수 있도록
-        // 신뢰도만 빠르게 내린다.
+        // 신뢰도만 빠르게 내린다. far 후보가 보이면 종료 대신 복구 여지로 본다.
         rubber_confidence_value_ = std::max(0, rubber_confidence_value_ - 25);
+        if (far_cones_visible) {
+            rubber_confidence_value_ = std::min(rubber_confidence_value_, 35);
+        }
         if (session.end_latched) {
             rubber_confidence_value_ = 0;
             rubber_entry_ready_value_ = 0;
@@ -806,15 +1078,19 @@ private:
                       fmt(snapshot.filtered_target.y)
                 : "target 없음",
             3, {180, 180, 255});
-        put("half_width=" + fmt(snapshot.half_width) +
-            "  fit L/R residual=" +
+        put("slope=" + fmt(snapshot.path.heading_slope) +
+            "  curve=" + fmt(snapshot.path.curvature) +
+            "  half_width=" + fmt(snapshot.half_width), 4,
+            {160, 160, 220});
+        put("fit L/R residual=" +
             (snapshot.left.valid ? fmt(snapshot.left.mean_residual) : "-") + "/" +
-            (snapshot.right.valid ? fmt(snapshot.right.mean_residual) : "-"), 4,
+            (snapshot.right.valid ? fmt(snapshot.right.mean_residual) : "-") +
+            "  lookahead=" + fmt(active_target_lookahead_), 5,
             {160, 160, 160});
         put("area: r<=" + fmt(scan_max_range_) +
             "m  ang<=" + fmt(scan_max_angle_ * 180.0f / kPi, 0) +
             "deg  side<=" + fmt(max_lateral_distance_) +
-            "m  cones<=" + std::to_string(max_cone_centers_), 5,
+            "m  cones<=" + std::to_string(max_cone_centers_), 6,
             {120, 120, 180});
 
         cv::putText(canvas, "LEFT", {12, base_y + 24},
@@ -841,7 +1117,7 @@ private:
         }
         // 피팅에 쓰인 구간부터 목표점 전방 거리까지 직선을 연장해 보여준다.
         const float x0 = std::max(0.0f, boundary.min_x - 0.10f);
-        const float x1 = std::max(boundary.max_x, target_lookahead_);
+        const float x1 = std::max(boundary.max_x, active_target_lookahead_);
         cv::line(canvas,
                  toPx({x0, boundary.at(x0)}),
                  toPx({x1, boundary.at(x1)}),
@@ -855,6 +1131,10 @@ private:
     float offset_gain_;
     float scan_min_range_;
     float scan_max_range_;
+    float far_scan_max_range_;
+    bool enable_far_curve_hint_;
+    int min_far_curve_cones_;
+    float far_curve_min_x_span_;
     float scan_max_angle_;
     float max_lateral_distance_;
     float front_ignore_angle_;
@@ -867,8 +1147,11 @@ private:
     int max_cone_centers_;
     int max_boundary_points_;
     float max_boundary_slope_;
+    float max_boundary_curvature_;
     float fit_residual_limit_;
     float target_lookahead_;
+    float active_target_lookahead_;
+    float curve_target_lookahead_;
     float min_target_lookahead_;
     float nominal_half_width_;
     float adaptive_half_width_;
@@ -876,6 +1159,13 @@ private:
     float max_corridor_width_;
     float offset_limit_;
     float max_offset_step_;
+    float curve_max_offset_step_;
+    float curve_slope_threshold_;
+    float curve_curvature_threshold_;
+    float slope_feedforward_gain_;
+    float curvature_feedforward_gain_;
+    float one_side_slope_feedforward_gain_;
+    float one_side_curvature_feedforward_gain_;
 
     float filtered_target_y_;
     bool has_filtered_target_y_;
@@ -915,7 +1205,8 @@ private:
             // 종료 래치 이후에는 경로 추정을 멈추지만, 무엇이 보이는지는 계속 표시한다.
             if (enable_gui_) {
                 std::vector<cv::Point2f> raw_points;
-                const auto centers = extractConeCenters(*msg, &raw_points);
+                const auto centers = extractConeCenters(
+                    *msg, scan_min_range_, scan_max_range_, &raw_points);
                 std::lock_guard<std::mutex> lock(debug_mutex_);
                 debug_ = DebugSnapshot{};
                 debug_.raw_points = std::move(raw_points);
@@ -927,15 +1218,25 @@ private:
         }
 
         std::vector<cv::Point2f> raw_points;
-        const auto centers = extractConeCenters(*msg, enable_gui_ ? &raw_points : nullptr);
-        const auto path = estimatePath(centers);
-        updateDetectionState(path);
+        const auto centers = extractConeCenters(
+            *msg, scan_min_range_, scan_max_range_, enable_gui_ ? &raw_points : nullptr);
+        const auto far_centers = enable_far_curve_hint_
+            ? extractConeCenters(*msg, scan_max_range_, far_scan_max_range_, nullptr)
+            : std::vector<cv::Point2f>{};
+        const auto curve_hint = estimateCurveHint(far_centers);
+        active_target_lookahead_ = curve_hint.direction == CurveDirection::UNKNOWN
+            ? target_lookahead_
+            : curve_target_lookahead_;
+        const auto path = estimatePath(centers, curve_hint);
+        const bool far_evidence = curve_hint.direction != CurveDirection::UNKNOWN;
+        updateDetectionState(path, far_evidence);
         publishInfo();
 
         if (enable_gui_) {
             std::lock_guard<std::mutex> lock(debug_mutex_);
             debug_.raw_points = std::move(raw_points);
             debug_.cone_centers = centers;
+            debug_.far_cone_centers = far_centers;
             debug_.path = path;
             debug_.filtered_target = cv::Point2f{path.target.x, filtered_target_y_};
             debug_.has_filtered_target = has_filtered_target_y_ && path.valid;

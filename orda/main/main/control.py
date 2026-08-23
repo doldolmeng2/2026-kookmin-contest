@@ -368,16 +368,16 @@ SPEED_PARAMS = {
 # 좁은 속도 범위로 유지한다. 다만 큰 조향에서는 물리적인 언더스티어를 막기 위해
 # 소폭만 감속하고, 경로를 실제로 잃었을 때 충분히 감속한다.
 RUBBERCONE_SPEED_PARAMS = {
-    'min_speed':              13.5,  # 경로 상실 시 하한 (최종 6.75)
-    'cautious_speed':         18.0,  # 큰 조향·한쪽 경계 보수 상태 (최종 9.0)
-    'cruise_speed':           22.0,  # 정상 추정 상태 (최종 11.0)
-    'cautious_confidence':    35.0,  # 이 신뢰도부터 9.0까지 회복
-    'full_speed_confidence':  85.0,  # 이 신뢰도부터 11.0 허용
+    'min_speed':              6.0,   # 경로 상실 시 하한 (최종 3.0)
+    'cautious_speed':         8.0,   # 큰 조향·한쪽 경계 보수 상태 (최종 4.0)
+    'cruise_speed':           12.0,  # 정상 추정 상태 (최종 6.0)
+    'cautious_confidence':    35.0,  # 이 신뢰도부터 4.0까지 회복
+    'full_speed_confidence':  85.0,  # 이 신뢰도부터 6.0 허용
     'turn_start_angle':       15.0,  # 이 조향각부터만 완만하게 감속
     # bag(cone_11) 측정: 조향 40°에서도 속도가 9.9로 거의 안 줄어 코너에서
     # 밀려났다. 기울기를 올리고, cautious_speed와 별개인 코너 전용 하한을 둔다.
-    'turn_slowdown':          0.20,  # 큰 조향 시 감속 기울기 (40°에서 최종 8.5)
-    'turn_min_speed':         14.0,  # 코너 감속 하한 (최종 7.0)
+    'turn_slowdown':          0.20,  # 큰 조향 시 감속 기울기
+    'turn_min_speed':         8.0,   # 코너 감속 하한 (최종 4.0)
     'max_steering_angle':     45.0,  # 라바콘 구간 안전 조향 한계
 }
 
@@ -849,9 +849,9 @@ class Controller:
         """
         라바콘 경로 신뢰도로 목표 속도를 계산한다.
 
-        정상 추정 시 최종 약 9.0~11.0을 유지하고, 조향각이 커질수록
-        최종 8.5(40°)~8.0(45°)까지 감속해 코너에서 밀려나는 것을 막는다.
-        경계가 사라져 신뢰도가 낮아질 때는 최종 6.75까지 감속한다.
+        정상 추정 시 최종 약 6.0을 유지하고, 조향각이 커질수록
+        최종 약 4.0까지 감속해 코너에서 밀려나는 것을 막는다.
+        경계가 사라져 신뢰도가 낮아질 때는 최종 3.0까지 감속한다.
         """
         params = self.rubbercone_speed_params
         confidence_ratio = max(0.0, min(1.0, float(confidence) / 100.0))

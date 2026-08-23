@@ -91,8 +91,8 @@ TRAFFIC_GREEN_CODES = (2, 3)
 
 # The controller gains remain the proven legacy implementation. These limits
 # are output shaping only; they do not participate in mission transitions.
-# 0.10 (5.0/s) took 2.2 s to reach the tuned 11.0 cruise speed in short
-# rubber-cone sections. The tuned steps reach it in about 0.9 s while keeping
+# 0.10 (5.0/s) took too long to reach the tuned 6.0 cruise speed in short
+# rubber-cone sections. The tuned steps reach it quickly while keeping
 # deceleration faster than acceleration.
 RUBBERCONE_ACCEL_STEP = 0.25
 RUBBERCONE_DECEL_STEP = 0.35
