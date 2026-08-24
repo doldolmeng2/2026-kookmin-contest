@@ -226,6 +226,14 @@ class MainNode(Node):
             ParameterDescriptor(dynamic_typing=True),
         )
         self.declare_parameter("show_debug", False)
+        # /mode_info 발행 시점 진단. 기본 꺼짐이라 실전 실행에는 영향이 없다.
+        #
+        # 2026-08-25 bag 채점에서 /mode_info 가 미션 경계마다 두 값 사이를
+        # 번갈아 나갔는데(추월 0.53초에 15회, 지름길 0.73초에 25회) 같은 구간에
+        # FSM 전환 로그는 한 번뿐이었고 runtime 진단도 옛 모드를 유지했다.
+        # 발행 순간의 상태·객체·스레드·사이클 번호를 같이 찍어야 어느 쪽이
+        # 어긋나는지 갈린다.
+        self.declare_parameter("mode_publish_diagnostic", False)
         # 터미널에서 Enter 를 눌러 모터 출력만 껐다 켠다. 인지·FSM·조향은 계속
         # 돌고 바퀴로 나가는 속도만 막히므로, 차를 세운 채로 차선 인식을 보며
         # 튜닝할 수 있다. 기본은 꺼짐이고, 튜닝 프로파일(module_lane_only)에서만
@@ -341,6 +349,11 @@ class MainNode(Node):
         )
         self.runtime_diagnostic_reporter = RuntimeDiagnosticReporter()
         self.last_runtime_diagnostic: Optional[RuntimeDiagnosticSnapshot] = None
+        self._cycle_seq = 0                       # control_cycle 호출 일련번호
+        self._last_published_mode_code: Optional[int] = None
+        self._mode_publish_diagnostic = bool(
+            self.get_parameter("mode_publish_diagnostic").value
+        )
         self._zone_state: Optional[Mode] = None   # 직전 사이클의 FSM 상태
         self._zone_exit_sent = False              # 현재 구간의 종료 엣지를 이미 냈는지
         self._fixed_entry_sent = False            # 이번 LANE_DRIVE 세션에서 진입 엣지를 냈는지
@@ -829,6 +842,7 @@ class MainNode(Node):
             self.right = data[4]
 
     def control_cycle(self) -> None:
+        self._cycle_seq += 1
         now = self._now_seconds()
 
         if self._last_now is not None and self._last_now - now > BAG_LOOP_BACKJUMP_S:
@@ -936,6 +950,31 @@ class MainNode(Node):
         # 아직 팀 코드가 배정되지 않았으므로 임의의 숫자를 발행하지 않는다.
         mode_code = external_mode_code(self.runtime.fsm.state)
         if mode_code is not None:
+            if (
+                self._mode_publish_diagnostic
+                and self._last_published_mode_code is not None
+                and int(mode_code) != self._last_published_mode_code
+            ):
+                import threading as _threading
+                import time as _time
+
+                self.get_logger().warning(
+                    "mode_publish %d -> %d  state=%s  cycle=%d  fsm=%x "
+                    "runtime=%x  node=%x  thread=%d  wall=%.6f  ros=%.6f"
+                    % (
+                        self._last_published_mode_code,
+                        int(mode_code),
+                        self.runtime.fsm.state.value,
+                        self._cycle_seq,
+                        id(self.runtime.fsm),
+                        id(self.runtime),
+                        id(self),
+                        _threading.get_ident(),
+                        _time.time(),
+                        self._now_seconds(),
+                    )
+                )
+            self._last_published_mode_code = int(mode_code)
             mode_msg = Int16()
             mode_msg.data = int(mode_code)
             self.mode_pub.publish(mode_msg)

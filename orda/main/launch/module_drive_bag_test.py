@@ -176,6 +176,57 @@ def generate_launch_description():
         description='라바콘 조향 오프셋 안전 한계'
     )
     rubbercone_offset_limit = LaunchConfiguration('rubbercone_offset_limit')
+    pidnet_show_visualization_arg = DeclareLaunchArgument(
+        'pidnet_show_visualization',
+        default_value='false',
+        description=(
+            'PIDNet 세그멘테이션 결과를 OpenCV 창으로 띄운다. 주행 스택 없이 '
+            '세그멘테이션만 볼 때는 module_pidnet_bag_preview.py 가 더 가볍다. '
+            '창 없이 보려면 /pidnet_overlay 를 rqt_image_view 로 열면 된다.'
+        )
+    )
+    pidnet_show_visualization = LaunchConfiguration('pidnet_show_visualization')
+    pidnet_roi_crop_arg = DeclareLaunchArgument(
+        'pidnet_roi_crop_visualization',
+        default_value='true',
+        description=(
+            '시각화 창을 라벨 ROI(하단 40%, y>=216)만 잘라 보여줄지 여부. '
+            '학습 라벨이 그 위쪽을 채점하지 않으므로 전체 프레임을 보면 상단의 '
+            '근거 없는 예측을 결함으로 오해하기 쉽다.'
+        )
+    )
+    pidnet_roi_crop_visualization = LaunchConfiguration(
+        'pidnet_roi_crop_visualization'
+    )
+    mode_publish_diagnostic_arg = DeclareLaunchArgument(
+        'mode_publish_diagnostic',
+        default_value='false',
+        description=(
+            '/mode_info 값이 바뀔 때마다 그 순간의 FSM 상태·객체 id·스레드·'
+            '사이클 번호를 함께 남긴다. 발행과 FSM 상태가 어긋나는 원인을 '
+            '좁힐 때만 켠다.'
+        )
+    )
+    rubbercone_max_corridor_width_arg = DeclareLaunchArgument(
+        'rubbercone_max_corridor_width',
+        default_value='1.40',
+        description=(
+            '라바콘 진입으로 인정할 통로 폭 상한 (m). 2026-08-13 bag 실측: 실제 '
+            '게이트 중앙값 0.83, 최대 1.26 / 오진입 지점 1.06 이상. 1.10 부근에서 '
+            '갈리지만 근거가 bag 하나뿐이라 기본값은 종전 값을 유지한다.'
+        )
+    )
+    rubbercone_max_corridor_width = LaunchConfiguration(
+        'rubbercone_max_corridor_width'
+    )
+    rubbercone_min_corridor_width_arg = DeclareLaunchArgument(
+        'rubbercone_min_corridor_width',
+        default_value='0.35',
+        description='라바콘 진입으로 인정할 통로 폭 하한 (m)'
+    )
+    rubbercone_min_corridor_width = LaunchConfiguration(
+        'rubbercone_min_corridor_width'
+    )
     rubbercone_enable_gui_arg = DeclareLaunchArgument(
         'rubbercone_enable_gui',
         default_value='false',
@@ -227,6 +278,9 @@ def generate_launch_description():
         'lane_target': lane_target,
         'test_profile': ParameterValue(test_profile, value_type=str),
         'show_debug': show_debug,
+        'mode_publish_diagnostic': ParameterValue(
+            LaunchConfiguration('mode_publish_diagnostic'), value_type=bool
+        ),
         'use_sim_time': True,
     }]
     isolated_main_node = Node(
@@ -267,6 +321,8 @@ def generate_launch_description():
             'target_lookahead': rubbercone_target_lookahead,
             'curve_target_lookahead': rubbercone_curve_target_lookahead,
             'nominal_half_width': rubbercone_nominal_half_width,
+            'min_corridor_width': rubbercone_min_corridor_width,
+            'max_corridor_width': rubbercone_max_corridor_width,
             'offset_gain': rubbercone_offset_gain,
             'offset_limit': rubbercone_offset_limit,
             'enable_far_curve_hint': rubbercone_enable_far_curve_hint,
@@ -298,6 +354,12 @@ def generate_launch_description():
             'class_topic': '/pidnet_class_map',
             'lane_classes': pidnet_lane_classes,
             'device': 'auto',
+            'show_visualization': ParameterValue(
+                pidnet_show_visualization, value_type=bool
+            ),
+            'roi_crop_visualization': ParameterValue(
+                pidnet_roi_crop_visualization, value_type=bool
+            ),
         }],
     )
     road_surface_node = Node(
@@ -371,6 +433,11 @@ def generate_launch_description():
         rubbercone_target_lookahead_arg,
         rubbercone_curve_target_lookahead_arg,
         rubbercone_nominal_half_width_arg,
+        rubbercone_min_corridor_width_arg,
+        rubbercone_max_corridor_width_arg,
+        mode_publish_diagnostic_arg,
+        pidnet_show_visualization_arg,
+        pidnet_roi_crop_arg,
         rubbercone_offset_gain_arg,
         rubbercone_offset_limit_arg,
         rubbercone_enable_gui_arg,

@@ -293,6 +293,26 @@ public:
         nominal_half_width_ = clampValue(
             static_cast<float>(declare_parameter<double>("nominal_half_width", 0.30)),
             0.15f, 0.70f);
+        // 진입 판정에 쓰는 통로 폭 범위. 기본값은 종전 하드코딩 값 그대로다.
+        //
+        // 왜 파라미터로 뺐는가: 2026-08-13 bag 에서 97.35 초에 라바콘이 없는 곳에서
+        // CONE_DRIVE 로 들어갔다. 오른쪽 연석과 왼쪽 벽이 양쪽 경계 조건
+        // (entryGeometryValid, 각 2점 이상)을 그대로 만족했고 confidence 도 88 로
+        // 정상 구간과 같아서, 그 지점에서는 노드 인터페이스만으로 구분할 수 없다.
+        //
+        // 구분되는 것은 폭 하나다. 같은 bag 을 /scan 에서 직접 재보면
+        //   실제 라바콘 게이트 : 중앙값 0.83 m, p90 1.06 m, 최대 1.26 m
+        //   97 초 오진입       : 최소 1.12 m, 중앙값 1.15 m
+        //   159 초 짧은 오진입 : 최소 1.06 m, 중앙값 1.28 m
+        // 이라 1.10 m 부근에서 갈린다. 다만 근거가 이 bag 하나뿐이고 본선에서는
+        // 라바콘 배치가 달라지므로 기본값은 낮추지 않았다. 실측으로 게이트 폭을
+        // 확인한 뒤 max_corridor_width 를 내리면 오진입이 사라진다.
+        min_corridor_width_ = clampValue(
+            static_cast<float>(declare_parameter<double>("min_corridor_width", 0.35)),
+            0.10f, 1.00f);
+        max_corridor_width_ = clampValue(
+            static_cast<float>(declare_parameter<double>("max_corridor_width", 1.40)),
+            min_corridor_width_ + 0.05f, 2.50f);
         one_side_recovery_margin_ = clampValue(
             static_cast<float>(declare_parameter<double>("one_side_recovery_margin", 0.08)),
             0.0f, 0.30f);
