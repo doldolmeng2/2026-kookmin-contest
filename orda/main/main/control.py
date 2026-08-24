@@ -398,7 +398,8 @@ class Controller:
         self.angle             = 0.0  # 현재 조향각
         self.speed             = 0.0  # 현재 속도
         # 내부 제어 상태
-        self.prev_offset       = 0.0  # 이전 오프셋 (PD 미분항 계산용)
+        # 이전 오프셋 (PD 미분항 계산용). None = 아직 모른다.
+        self.prev_offset: Optional[float] = None
         self.prev_mode: Optional[Mode] = None
         # 가드레일 상태 (변화율 제한과 레일 상실 시 감쇠에 쓴다)
         self.guardrail_angle          = 0.0
@@ -512,7 +513,14 @@ class Controller:
 
         elif mode is Mode.FIXED_AVOID:
             # PD 조향(회피 전용 이득) + 조향각 기반 속도 감속
+            #
+            # 조향 제한을 두는 이유: 다른 모드는 모두 상한이 있는데 여기만 없어서,
+            # 큰 오프셋이 그대로 곱해져 나갈 수 있었다. 미분항 킥을 고친 뒤로는
+            # 실측 최대가 35° 근처라 이 상한에 닿지 않는다 — 안전망이지 튜닝
+            # 지점이 아니다. 차선 주행과 같은 봉투를 쓴다.
             self.angle = self._compute_steering_pd(mode, offset)
+            limit = abs(float(self.pure_pursuit_params['max_steering_angle']))
+            self.angle = max(-limit, min(limit, self.angle))
             params     = self.speed_params.get(mode)
             self.speed = (
                 self._compute_speed_from_angle(self.angle, params)
@@ -535,7 +543,17 @@ class Controller:
             return 0.0
 
         error = float(offset)
-        diff  = error - self.prev_offset
+        # 모드 전환 직후 첫 사이클에는 미분항을 쓰지 않는다.
+        #
+        # reset() 이 prev_offset 을 0 으로 되돌리므로, 예전에는 새 모드의 첫
+        # 계산에서 diff 가 오프셋 전체가 됐다. FIXED_AVOID 는 kp 0.12 · kd 0.35
+        # 라서 그 한 사이클만 0.47·e 로 커졌고, 2026-08-13 bag 28.98 초
+        # (LANE_DRIVE → FIXED_AVOID 전환 순간) 에 offset -289 px 가 -135.8° 로
+        # 나갔다. 그 다음 사이클부터는 -34.7° 근처였으니 오프셋이 아니라 킥이었다.
+        #
+        # 이전 오프셋을 모른다는 것과 이전 오프셋이 0 이었다는 것은 다르다.
+        # 모를 때는 변화량을 0 으로 두는 쪽이 맞다.
+        diff = 0.0 if self.prev_offset is None else error - self.prev_offset
         self.prev_offset = error
 
         # alpha > 0이면 오프셋이 클수록 kp를 증폭 (비선형 제어)
@@ -885,7 +903,9 @@ class Controller:
 
     def reset(self):
         """내부 제어 상태 초기화 (모드 전환 시 호출)"""
-        self.prev_offset = 0.0
+        # None = "직전 오프셋을 모른다". 0.0 으로 두면 첫 사이클의 미분항이
+        # 오프셋 전체가 되어 모드 전환마다 조향이 튄다 (_compute_steering_pd 참고).
+        self.prev_offset = None
         self.offset_filtered = None
         self.speed_angle = None
         self.offset_history.clear()
