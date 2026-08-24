@@ -109,7 +109,9 @@ src/
 │   │
 │   └── function/                   # 보조 도구
 │        ├── manual_drive           # Xbox 컨트롤러 수동 주행 / bag 수집
-│        └── sensors_viewer         # 센서 데이터 시각화
+│        ├── sensors_viewer         # 센서 데이터 시각화
+│        ├── drive_eval             # bag 센서로 스택을 돌려 조향·모드·라바콘 채점
+│        └── bag_motion_replay      # 녹화된 구동 명령을 내용·타이밍 그대로 재발행
 │
 ├── track_drive/                    # (Xytron 제공) 예제 주행 패키지
 ├── xycar_application/              # (Xytron 제공) 예제 애플리케이션
