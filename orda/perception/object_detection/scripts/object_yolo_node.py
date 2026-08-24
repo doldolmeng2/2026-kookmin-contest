@@ -64,6 +64,12 @@ class ObjectYoloNode(Node):
         self.declare_parameter("traffic_output_topic", "/traffic_detection")
         self.declare_parameter("traffic_boxes_topic", "/traffic_boxes")
         self.declare_parameter("confidence_threshold", 0.50)
+        # 장애물(차량) 판정만 더 엄격하게 본다. 라바콘은 검출기에 없는 물체라
+        # red_car 로 새어 나오는데, 실측(2026-08-23 bag 3종)에서 그 오검출은
+        # 최대 0.85 에 그치고 FSM 진입 크기(1900px^2)를 넘는 건은 0.72 였다.
+        # 반면 진짜 고정 방해차량은 0.89~0.93 으로 잡힌다. 신호등은 원거리에서
+        # 신뢰도가 낮게 나오므로 이 값을 함께 올리면 안 된다.
+        self.declare_parameter("obstacle_confidence_threshold", 0.83)
         self.declare_parameter("nms_threshold", 0.40)
         self.declare_parameter("input_size", 640)
         self.declare_parameter("max_inference_hz", 0.0)
@@ -101,6 +107,9 @@ class ObjectYoloNode(Node):
 
         self.confidence = float(
             self.get_parameter("confidence_threshold").value
+        )
+        self.obstacle_confidence = float(
+            self.get_parameter("obstacle_confidence_threshold").value
         )
         self.nms = float(self.get_parameter("nms_threshold").value)
         self.input_size = int(self.get_parameter("input_size").value)
@@ -147,7 +156,9 @@ class ObjectYoloNode(Node):
             f"ONNX Runtime ready: detector={detector_model_path}, "
             f"output={output_shape}, "
             f"fixed={sorted(self.fixed_ids)}, moving={sorted(self.moving_ids)}, "
-            f"traffic={sorted(self.traffic_ids)}"
+            f"traffic={sorted(self.traffic_ids)}, "
+            f"conf(obstacle)={self.obstacle_confidence:.2f}, "
+            f"conf(traffic)={self.confidence:.2f}"
         )
 
         qos = QoSProfile(
@@ -215,11 +226,12 @@ class ObjectYoloNode(Node):
                 scale=prepared.scale,
                 pad_x=prepared.pad_x,
                 pad_y=prepared.pad_y,
-                confidence_threshold=self.confidence,
                 nms_threshold=self.nms,
             )
             detections = decode_detections(
-                allowed_class_ids=self.allowed_ids, **decode_kwargs
+                allowed_class_ids=self.allowed_ids,
+                confidence_threshold=self.obstacle_confidence,
+                **decode_kwargs,
             )
             fixed_detection = closest_detection_for_classes(
                 detections, self.fixed_ids
@@ -231,7 +243,10 @@ class ObjectYoloNode(Node):
             # 차량용 min_size_px(기본 12px) 필터에 걸려 누락되지 않도록
             # 최소 크기 제한 없이 별도로 디코드한다 (traffic_node 원래 동작과 동일).
             traffic_detections = decode_detections(
-                allowed_class_ids=self.traffic_ids, min_size_px=1, **decode_kwargs
+                allowed_class_ids=self.traffic_ids,
+                confidence_threshold=self.confidence,
+                min_size_px=1,
+                **decode_kwargs,
             )
         except Exception as exc:
             self.get_logger().error(f"object YOLO inference failed: {exc}")
